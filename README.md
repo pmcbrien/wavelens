@@ -18,10 +18,10 @@ It never connects to, pairs with or transmits to anything. It has **no network a
 <p align="center">
   <img src="docs/screenshots/live-icons-freq.png" width="30%" alt="Live list with device icons, signal and frequency">
   <img src="docs/screenshots/card-signal-adv-ring.png" width="30%" alt="Expanded card: signal history, advertising interval, RSSI ring">
-  <img src="docs/screenshots/flagged-axon.png" width="30%" alt="A flagged body camera recognised by fingerprint">
+  <img src="docs/screenshots/tracker-with-owner.png" width="30%" alt="A Find My Device tracker, confirmed, still with its owner">
 </p>
 
-*Screenshots are from real drives. GPS coordinates are blacked out; some are from earlier builds that still carried the working title "SIGINT Scope".*
+*Screenshots are from real drives; GPS coordinates are blacked out. A few are from earlier builds that still carried the working title "SIGINT Scope".*
 
 ---
 
@@ -76,8 +76,12 @@ Everything else is bucketed by manufacturer using the IEEE OUI and Bluetooth SIG
 
 <p align="center">
   <img src="docs/screenshots/live-le-filter.png" width="30%" alt="Live list filtered to Body cam / LE gear">
+  <img src="docs/screenshots/flagged-axon.png" width="30%" alt="A flagged body camera recognised by fingerprint">
   <img src="docs/screenshots/drone-dji.png" width="30%" alt="A DJI device classified as drone">
+</p>
+<p align="center">
   <img src="docs/screenshots/fastpair-tracker.png" width="30%" alt="Fast Pair earbuds shown with the weak-match note">
+  <img src="docs/screenshots/card-expanded.png" width="30%" alt="Expanded card with match reason, SSID, channel, capabilities">
 </p>
 
 The rule that matched is always shown on the card with a one‑line reason, including when the match is weak ("also matches ordinary headphones, so treat as weak"). The classifier is a best‑effort guess from public signatures — look before you act on it.
@@ -88,10 +92,6 @@ The rule that matched is always shown on the card with a one‑line reason, incl
 
 ### Live
 The main list. Strongest signal first, with a glyph for the device kind (🔔 doorbell, 🛞 TPMS, 🎥 body cam, 🚁 drone, 🏷 tracker, 📷 camera …), the current dBm, the last frequency heard (Wi‑Fi channel, BLE PHY, or cell band), an estimated distance, and badges: **NEW** highlight box, **FLAGGED**, **FOLLOWING**, **RIDING / PACING**, **MINE**, **WITH OWNER / SEPARATED** for trackers. Filter chips across the top narrow by category. Tap a card for details; alert‑worthy cards open expanded automatically.
-
-<p align="center">
-  <img src="docs/screenshots/card-expanded.png" width="30%" alt="Expanded card with match reason, SSID, channel, capabilities">
-</p>
 
 A card's details include first/last seen, packet count, signal now/best/average, advertising interval and whether the payload is static, the services and company IDs it advertises, the matched rules with their explanations, the raw manufacturer data, dwell time, and the peak‑signal fix. Buttons: **Flag**, **Mine**, **Ignore "<name>"**.
 
