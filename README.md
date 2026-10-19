@@ -5,12 +5,12 @@
 It never connects to, pairs with or transmits to anything. It has **no network access**: no account, no analytics, no uploads. Everything stays on the phone.
 
 <p align="center">
-  <a href="https://github.com/pmcbrien/wavelens/releases/latest/download/wavelens-debug.apk"><img alt="Download the APK" src="https://img.shields.io/badge/Download-Wavelens%20APK-2ea44f?style=for-the-badge&logo=android&logoColor=white"></a>
+  <a href="https://github.com/pmcbrien/wavelens/raw/main/wavelens.apk"><img alt="Download the APK" src="https://img.shields.io/badge/Download-Wavelens%20APK-2ea44f?style=for-the-badge&logo=android&logoColor=white"></a>
   &nbsp;
   <a href="https://github.com/pmcbrien/wavelens/releases/latest"><img alt="All releases" src="https://img.shields.io/github/v/release/pmcbrien/wavelens?style=for-the-badge&label=Latest%20release"></a>
 </p>
 
-> **Free APK, no sign-up.** Builds are published under **[Releases](https://github.com/pmcbrien/wavelens/releases/latest)** (right-hand sidebar on the repo page). Direct link: [wavelens-debug.apk](https://github.com/pmcbrien/wavelens/releases/latest/download/wavelens-debug.apk). Android 8.0+ (API 26).
+> **Free APK, no sign-up.** Tap the button above or download [`wavelens.apk`](https://github.com/pmcbrien/wavelens/raw/main/wavelens.apk) straight from this repo. Android 8.0+ (API 26).
 
 <p align="center">
   <img src="docs/screenshots/live-icons-freq.png" width="30%" alt="Live list with device icons, signal and frequency">
@@ -38,7 +38,7 @@ No fixed commitment beyond actually using it. Twelve people is the minimum Googl
 
 ## Install
 
-1. On your phone, open [github.com/pmcbrien/wavelens/releases/latest](https://github.com/pmcbrien/wavelens/releases/latest) and tap the `.apk` under **Assets** — or use the direct link above.
+1. On your phone, tap the download button at the top of this page (or [`wavelens.apk`](https://github.com/pmcbrien/wavelens/raw/main/wavelens.apk)).
 2. Open it. Android will ask you to allow installs from your browser — allow it once.
 3. Open Wavelens, tap **SCAN**, read the short disclosure, and grant:
    - **Nearby devices / Bluetooth** — to hear BLE advertisements and classic discovery.
