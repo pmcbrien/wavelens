@@ -11,6 +11,11 @@ It never connects to, pairs with or transmits to anything. It has **no network a
 > **Free APK, no sign-up.** Tap the button above or download [`wavelens.apk`](https://github.com/pmcbrien/wavelens/raw/main/wavelens.apk) straight from this repo. Android 8.0+ (API 26).
 
 <p align="center">
+  <a href="docs/promo/wavelens-promo.mp4"><img src="docs/promo/body-cam-alert.jpg" width="92%" alt="Night drive: Wavelens warns the driver of a body cam ahead"></a><br>
+  <sub>Body cam ahead — tone, voice and flash before you can see it. <a href="docs/promo/wavelens-promo.mp4">Watch the 20-second spot.</a></sub>
+</p>
+
+<p align="center">
   <img src="docs/screenshots/live-icons-freq.png" width="30%" alt="Live list with device icons, signal and frequency">
   <img src="docs/screenshots/card-signal-adv-ring.png" width="30%" alt="Expanded card: signal history, advertising interval, RSSI ring">
   <img src="docs/screenshots/flagged-axon.png" width="30%" alt="A flagged body camera recognised by fingerprint">
