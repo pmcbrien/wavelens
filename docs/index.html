@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wavelens — Privacy Policy</title>
+<style>
+  :root { --bg:#fff; --fg:#1a1a1a; --mut:#555; --line:#e3e3e3; --acc:#0a66c2; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#e8e8e8; --mut:#a8a8a8; --line:#2a2a2a; --acc:#6cb4ff; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:40px 16px 80px; }
+  h1 { font-size:28px; margin:0 0 4px; } h2 { font-size:19px; margin:32px 0 8px; }
+  .sub { color:var(--mut); margin:0 0 24px; }
+  table { border-collapse:collapse; width:100%; font-size:15px; }
+  th,td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--mut); font-weight:600; }
+  a { color:var(--acc); }
+  .box { border:1px solid var(--line); border-radius:8px; padding:14px 16px; margin:16px 0; }
+</style>
+</head>
+<body>
+<main>
+<h1>Wavelens — Privacy Policy</h1>
+<p class="sub">Effective 19 October 2026 · Developer: Patrick McBrien</p>
+
+<div class="box"><strong>Summary.</strong> Wavelens has no network access. It does not collect, transmit, sell or share any data. Everything it records stays in the app's private storage on your device and is deleted when you uninstall the app.</div>
+
+<h2>What the app does</h2>
+<p>Wavelens is a passive radio-survey tool. It listens to Bluetooth, Wi-Fi and cellular signals that nearby devices already broadcast, classifies them against an offline signature list, and shows you what is transmitting around you. It never connects to, pairs with, or sends anything to the devices it observes.</p>
+
+<h2>Permissions and why they are needed</h2>
+<table>
+<tr><th>Permission</th><th>Used for</th></tr>
+<tr><td>Bluetooth (scan / connect)</td><td>Receiving Bluetooth LE advertisements and classic discovery results. "Connect" is required by Android only to read a device's advertised name; the app never initiates a connection.</td></tr>
+<tr><td>Nearby Wi-Fi devices / Wi-Fi state</td><td>Reading the list of Wi-Fi access points in range (SSID, BSSID, channel, signal strength). The app does not join any network.</td></tr>
+<tr><td>Precise location</td><td>Android requires location permission to receive Bluetooth and Wi-Fi scan results. The app also records your GPS position alongside each detection so it can show where a device was heard, tell when a device is moving with you, and build an on-device history of where you have encountered it.</td></tr>
+<tr><td>Location while in the background (foreground service)</td><td>Scanning continues while the screen is off or another app is in front, so the app can alert you while driving. A persistent notification is shown the whole time this is active, and you can stop it from the notification or the app at any time.</td></tr>
+<tr><td>Notifications</td><td>The scanning status notification and alert notifications.</td></tr>
+<tr><td>Vibrate, wake lock, foreground service</td><td>Alert feedback and keeping the scanner running while backgrounded.</td></tr>
+</table>
+
+<h2>Data the app stores on your device</h2>
+<ul>
+  <li>Detected device records: radio identifiers (MAC/BSSID), advertised names, service identifiers, manufacturer data, signal strength, and the time and GPS position where they were heard.</li>
+  <li>An alert log, an encounter history (where and how often a device has been heard), fingerprints of devices you flag or mark as your own, and, if you enable it, recorded scan sessions.</li>
+  <li>Your settings.</li>
+</ul>
+<p>All of this lives in the app's private storage. It is excluded from Android cloud backup and device-to-device transfer. Nothing is uploaded anywhere; the app contains no analytics, advertising or crash-reporting SDKs and makes no network requests.</p>
+
+<h2>Sharing</h2>
+<p>The app shares nothing automatically. The only way data leaves the device is if you choose to export a CSV, KML or session file through the Android file picker; where you send that file is up to you.</p>
+
+<h2>Deleting your data</h2>
+<p>Use "Clear" actions in the app's Setup screen to remove the alert log, history, watchlist and sessions, or uninstall the app to delete everything.</p>
+
+<h2>Children</h2>
+<p>The app is not directed at children and collects no personal information from anyone.</p>
+
+<h2>Changes and contact</h2>
+<p>If this policy changes, the new version will be posted at this address with a new effective date. Questions: email <a href="mailto:wavelensapp@gmail.com">wavelensapp@gmail.com</a> or open an issue at <a href="https://github.com/pmcbrien/sigint-scope">github.com/pmcbrien/sigint-scope</a>.</p>
+</main>
+</body>
+</html>
