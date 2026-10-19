@@ -6,8 +6,6 @@ It never connects to, pairs with or transmits to anything. It has **no network a
 
 <p align="center">
   <a href="https://github.com/pmcbrien/wavelens/raw/main/wavelens.apk"><img alt="Download the APK" src="https://img.shields.io/badge/Download-Wavelens%20APK-2ea44f?style=for-the-badge&logo=android&logoColor=white"></a>
-  &nbsp;
-  <a href="https://github.com/pmcbrien/wavelens/releases/latest"><img alt="All releases" src="https://img.shields.io/github/v/release/pmcbrien/wavelens?style=for-the-badge&label=Latest%20release"></a>
 </p>
 
 > **Free APK, no sign-up.** Tap the button above or download [`wavelens.apk`](https://github.com/pmcbrien/wavelens/raw/main/wavelens.apk) straight from this repo. Android 8.0+ (API 26).
@@ -47,7 +45,7 @@ No fixed commitment beyond actually using it. Twelve people is the minimum Googl
 
 The first scan takes a few seconds to populate. In a city you'll see hundreds of emitters within a minute; the Live screen hides the boring ones by default (see *Main screen* in Setup).
 
-`wavelens-release.apk` is signed with the app's release key and will update cleanly to the Play Store version later. `wavelens-debug.apk` is the development build — same features, but it can't be upgraded over by the release build (uninstall first).
+The APK here is the current build; it is replaced in place whenever a new version ships, so re-download from this page to update. When the Play Store version arrives it is signed with a different key, so uninstall this one before installing from the store.
 
 ---
 
@@ -159,7 +157,7 @@ A pack can also be dropped on the phone as an override and reloaded from Setup w
 
 - No network permission. Nothing leaves the phone except files you export yourself.
 - Detections, alerts, history, fingerprints and recordings live in the app's private storage and are excluded from Android backup and device transfer.
-- Full policy: [pmcbrien.github.io/wavelens](https://pmcbrien.github.io/wavelens/).
+- Full policy: [docs/index.html](docs/index.html) (also at [pmcbrien.github.io/wavelens](https://pmcbrien.github.io/wavelens/)).
 
 ---
 
