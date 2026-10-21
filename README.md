@@ -16,12 +16,12 @@ It never connects to, pairs with or transmits to anything. It has **no network a
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/live-icons-freq.png" width="30%" alt="Live list with device icons, signal and frequency">
-  <img src="docs/screenshots/card-signal-adv-ring.png" width="30%" alt="Expanded card: signal history, advertising interval, RSSI ring">
-  <img src="docs/screenshots/tracker-with-owner.png" width="30%" alt="A Find My Device tracker, confirmed, still with its owner">
+  <img src="docs/screenshots/hud-drone.png" width="30%" alt="Driving HUD: a DJI Air 3S drone at -90 dBm, about 35 m away">
+  <img src="docs/screenshots/hud-item-tracker.png" width="30%" alt="Driving HUD: a new item tracker 10 m away, four more listed below">
+  <img src="docs/screenshots/live-tracker-detail.png" width="30%" alt="Expanded card for an item tracker: Apple Continuity, with owner, battery full">
 </p>
 
-*Screenshots are from real drives; GPS coordinates are blacked out. A few are from earlier builds that still carried the working title "SIGINT Scope".*
+*Screenshots are from real drives; GPS coordinates are masked. A few are from earlier builds that still carried the working title "SIGINT Scope".*
 
 ---
 
@@ -75,9 +75,9 @@ The APK here is the current build; it is replaced in place whenever a new versio
 Everything else is bucketed by manufacturer using the IEEE OUI and Bluetooth SIG company registries, which ship inside the app. Confidence is shown as **Possible / Likely / Confirmed** — a vendor prefix alone is *Possible*; a structured, self‑describing frame (Remote ID, Find My) is *Confirmed*.
 
 <p align="center">
-  <img src="docs/screenshots/live-le-filter.png" width="30%" alt="Live list filtered to Body cam / LE gear">
+  <img src="docs/screenshots/drone-detail.png" width="30%" alt="Drone card: confirmed by DJI company ID, vendor prefix and name rule, each match explained">
   <img src="docs/screenshots/flagged-axon.png" width="30%" alt="A flagged body camera recognised by fingerprint">
-  <img src="docs/screenshots/drone-dji.png" width="30%" alt="A DJI device classified as drone">
+  <img src="docs/screenshots/signal-list.png" width="30%" alt="Signal view: everything heard in the last 30 s, strongest first, own kit marked Mine">
 </p>
 <p align="center">
   <img src="docs/screenshots/fastpair-tracker.png" width="30%" alt="Fast Pair earbuds shown with the weak-match note">
@@ -124,7 +124,9 @@ Feature screens that don't need a tab of their own:
 Every setting, in the order it appears on the screen. Defaults in **bold**.
 
 <p align="center">
-  <img src="docs/screenshots/setup-alerts.png" width="30%" alt="Setup: alert categories, re-alert interval, main screen threshold">
+  <img src="docs/screenshots/setup-radios.png" width="30%" alt="Setup: radios, keep screen on, alert channels">
+  <img src="docs/screenshots/setup-alert-options.png" width="30%" alt="Setup: flash, strobe, vibrate, notification, quiet owned trackers, following-you alerts">
+  <img src="docs/screenshots/setup-alert-categories.png" width="30%" alt="Setup: alert categories, re-alert interval, tracker dwell time">
 </p>
 
 #### Radios
