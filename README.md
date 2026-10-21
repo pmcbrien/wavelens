@@ -141,7 +141,7 @@ Feature screens that don't need a tab of their own:
 - **Routes** — learns the roads you drive regularly and the fixed emitters along them, then alerts on a *new* camera, sensor or AP on a regular route. See [Routes](#routes-new-on-your-route).
 - **Tails** — the unified "is this device tailing me?" verdict with a map replay of your path against the device's hits and gaps. See [Tails](#tails).
 - **Trips** — a report for every drive: duration, distance, cameras passed, trackers heard, anything that rode or followed, alerts raised; export as PDF or KML. See [Trips](#trips).
-- **What is this?** — a plain‑English card for every category and every verdict: what the hardware is, who deploys it, what it can and can't see, how Wavelens recognises it, what to do, and the public sources. The same cards open from the **What is this?** button on any expanded device card.
+- **What is this?** — a plain‑English card for every category and every verdict: what the hardware is, who deploys it, what it can and can't see, how Wavelens recognises it, and what to do. The same cards open from the **What is this?** button on any expanded device card.
 - **Share diagnostics** — builds a scrubbed report (app/Android version, scanner health and restarts, your alert settings, device counts by category, classified hardware by vendor prefix, optionally this session's alerts by category) and hands it to the share sheet. The app has no network permission, so nothing goes anywhere until you pick where.
 - **Signature packs** — see the active and bundled pack versions, and import an updated pack offline with a diff of what changed. See [Signature pack](#signature-pack).
 
