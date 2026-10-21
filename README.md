@@ -6,7 +6,10 @@ It never connects to, pairs with or transmits to anything. It has **no network a
 
 <p align="center">
   <a href="https://github.com/pmcbrien/wavelens/raw/main/wavelens.apk"><img alt="Download the APK" src="https://img.shields.io/badge/Download-Wavelens%20APK-2ea44f?style=for-the-badge&logo=android&logoColor=white"></a>
+  <a href="https://wavelensapp.us"><img alt="Website" src="https://img.shields.io/badge/Website-wavelensapp.us-f5b400?style=for-the-badge&logo=googlechrome&logoColor=white"></a>
 </p>
+
+<p align="center"><a href="https://wavelensapp.us">wavelensapp.us</a> · <a href="https://wavelensapp.us/privacy.html">Privacy policy</a> · <a href="https://wavelensapp.us/support.html">Support</a> · <a href="https://youtu.be/8R2Y43eKz08">30-second spot</a></p>
 
 > **Free APK, no sign-up.** Tap the button above or download [`wavelens.apk`](https://github.com/pmcbrien/wavelens/raw/main/wavelens.apk) straight from this repo. Android 8.0+ (API 26).
 
