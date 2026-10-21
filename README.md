@@ -266,6 +266,23 @@ CSV of all emitters, CSV of cell sites, KML for Google Earth, the alert log, the
 
 ---
 
+## Community map — contribute what you find
+
+Wavelens users can pool the location of **fixed** surveillance infrastructure — plate readers, traffic sensors, acoustic sensors — into one shared map, `community/emitters.geojson`, that anyone can load into the app.
+
+**What gets shared.** Only emitters in those three categories, heard in the same spot on three or more separate drives, positioned by the averaged peak and rounded to about 100 m. No trips, no addresses or MACs (entries are keyed by a one‑way hash), no timestamps finer than a day, and nothing from the camera/doorbell, network, body‑cam, vehicle, phone or wearable classes — those are either mobile or someone's home.
+
+**How to contribute.**
+1. Setup → **Community map → Preview share pack**. Untick anything you'd rather keep to yourself, then **Export**.
+2. Open a [Contribute emitters](../../issues/new?template=contribute.yml) issue and drag the `.geojson` file in.
+3. A bot validates it (categories, rounding, no identifiers), merges it, and opens a pull request. Once reviewed, it's on the map.
+
+**How to use it.** Download [`community/emitters.geojson`](community/emitters.geojson) to your phone, then Setup → **Community map → Import community map**. Those emitters become part of your known‑fixed baseline immediately: they stop alerting as "new" near home, and when you drive somewhere another contributor has mapped, you inherit their catalogue.
+
+The app never uploads anything; every step above is a file you choose to share. Contributions are CC0.
+
+---
+
 ## Signature pack
 
 The signature pack that ships inside the app: rules are AND‑matched on OUI prefixes, service UUIDs (with wildcards), manufacturer‑data prefixes, service‑data prefixes, names, SSIDs, Wi‑Fi capabilities and channel. Each rule carries a category, confidence, weight and a short explanation that is shown on the card. The pack is versioned and the version shows in the status line.
