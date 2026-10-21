@@ -15,7 +15,13 @@ It never connects to, pairs with or transmits to anything. It has **no network a
 
 <p align="center">
   <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-promo.mp4"><img src="docs/promo/body-cam-alert.jpg" width="92%" alt="Night drive: Wavelens warns the driver of a body cam ahead"></a><br>
-  <sub>Drone overhead, body cam ahead, a phone that keeps reappearing behind you — tone, voice and flash before you can see any of it. <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-promo.mp4">Watch the 30-second spot</a>.</sub>
+  <sub>Drone overhead, body cam ahead, a phone that keeps reappearing behind you — tone, voice and flash before you can see any of it. <a href="https://youtu.be/8R2Y43eKz08">Watch the 30-second spot on YouTube</a> (or the <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-promo.mp4">mp4</a>).</sub>
+</p>
+
+<p align="center">
+  <a href="https://youtu.be/09LMsqHtMFQ"><img src="https://img.youtube.com/vi/09LMsqHtMFQ/mqdefault.jpg" width="45%" alt="How Wavelens uses the location foreground-service permission"></a>
+  <a href="https://youtu.be/wceR7j8M568"><img src="https://img.youtube.com/vi/wceR7j8M568/mqdefault.jpg" width="45%" alt="How Wavelens uses the connected-device foreground-service permission"></a><br>
+  <sub>Two short walk-throughs filed with Google Play: <a href="https://youtu.be/09LMsqHtMFQ">how location is used</a> · <a href="https://youtu.be/wceR7j8M568">how Bluetooth and Wi-Fi scanning run in the background</a>.</sub>
 </p>
 
 <p align="center">
