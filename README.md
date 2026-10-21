@@ -46,6 +46,22 @@ To join:
 
 No fixed commitment beyond actually using it. Twelve people is the minimum Google needs; more is better.
 
+### How to contribute to the beta
+
+You don't need to be technical. The most useful thing is a few real drives and honest notes. In rough order of value:
+
+1. **Drive with it.** Phone on the dash or in a pocket, screen off, SCAN running. Commutes, errands, a highway stretch, a parking garage. Note anything that alerted you and whether it was right.
+2. **Mark your own kit "Mine"** (earbuds, watch, car, home Wi-Fi) in the first five minutes so your own gear stops showing up — then tell us if anything of yours still alerts.
+3. **Report false alarms** — a "tracker" that was your passenger's AirPods, a "body cam" that was a bus. Open the device card, tap **Flag**, screenshot it, and send the screenshot. That card is the whole story: what it matched and why.
+4. **Report misses** — something you *know* was there (your own AirTag in the glovebox, a drone you could see, a plate-reader pole you drive past daily) that the app didn't call. Say what it was and roughly where in the list it appeared, if at all.
+5. **Send a diagnostics report** when something feels off: **More → Share diagnostics**. It's a scrubbed text report (app and Android version, scanner health and restart count, your alert settings, device counts by category — no coordinates, no identifiers) that you can read before you send it. Restart counts above a handful per hour are exactly the kind of thing we want to see.
+6. **Export a CSV** (Setup → Export) for anything you'd like a new signature rule for — a camera, a sensor, a brand of tracker. The CSV has the vendor prefix, services and advertisement bytes needed to write one.
+7. **Tell us what confused you.** A screen you didn't understand, a setting you couldn't find, a word that didn't mean what you expected. First impressions are only available once.
+
+Include your phone model and Android version in the first message; after that, just the screenshot or report. Send everything to **wavelensapp@gmail.com** or [open an issue](https://github.com/pmcbrien/wavelens/issues). Please don't post other people's device names or addresses in public issues — email those.
+
+For the Play test to count, install from the Play Store (not only the APK) after accepting the invite, and keep it installed for the two weeks. Installing from Play over the APK is fine.
+
 ---
 
 ## Install
