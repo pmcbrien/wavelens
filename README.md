@@ -117,6 +117,7 @@ Feature screens that don't need a tab of their own:
 - **Tails** — the unified "is this device tailing me?" verdict with a map replay of your path against the device's hits and gaps. See [Tails](#tails).
 - **Trips** — a report for every drive: duration, distance, cameras passed, trackers heard, anything that rode or followed, alerts raised; export as PDF or KML. See [Trips](#trips).
 - **What is this?** — a plain‑English card for every category and every verdict: what the hardware is, who deploys it, what it can and can't see, how Wavelens recognises it, what to do, and the public sources. The same cards open from the **What is this?** button on any expanded device card.
+- **Share diagnostics** — builds a scrubbed report (app/Android version, scanner health and restarts, your alert settings, device counts by category, classified hardware by vendor prefix, optionally unclassified devices for signature research and this session's alerts by category) and hands it to the share sheet. The app has no network permission, so nothing goes anywhere until you pick where.
 - **Signature packs** — see the active and bundled pack versions, import an updated pack offline with a diff of what changed, share a single rule, import a rule someone sent you. See [Signature pack](#signature-pack).
 
 ### Setup
@@ -293,7 +294,7 @@ A pack can also be dropped on the phone as an override and reloaded from Setup w
 
 ## Privacy
 
-- No network permission. Nothing leaves the phone except files you export yourself.
+- No network permission. Nothing leaves the phone except files you export yourself — including **More → Share diagnostics**, a scrubbed report (no coordinates, cell IDs, rotating addresses or personal device names) that you read in full and then hand to the share sheet.
 - Detections, alerts, history, fingerprints and recordings live in the app's private storage and are excluded from Android backup and device transfer.
 - Full policy: [docs/index.html](docs/index.html) (also at [pmcbrien.github.io/wavelens](https://pmcbrien.github.io/wavelens/)).
 
