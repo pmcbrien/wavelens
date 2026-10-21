@@ -14,7 +14,6 @@ disagree, the code wins and this file has a bug.
 |---|---|
 | `assets/signatures.json` | Bundled pack. Always present, read-only. |
 | `filesDir/signatures.json` | Imported pack. If present and parseable it replaces the bundled pack entirely (no merging). Deleted by **Revert to bundled**, or automatically if it fails to parse at startup. |
-| `filesDir/user_rules.json` | Your overlay: single rules you imported. Loaded after the pack; a user rule with the same `id` as a pack rule replaces it. Survives pack imports and reverts. |
 
 ## Pack layout
 
@@ -133,90 +132,9 @@ From `Classifier.classify`:
 Corollary: a weight-100 heuristic beats a weight-50 registry match. Give the registry
 identifiers the higher weight.
 
-## Single-rule files
+## Reporting a signature
 
-**Share a rule** renders one rule as the object above. **Import a rule…** accepts either a
-bare rule object or `{"rules": [ one rule ]}` and validates it: id format, known category,
-confidence/weight/verified types, a `match` with at least one known predicate and no
-unknown ones, regexes that compile, OUIs that are 6 hex digits, decimal `manufacturers`,
-`sources` from the list above, and well-formed `mfgPrefix` / `sdPrefix` entries. The
-preview shows whether the id overrides a pack rule. Accepted rules are written to
-`user_rules.json`:
-
-```json
-{
-  "_readme": "User rule overlay for Wavelens. Rules here override pack rules with the same id.",
-  "rules": [ { ...rule... } ]
-}
-```
-
-Pack imports are more lenient than single-rule imports: they only require valid JSON, a
-`rules` array, unique non-empty ids and at least one rule, because a pack that reached
-you has normally been reviewed already.
-
-## Examples
-
-A name heuristic limited to one radio:
-
-```json
-{
-  "id": "example-name",
-  "category": "CAMERA",
-  "confidence": "LIKELY",
-  "weight": 60,
-  "verified": false,
-  "note": "Example doorbell advertising its model name; collides with any device named the same",
-  "match": { "nameRegex": "(?i)^examplecam-", "sources": ["BLE"] }
-}
-```
-
-A registry identifier (company ID plus a payload prefix):
-
-```json
-{
-  "id": "example-mfg-prefix",
-  "category": "TRACKER",
-  "confidence": "CONFIRMED",
-  "weight": 100,
-  "verified": true,
-  "note": "Example vendor company ID with the tag's advertisement type byte",
-  "source": "https://www.bluetooth.com/specifications/assigned-numbers/",
-  "checked": "sig-2026-10-18",
-  "match": { "manufacturers": [65535], "mfgPrefix": [{ "id": 65535, "hex": "01" }] }
-}
-```
-
-A Wi-Fi SSID with a vendor OUI, both required:
-
-```json
-{
-  "id": "example-ssid-oui",
-  "category": "ALPR",
-  "confidence": "CONFIRMED",
-  "weight": 100,
-  "verified": true,
-  "note": "Example camera in setup mode: vendor OUI and its provisioning SSID together",
-  "match": { "sources": ["WIFI"], "ssidRegex": "^EXAMPLE-[0-9A-F]{4}$", "ouis": ["00:00:5E"], "publicAddr": true }
-}
-```
-
-## How to contribute signatures
-
-Signatures are the part of Wavelens that most benefits from other people's captures.
-
-1. Open a pull request against the repository that edits
-   `app/src/main/assets/signatures.json`. **One rule per PR** so each identifier can be
-   reviewed and reverted on its own.
-2. Cite the source in the rule's `source` field: the registry page for an OUI or company
-   ID, or the write-up / capture that documents a name, SSID or payload prefix. Rules
-   without a source are not merged.
-3. Set `verified` honestly. Registry identifiers are `true`; anything inferred from a
-   name, SSID or third-party research is `false`.
-4. Bump `pack_version` by one and set `pack_date` to the day of the change.
-5. Include, in the PR description, the CSV export (Setup screen) or a Sessions recording
-   excerpt that shows the device matching — with coordinates and anything personal
-   removed. Replay (Setup → Sessions) is the quickest way to test a rule against a
-   previous drive before opening the PR.
-
-Rules you only want on your own phone do not need a PR: import them from **More →
-Signature packs → Import a rule…** and they persist across pack updates.
+Wavelens has no rule-sharing or crowd-sourcing feature by design. If a device is
+misclassified or unclassified, open an issue in the repository describing the hardware
+and what the card showed (category, confidence, matched rules, vendor). Do not post
+coordinates, full addresses or raw payloads. Pack updates ship with the app.

@@ -117,8 +117,8 @@ Feature screens that don't need a tab of their own:
 - **Tails** — the unified "is this device tailing me?" verdict with a map replay of your path against the device's hits and gaps. See [Tails](#tails).
 - **Trips** — a report for every drive: duration, distance, cameras passed, trackers heard, anything that rode or followed, alerts raised; export as PDF or KML. See [Trips](#trips).
 - **What is this?** — a plain‑English card for every category and every verdict: what the hardware is, who deploys it, what it can and can't see, how Wavelens recognises it, what to do, and the public sources. The same cards open from the **What is this?** button on any expanded device card.
-- **Share diagnostics** — builds a scrubbed report (app/Android version, scanner health and restarts, your alert settings, device counts by category, classified hardware by vendor prefix, optionally unclassified devices for signature research and this session's alerts by category) and hands it to the share sheet. The app has no network permission, so nothing goes anywhere until you pick where.
-- **Signature packs** — see the active and bundled pack versions, import an updated pack offline with a diff of what changed, share a single rule, import a rule someone sent you. See [Signature pack](#signature-pack).
+- **Share diagnostics** — builds a scrubbed report (app/Android version, scanner health and restarts, your alert settings, device counts by category, classified hardware by vendor prefix, optionally this session's alerts by category) and hands it to the share sheet. The app has no network permission, so nothing goes anywhere until you pick where.
+- **Signature packs** — see the active and bundled pack versions, and import an updated pack offline with a diff of what changed. See [Signature pack](#signature-pack).
 
 ### Setup
 Every setting, in the order it appears on the screen. Defaults in **bold**.
@@ -267,28 +267,11 @@ CSV of all emitters, CSV of cell sites, KML for Google Earth, the alert log, the
 
 ---
 
-## Community map — contribute what you find
-
-Wavelens users can pool the location of **fixed** surveillance infrastructure — plate readers, traffic sensors, acoustic sensors — into one shared map, `community/emitters.geojson`, that anyone can load into the app.
-
-**What gets shared.** Only emitters in those three categories, heard in the same spot on three or more separate drives, positioned by the averaged peak and rounded to about 100 m. No trips, no addresses or MACs (entries are keyed by a one‑way hash), no timestamps finer than a day, and nothing from the camera/doorbell, network, body‑cam, vehicle, phone or wearable classes — those are either mobile or someone's home.
-
-**How to contribute.**
-1. Setup → **Community map → Preview share pack**. Untick anything you'd rather keep to yourself, then **Export**.
-2. Open a [Contribute emitters](../../issues/new?template=contribute.yml) issue and drag the `.geojson` file in.
-3. A bot validates it (categories, rounding, no identifiers), merges it, and opens a pull request. Once reviewed, it's on the map.
-
-**How to use it.** Download [`community/emitters.geojson`](community/emitters.geojson) to your phone, then Setup → **Community map → Import community map**. Those emitters become part of your known‑fixed baseline immediately: they stop alerting as "new" near home, and when you drive somewhere another contributor has mapped, you inherit their catalogue.
-
-The app never uploads anything; every step above is a file you choose to share. Contributions are CC0.
-
----
-
 ## Signature pack
 
 The signature pack that ships inside the app: rules are AND‑matched on OUI prefixes, service UUIDs (with wildcards), manufacturer‑data prefixes, service‑data prefixes, names, SSIDs, Wi‑Fi capabilities and channel. Each rule carries a category, confidence, weight and a short explanation that is shown on the card. The pack is versioned and the version shows in the status line.
 
-A pack can also be dropped on the phone as an override and reloaded from Setup without reinstalling the app. **More → Signature packs** shows the active and bundled pack versions, imports a pack with a diff (added / removed / changed rules, "12 new ALPR vendors"), refuses an older pack unless you confirm the downgrade, and lets you share one rule as JSON or import a rule someone sent you into a user overlay that wins over the pack by id. The rule schema is documented in [docs/SIGNATURES.md](docs/SIGNATURES.md). Found something the pack doesn't know? Open an issue with the capture row (the CSV export has everything needed) and what the device turned out to be.
+A pack can also be dropped on the phone as an override and reloaded from Setup without reinstalling the app. **More → Signature packs** shows the active and bundled pack versions, imports a pack with a diff (added / removed / changed rules, "12 new ALPR vendors"), and refuses an older pack unless you confirm the downgrade. There is no rule sharing or crowd-sourcing of any kind; pack updates ship with the app. The rule schema is documented in [docs/SIGNATURES.md](docs/SIGNATURES.md). Found something the pack doesn't know? Open an issue with the capture row (the CSV export has everything needed) and what the device turned out to be.
 
 ---
 
