@@ -1,7 +1,7 @@
 # Signature packs
 
 Wavelens classifies every emitter it hears against a JSON signature pack. The pack shipped
-in the APK is `app/src/main/assets/signatures.json`. Nothing is ever downloaded: an updated
+in the app is `app/src/main/assets/signatures.json`. Nothing is ever downloaded: an updated
 pack is a file you move to the phone yourself and import from **More → Signature packs**,
 which shows exactly what would change before anything is applied.
 

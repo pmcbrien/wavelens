@@ -5,13 +5,13 @@
 It never connects to, pairs with or transmits to anything. It has **no network access**: no account, no analytics, no uploads. Everything stays on the phone.
 
 <p align="center">
-  <a href="https://github.com/pmcbrien/wavelens/raw/main/wavelens.apk"><img alt="Download the APK" src="https://img.shields.io/badge/Download-Wavelens%20APK-2ea44f?style=for-the-badge&logo=android&logoColor=white"></a>
+  <a href="https://wavelensapp.us/#beta"><img alt="Join the Google Play beta" src="https://img.shields.io/badge/Google%20Play-join%20the%20beta-2ea44f?style=for-the-badge&logo=googleplay&logoColor=white"></a>
   <a href="https://wavelensapp.us"><img alt="Website" src="https://img.shields.io/badge/Website-wavelensapp.us-f5b400?style=for-the-badge&logo=googlechrome&logoColor=white"></a>
 </p>
 
 <p align="center"><a href="https://wavelensapp.us">wavelensapp.us</a> · <a href="https://wavelensapp.us/privacy.html">Privacy policy</a> · <a href="https://wavelensapp.us/support.html">Support</a> · <a href="https://youtu.be/8R2Y43eKz08">30-second spot</a> · <a href="https://www.facebook.com/profile.php?id=61595528948738">Facebook</a></p>
 
-> **Free APK, no sign-up.** Tap the button above or download [`wavelens.apk`](https://github.com/pmcbrien/wavelens/raw/main/wavelens.apk) straight from this repo. Android 8.0+ (API 26).
+> **Available on Google Play** — currently in closed testing. [Request beta access](mailto:wavelensapp@gmail.com?subject=Wavelens%20beta%20tester) and get it free. Android 8.0+ (API 26).
 
 <p align="center">
   <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-promo.mp4"><img src="docs/promo/body-cam-alert.jpg" width="92%" alt="Night drive: Wavelens warns the driver of a body cam ahead"></a><br>
@@ -60,14 +60,16 @@ You don't need to be technical. The most useful thing is a few real drives and h
 
 Include your phone model and Android version in the first message; after that, just the screenshot or report. Send everything to **wavelensapp@gmail.com** or [open an issue](https://github.com/pmcbrien/wavelens/issues). Please don't post other people's device names or addresses in public issues — email those.
 
-For the Play test to count, install from the Play Store (not only the APK) after accepting the invite, and keep it installed for the two weeks. Installing from Play over the APK is fine.
+For the Play test to count, install from the Play Store after accepting the invite, and keep it installed for the two weeks.
 
 ---
 
 ## Install
 
-1. On your phone, tap the download button at the top of this page (or [`wavelens.apk`](https://github.com/pmcbrien/wavelens/raw/main/wavelens.apk)).
-2. Open it. Android will ask you to allow installs from your browser — allow it once.
+Wavelens is distributed only through Google Play. While it is in closed testing:
+
+1. Email **[wavelensapp@gmail.com](mailto:wavelensapp@gmail.com?subject=Wavelens%20beta%20tester)** with the Google account on your phone. You'll get an opt-in link and a code that makes the app free.
+2. Open the link on your phone, tap **Become a tester**, redeem the code, and install from the Play Store.
 3. Open Wavelens, tap **SCAN**, read the short disclosure, and grant:
    - **Nearby devices / Bluetooth** — to hear BLE advertisements and classic discovery.
    - **Location (precise)** — Android requires it for any Bluetooth/Wi‑Fi scan results; Wavelens also uses it to geotag detections and to tell when something is moving with you.
@@ -75,7 +77,7 @@ For the Play test to count, install from the Play Store (not only the APK) after
 
 The first scan takes a few seconds to populate. In a city you'll see hundreds of emitters within a minute; the Live screen hides the boring ones by default (see *Main screen* in Setup).
 
-The APK here is the current build; it is replaced in place whenever a new version ships, so re-download from this page to update. When the Play Store version arrives it is signed with a different key, so uninstall this one before installing from the store.
+Updates arrive through the Play Store like any other app. If you installed an early test build from a download link, uninstall it before installing from Play — Android will not update across signing keys.
 
 ---
 
