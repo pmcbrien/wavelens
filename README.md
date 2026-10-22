@@ -302,6 +302,35 @@ A pack can also be dropped on the phone as an override and reloaded from Setup w
 
 ---
 
+## Companion radios
+
+A phone can't choose which Wi‑Fi channel it listens on, can't hear 433/915 MHz or 5.8 GHz at all, and has an antenna the size of a paperclip. A companion is a second radio with a real antenna — an ESP32, a Raspberry Pi with an RTL‑SDR or HackRF, a carputer — that does the listening and hands every hit to Wavelens over Bluetooth. The app treats it exactly like its own packets (same signatures, alerts, history, map, tails and Rule hits) and can tell it which band or channels to park on. Bluetooth only; the app still has no network permission and nothing leaves the phone.
+
+Everything to build one is in [`companion/`](companion/): the one‑page [line protocol](companion/README.md#line-protocol), the [ESP32 firmware](companion/esp32/wavelens_companion/) (Wi‑Fi beacon sniffer with channel park/hop, BLE relay, optional RX5808 5.8 GHz and CC1101/SX1276 sub‑GHz modules), and the [Pi / carputer bridge](companion/pi/wavelens_bridge.py) with feeds for `rtl_433`, `hackrf_sweep`, `rtl_power`, `dump1090` ADS‑B and Kismet. Pair under **More → Companion radio**; the first one heard is adopted automatically.
+
+<p align="center">
+  <a href="companion/diagrams/overview.svg"><img src="companion/diagrams/overview.svg" width="100%" alt="Overview: the phone running Wavelens as a BLE central with an ESP32, a Raspberry Pi with RTL-SDR, a carputer and an Arduino as peripherals, each with a directional antenna"></a>
+</p>
+<p align="center">
+  <a href="companion/diagrams/esp32-directional.svg"><img src="companion/diagrams/esp32-directional.svg" width="49%" alt="ESP32-S3 board wired to an external 2.4 GHz Yagi through a u.FL pigtail and SMA bulkhead, with an optional RX5808 5.8 GHz receiver"></a>
+  <a href="companion/diagrams/pi-sdr-directional.svg"><img src="companion/diagrams/pi-sdr-directional.svg" width="49%" alt="Raspberry Pi with an RTL-SDR into a log-periodic antenna and a monitor-mode Wi-Fi adapter into a panel antenna, Bluetooth to the phone"></a>
+</p>
+<p align="center">
+  <a href="companion/diagrams/carputer.svg"><img src="companion/diagrams/carputer.svg" width="49%" alt="Car side view: roof antenna plate with Yagi, panel and log-periodic, coax into a mini PC in the trunk on a powered USB hub with SDRs"></a>
+  <a href="companion/diagrams/vehicle-mount.svg"><img src="companion/diagrams/vehicle-mount.svg" width="49%" alt="Top view of a car with a Yagi on the roof front edge pointing forward, the beam ahead, the phone on the dash and the companion under the seat"></a>
+</p>
+
+| Build | Hears | Parks on a channel? |
+|---|---|---|
+| ESP32 (‑U board with u.FL) | 2.4 GHz Wi‑Fi hotspots and BLE adverts · optional 5.8 GHz video carriers · optional 433/315 MHz decoders | Yes |
+| Raspberry Pi + RTL‑SDR | rtl_433's sub‑GHz decoders (TPMS, fobs, sensors) · band sweeps below 1.7 GHz · ADS‑B · monitor‑mode Wi‑Fi | No |
+| Pi or carputer + HackRF | Energy sweeps 1 MHz–6 GHz: 5.8 GHz video, 1.2 GHz links, 900 MHz LoRa, 433/315 MHz bursts | No |
+| Arduino | Only with a BLE module and a radio module — [build the ESP32 instead](companion/diagrams/arduino.svg) | — |
+
+**Status:** the app side ships in the current build. The firmware and bridge are written against the documented APIs and have not yet been run on hardware; expect to fix a signature or two on first build, and please send a pull request when you do. A directional antenna makes the app hear more and sooner; it does not keep an oncoming car at highway speed in range any longer — see [Does it work?](https://wavelensapp.us/results.html).
+
+---
+
 ## Privacy
 
 - No network permission. Nothing leaves the phone except files you export yourself — including **More → Share diagnostics**, a scrubbed report (no coordinates, cell IDs, rotating addresses or personal device names) that you read in full and then hand to the share sheet.
