@@ -91,6 +91,7 @@ The APK here is the current build; it is replaced in place whenever a new versio
 | Item tracker | AirTag, SmartTag, Tile, Chipolo, Find My / FMDN beacons | amber |
 | Traffic / MAC sensor | Bluetooth travel‑time and occupancy sensors | amber |
 | Camera / doorbell | Ring, Nest, Arlo, Wyze, Blink, Kuna, Eufy | amber |
+| Fleet / telematics | Samsara, Lytx, SmartDrive, Zonar, CalAmp, Trapeze, Luminator, Init, PeopleNet, Trimble, Seon, Verizon Connect — and the Cradlepoint, Sierra Wireless and Peplink routers every fleet uses | blue |
 | Vehicle / TPMS | BLE tyre sensors, OBD dongles, car head units | blue |
 | Phone / tablet | Apple Continuity, Android, Windows | blue |
 | Wearable / audio | watches, earbuds, hearing aids | blue |
@@ -204,6 +205,7 @@ Radio changes take effect on the next **SCAN**.
 |---|---|---|
 | Alert on recurring devices | **on** | Says "Recurring device" once per session for a device seen at home *and* elsewhere, or in three places, on two or more days. **Ack** silences it; **Mine** fingerprints it as yours. |
 | Quiet known fixed emitters | **on** | A camera or AP you've passed in the same spot in three or more sessions is scenery: it's logged as *known fixed* rather than alerted. Does not apply to flagged, following, riding or separated devices. |
+| Confirm vendor-only hardware on a second pass | **on** | A plate‑reader, body‑cam, camera or sensor hit that rests on a vendor prefix alone (*Possible*) is a pole or a bus, an ambulance, a fleet truck with the same radio — one packet cannot tell. Heard once at speed it is listed and tagged but does not tone; it alerts when heard at the same spot on another day (then shown as *fixed*, Likely), or, parked, after two minutes in range. Named and registered signatures alert on the first packet regardless. |
 | Forget one‑off devices after | **30 days** (7–90) | Retention for devices heard in a single session. Recurring devices and fixed emitters are kept. |
 
 Also here: the count of known fixed emitters at your current location, recurring devices pending review, **Export history CSV**, **Clear history**.
