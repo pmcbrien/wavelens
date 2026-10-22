@@ -1,6 +1,6 @@
 # Wavelens
 
-**See what's transmitting around you.** Wavelens is a passive radio scanner for Android. It listens to the Bluetooth, Wi‑Fi and cellular signals that nearby devices already broadcast, classifies them against an offline signature pack, and tells you in plain language what they are — item trackers, fixed cameras and licence‑plate readers, body‑worn cameras, drones, doorbells, phones, vehicles — and whether any of them is moving with you.
+**Is something travelling with you?** Wavelens is a passive radio scanner for Android. It listens to the Bluetooth, Wi‑Fi and cellular signals that nearby devices already broadcast, classifies them against an offline signature pack, and answers the question that matters: whether any of them — an item tracker, a phone, a car — is moving with you. Along the way it names what it can be sure of (trackers, Remote ID drones) and flags what it can only suspect (hardware from the makers of plate readers, body cams and sensors).
 
 It never connects to, pairs with or transmits to anything. It has **no network access**: no account, no analytics, no uploads. Everything stays on the phone.
 
@@ -97,7 +97,7 @@ The APK here is the current build; it is replaced in place whenever a new versio
 | IoT sensor, beacon, AP / network gear | smart home, iBeacon/Eddystone, routers | green |
 | Cell site | your serving and neighbour towers (RF tab) | grey |
 
-Everything else is bucketed by manufacturer using the IEEE OUI and Bluetooth SIG company registries, which ship inside the app. Confidence is shown as **Possible / Likely / Confirmed** — a vendor prefix alone is *Possible*; a structured, self‑describing frame (Remote ID, Find My) is *Confirmed*.
+Everything else is bucketed by manufacturer using the IEEE OUI and Bluetooth SIG company registries, which ship inside the app. Confidence is shown as **Possible / Likely / Confirmed**. *Confirmed* is reserved for devices that describe themselves — Remote ID, Find My / FMDN frames, a specific service — or a model name backed by the matching vendor. A vendor prefix or company ID alone says "this maker's hardware" and tops out at *Likely*, however many registry rules agree, because the same radio sits in a body cam, its dock and a transit bus. Treat Likely as a reason to look, and Confirmed as a reason to act.
 
 <p align="center">
   <img src="docs/screenshots/drone-detail.png" width="30%" alt="Drone card: confirmed by DJI company ID, vendor prefix and name rule, each match explained">
