@@ -136,7 +136,7 @@ A card's details include first/last seen, packet count, signal now/best/average,
 What is close to you *right now*. Every device heard in the last 10 s / 30 s / 1 min / 3 min, strongest first, ranked by current signal with a small penalty per second since it was last heard. Each row has a large dBm block colour‑coded red (≥ −50, touching the phone) / amber (≥ −65) / green (≥ −80) / blue (weaker), a five‑bar meter, a rough distance hint, a level bar with a white peak‑hold tick, and the trend arrow. Rows for flagged, following, riding or high‑threat devices are tinted red. Use it to walk a car or a room: the top row is the thing you are closest to.
 
 ### HUD
-A driving view: one giant band for the single most important emitter (flagged > following > riding with you > category threat), big chips, and a status strip (emitters heard, seconds since the last packet, scanner restarts). Tap anywhere to switch between *priority* and *strongest‑signal* ordering; long‑press the top band to flag it.
+A driving view in three bands. The **verdict**: one phrase for the whole table, coloured — FOLLOWING, FLAGGED, TRACKER WITH YOU, RIDING WITH YOU, PLATE READER, POSSIBLE CAMERA (a vendor‑only hit on hold for its second pass is amber, never red), WATCHING, CLEAR — with a one‑line reason. The **device** behind it: name, a wide signal meter, distance, closing / steady / pulling away, chips, and two large buttons, MINE (with undo) and FLAG, because gestures are the wrong interface at 45 mph. Then up to three runners‑up and a **status strip**: scanner dot, road mode, a battery warning if the app is optimised, counts, and the sort order (priority / signal) as a tappable chip.
 
 ### Alerts
 Built for "what was that?". One row per alert, newest first, repeats of the same device collapsed with a count; filter chips for cameras & LE gear, trackers, drones, riding & following, recurring; a dot on anything that fired since you last looked, and a count on the tab itself. Each row says what matched, how strong it was then, whether the device is **still here** (with its signal now), and how far from here you were when it fired. Tap one and the device opens — live if it is still in range, otherwise the snapshot from the moment it alerted — with when and where, the tail replay if there is one, Flag / Mine / Ignore, "What is this?", open the spot in your maps app, copy or share the details. A **Recurring devices** block sits at the top and the raw scanner event log folds away underneath. The alert log is also written to disk as CSV as it happens, so a crash or battery death loses nothing and last night's alerts are still there after a restart. Export from Setup.
@@ -158,7 +158,7 @@ Feature screens that don't need a tab of their own:
 - **Signature packs** — see the active and bundled pack versions, and import an updated pack offline with a diff of what changed. See [Signature pack](#signature-pack).
 
 ### Setup
-Every setting, in the order it appears on the screen. Defaults in **bold**.
+Behind the gear in the top bar (Back returns you to where you were). Ten collapsible sections; every setting, in the order it appears. Defaults in **bold**.
 
 <p align="center">
   <img src="docs/screenshots/setup-radios.png" width="30%" alt="Setup: radios, keep screen on, alert channels">
