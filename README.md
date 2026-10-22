@@ -339,6 +339,12 @@ Everything to build one is in [`companion/`](companion/): the one‑page [line p
 | Any SDR build + local FCC pack | Licensed carriers named: which agency or business holds the frequency, and how far its site is | — |
 | Arduino | Only with a BLE module and a radio module — [build the ESP32 instead](companion/diagrams/arduino.svg) | — |
 
+**Range and warning time, simulated.** A link-budget model ([`companion/tools/range_sim.py`](companion/tools/range_sim.py), every assumption in the file): median ranges with line of sight in the beam, reliable range about half. A BLE beacon on a pole: ~60 m for the phone in the car, ~400 m for an ESP32 with a 12 dBi Yagi on the roof &mdash; 1 s versus 12 s of warning at 70 mph. A Wi‑Fi hotspot: ~230 m versus ~1.9 km. TPMS ~340 m and LoRa nodes ~1.3 km on an RTL‑SDR; 5.8 GHz video 1–5 km; licensed radios to the horizon, which is why those are "in range", not "near you". Oncoming traffic at highway speed stays out of reach for anything that has to hear the device first. Full table in [companion/README.md](companion/README.md#range-and-warning-time-simulated).
+
+<p align="center">
+  <a href="companion/diagrams/range-sim.svg"><img src="companion/diagrams/range-sim.svg" width="100%" alt="Bar chart of simulated detection range on a log scale: phone versus ESP32 with a Yagi, RTL-SDR, RX5808 and HackRF, per target"></a>
+</p>
+
 **Status:** the app side ships in the current build. The firmware and bridge are written against the documented APIs and have not yet been run on hardware; expect to fix a signature or two on first build, and please send a pull request when you do. A directional antenna makes the app hear more and sooner; it does not keep an oncoming car at highway speed in range any longer — see [Does it work?](https://wavelensapp.us/results.html).
 
 ---
