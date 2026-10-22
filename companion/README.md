@@ -135,6 +135,38 @@ means that agency's radios are in range — a dispatcher, a cruiser, a repeater 
 ten miles off — not that one is watching you. Unlicensed bands (Wi-Fi, BLE, 433 / 915 MHz
 ISM, 5.8 GHz video) have no license records; the app's own signature pack covers those.
 
+## Range and warning time, simulated
+
+[`tools/range_sim.py`](tools/range_sim.py) is a link-budget model — log-distance path loss,
+stated antenna gains, receiver sensitivities, a radio-horizon cap — with every assumption
+in the file so you can change the antenna or the speed and rerun it. These are **median
+ranges with line of sight in the beam**, not measurements; reliable range (nine passes in
+ten) is roughly half. The Rule hits table in the app is what replaces them with real numbers.
+
+![Simulated detection range, phone vs companion radios](diagrams/range-sim.svg)
+
+| Target | Receiver | Median range | Warning, you at 45 mph | at 70 mph | Oncoming, both at 70 |
+|---|---|---|---|---|---|
+| BLE beacon on a pole (battery pack, accessory radio) | phone | 58 m | 2.2 s | 1.1 s | 0.2 s |
+| BLE beacon on a pole (battery pack, accessory radio) | esp32 | 405 m | 19 s | 12 s | 5.6 s |
+| Wi-Fi hotspot / AP (body cam, setup network) | phone | 231 m | 11 s | 6.7 s | 3.0 s |
+| Wi-Fi hotspot / AP (body cam, setup network) | esp32 | 1.9 km | 96 s | 61 s | 30 s |
+| TPMS sensor / key fob, 315-433 MHz | rtlsdr | 337 m | 16 s | 10.0 s | 4.6 s |
+| Remote / sensor / LoRa node, 433-915 MHz | rtlsdr | 1.3 km | 65 s | 41 s | 20 s |
+| 5.8 GHz FPV video, 200 mW, drone in the air | rx5808 | 4.7 km | 232 s | 149 s | 74 s |
+| 5.8 GHz FPV video, 200 mW (HackRF sweep) | hackrf | 1.1 km | 55 s | 35 s | 16 s |
+| Licensed handheld, 5 W | rtlsdr | 10 km (horizon) | regional — not a warning | | |
+| Licensed mobile, 25 W | rtlsdr | 11 km (horizon) | regional — not a warning | | |
+| Licensed repeater on a tower, 100 W | rtlsdr | 37 km (horizon) | regional — not a warning | | |
+
+Medians with line of sight in the beam; reliable range is roughly half. Riding with you or following you: unlimited — the closing speed is zero. A fixed site you have passed before: 10–15 s from a 300 m history geofence at any speed, with no radio needed (planned).
+
+What the table says in one line: a companion with a directional antenna turns a fixed pole
+from "alert as you pass it" into "alert a block or two ahead," and makes sub-GHz and
+5.8 GHz audible at all. It does not rescue the oncoming-at-highway-speed case; nothing
+that has to hear the device first can. Road mode (first-packet alerts) gives back the
+seconds the app used to spend waiting for a second packet.
+
 ## What a companion does not fix
 
 A directional antenna adds gain where it points and loses it everywhere else. It makes a
