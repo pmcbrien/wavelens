@@ -11,6 +11,7 @@ writing Wavelens lines (see ../README.md) to stdin.
   ./wavelens_bridge.py --rtl-power 300M:1000M:50k        # RTL-SDR: the same idea below 1.7 GHz
   ./wavelens_bridge.py --dump1090 localhost:30003        # ADS-B aircraft from dump1090 / readsb (SBS port)
   ./wavelens_bridge.py --kismet-json /tmp/kismet.json    # Kismet export from a monitor-mode Wi-Fi adapter
+  ./wavelens_bridge.py --fcc-pack fcc-local.json ...     # label licensed carriers by name (see ../tools/fcc_local_pack.py)
   ./wavelens_bridge.py                                   # raw: stdin already in Wavelens line format
 
 Several at once:  rtl_433 -F json | ./wavelens_bridge.py --rtl433 --hackrf-sweep --dump1090 localhost:30003
@@ -22,7 +23,9 @@ not yet run on a Pi by the author.
 """
 
 import argparse
+import bisect
 import json
+import math
 import shlex
 import socket
 import subprocess
@@ -37,7 +40,7 @@ RX = "57617665-6c65-6e73-0100-000000000003"
 FW = "wavelens-bridge 0.1"
 
 out: "Queue[str]" = Queue(maxsize=256)
-state = {"linked": False, "band": "all", "mode": "rf", "ch": "hop"}
+state = {"linked": False, "band": "all", "mode": "rf", "ch": "hop", "lat": None, "lon": None, "pos_at": 0.0}
 
 
 def emit(obj: dict) -> None:
@@ -53,6 +56,73 @@ CAPS = ["rf"]
 
 def hello() -> None:
     emit({"t": "hello", "fw": FW, "name": "Wavelens Pi", "caps": sorted(set(CAPS))})
+
+
+# ---------------------------------------------------------------- local FCC license pack
+
+class FccPack:
+    """Frequency → licensee lookup built by ../tools/fcc_local_pack.py.
+
+    A hit at 453.21 MHz becomes "Licensed: Example County Sheriff's Office · WQZZ001 · public
+    safety" with a category hint from the licensee's name and radio service. When the phone
+    has shared its position (opt-in), the nearest licensed site's distance is included and
+    the nearest licensee wins when several share a frequency.
+    """
+
+    def __init__(self, path: str):
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        self.entries = d.get("entries", [])
+        self.keys = [e["mhz"] for e in self.entries]           # sorted by the builder
+        self.area = d.get("area", {})
+
+    def lookup(self, mhz: float, tol_khz: float = 12.5):
+        """Entries whose assigned frequency (or band) covers mhz ± tol. Nearest-first when a position is known."""
+        lo = bisect.bisect_left(self.keys, mhz - 5.0)
+        hits = []
+        for e in self.entries[lo:]:
+            if e["mhz"] > mhz + 5.0:
+                break
+            half = max(e.get("bw_khz") or 12.5, tol_khz) / 2000.0
+            if e.get("mhz_hi"):
+                ok = e["mhz"] - half <= mhz <= e["mhz_hi"] + half
+            else:
+                ok = abs(e["mhz"] - mhz) <= half
+            if ok:
+                hits.append(e)
+        lat, lon = state.get("lat"), state.get("lon")
+        if lat is not None and lon is not None and time.time() - state.get("pos_at", 0) < 120:
+            def dist(e):
+                ds = [haversine_km(lat, lon, la, lo_) for la, lo_ in e.get("sites", [])]
+                return min(ds) if ds else 1e9
+            hits.sort(key=dist)
+            return [(e, dist(e)) for e in hits]
+        return [(e, None) for e in hits]
+
+    def label(self, mhz: float, tol_khz: float = 12.5):
+        """(name, cat, conf, extras) for a carrier, or None when nothing is licensed there."""
+        hits = self.lookup(mhz, tol_khz)
+        if not hits:
+            return None
+        e, d = hits[0]
+        name = f"Licensed: {e['name'] or e['call']} · {e['call']} · {e['service_label']}"
+        x = {"licensee": e["name"], "call_sign": e["call"], "service": e["service_label"], "place": e.get("place", "")}
+        if d is not None and d < 1e8:
+            x["site_km"] = f"{d:.1f}"
+        if len(hits) > 1:
+            x["other_licensees"] = "; ".join(f"{h['name'] or h['call']} ({h['call']})" for h, _ in hits[1:4])
+        return name, e.get("cat") or "UNKNOWN", "LIKELY", x
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+FCC: "FccPack | None" = None
 
 
 # ---------------------------------------------------------------- spectrum sweeps (HackRF, rtl_power)
@@ -115,16 +185,23 @@ class Sweep:
             if db - f < self.th:
                 continue
             mhz = hz / 1e6
-            name, cat, conf = band_of(mhz)
-            if name is None:
-                continue
+            x = {"over_floor_db": f"{db - f:.0f}", "bin_hz": f"{step:.0f}"}
+            lic = FCC.label(mhz, tol_khz=max(step / 1000.0, 12.5)) if FCC else None
+            if lic:
+                name, cat, conf, lx = lic
+                x.update(lx)
+                ident = f"fcc/{lx['call_sign']}/{mhz:.3f}"
+            else:
+                name, cat, conf = band_of(mhz)
+                if name is None:
+                    continue
+                ident = None
             bucket = round(mhz / self.bucket)
             if now - self.last.get(bucket, 0) < self.rate:
                 continue
             self.last[bucket] = now
-            emit({"t": "rf", "id": f"{self.src}/{bucket * self.bucket:.0f}", "n": name, "f": int(round(mhz)),
-                  "r": int(round(db)), "cat": cat, "conf": conf, "src": self.src,
-                  "x": {"over_floor_db": f"{db - f:.0f}", "bin_hz": f"{step:.0f}"}})
+            emit({"t": "rf", "id": ident or f"{self.src}/{bucket * self.bucket:.0f}", "n": name,
+                  "f": int(round(mhz)), "r": int(round(db)), "cat": cat, "conf": conf, "src": self.src, "x": x})
 
 
 def feed_process(cmd: str, handler) -> None:
@@ -225,17 +302,23 @@ def feed_rtl433(line: str) -> None:
             break
     if "tpms" in model.lower() or "pressure" in d:
         cat, conf = ("VEHICLE", "LIKELY")
-    freq = d.get("freq") or d.get("freq1")
+    freq_f = d.get("freq") or d.get("freq1")
     try:
-        freq = int(float(freq)) if freq else 0
+        freq_f = float(freq_f) if freq_f else 0.0
     except (TypeError, ValueError):
-        freq = 0
+        freq_f = 0.0
+    freq = int(freq_f)
     rssi = d.get("rssi")
     try:
         rssi = int(float(rssi))
     except (TypeError, ValueError):
         rssi = -70
     x = {k: str(v) for k, v in d.items() if k in ("pressure_kPa", "pressure_PSI", "temperature_C", "battery_ok", "mic", "type")}
+    if FCC and cat == "UNKNOWN" and freq_f:
+        lic = FCC.label(freq_f)
+        if lic:
+            _, cat, conf, lx = lic
+            x.update(lx)
     emit({"t": "rf", "id": f"{model}/{ident}", "n": model, "f": freq, "r": rssi, "cat": cat, "conf": conf, "src": "rtl433", "x": x})
 
 
@@ -297,6 +380,17 @@ def run_peripheral(name: str) -> None:
         if c == "ping":
             hello()
             emit({"t": "status", "msg": "ok", "band": state["band"], "mode": state["mode"]})
+        elif c == "pos":
+            # Opt-in from the phone: its GPS fix, so licensed sites can be ranked by distance.
+            # Kept in memory only, never written anywhere, forgotten after two minutes.
+            if cmd.get("lat") is None:
+                state["lat"], state["lon"], state["pos_at"] = None, None, 0.0     # the phone turned sharing off
+            else:
+                try:
+                    state["lat"], state["lon"] = float(cmd["lat"]), float(cmd["lon"])
+                    state["pos_at"] = time.time()
+                except (KeyError, TypeError, ValueError):
+                    pass
         elif c in ("band", "mode", "ch"):
             state[c] = cmd.get("v")
             # An SDR bridge has nothing to park; say so once rather than pretend.
@@ -346,8 +440,15 @@ def main() -> None:
     ap.add_argument("--rtl-power", metavar="SPEC", help="run rtl_power with this -f spec, e.g. 300M:1000M:50k")
     ap.add_argument("--dump1090", metavar="HOST:PORT", help="relay aircraft from a dump1090/readsb SBS port")
     ap.add_argument("--kismet-json", metavar="PATH", help="relay Wi-Fi devices from a Kismet JSON export")
+    ap.add_argument("--fcc-pack", metavar="PATH", help="local FCC license pack from tools/fcc_local_pack.py; labels licensed carriers")
     ap.add_argument("--name", default="Wavelens Pi")
     a = ap.parse_args()
+
+    global FCC
+    if a.fcc_pack:
+        FCC = FccPack(a.fcc_pack)
+        CAPS.append("fcc")
+        print(f"bridge: FCC pack loaded, {len(FCC.entries)} licensed frequencies", file=sys.stderr)
 
     if a.kismet_json:
         CAPS.append("wifi")

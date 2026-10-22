@@ -16,6 +16,7 @@ permission, and nothing the companion hears leaves the phone.
 | [Raspberry Pi + RTL-SDR](pi/) | rtl_433 (hundreds of sub-GHz decoders) · rtl_power band sweeps below 1.7 GHz · dump1090 ADS-B aircraft · monitor-mode USB Wi-Fi via Kismet | No (relays what the tools give it) | A Python script, $60–120 |
 | Pi / carputer + **HackRF** | hackrf_sweep: carriers anywhere from 1 MHz to 6 GHz — 5.8 GHz video, 1.2 GHz links, 900 MHz LoRa, 433 / 315 MHz bursts — as "something is transmitting here" | No | Same script, +$300 |
 | Carputer (any Linux box) | All of the above at once, as many radios as it has USB ports | No | Same script |
+| Any SDR build + [local FCC pack](#local-fcc-license-pack--who-owns-that-carrier) | Licensed carriers named: which agency or business holds the frequency, and how far its site is | — | One script run per area |
 | Arduino | Only with a BLE module (HM-10) *and* a radio module; an ESP32 does both for less | — | Not recommended; see [diagrams](diagrams/) |
 
 Wiring and antenna diagrams: [diagrams/](diagrams/) — overview, ESP32, Pi + SDR, carputer, Arduino, vehicle mounting.
@@ -88,6 +89,8 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 {"c":"band","v":"2g"}                // 2g | 5g | all     (say so in a status if the hardware can't)
 {"c":"ch","v":"hop"}                 // hop every channel of the band
 {"c":"ch","v":[1,6,11]}              // or park on these
+{"c":"pos","lat":27.9,"lon":-82.8}   // opt-in only: the phone's fix, every 10 s, so the companion can rank
+                                     // licensed sites by distance. lat null = sharing turned off; forget it.
 ```
 
 Unknown commands are ignored. Every command may be answered with a `status` line.
@@ -96,6 +99,41 @@ Unknown commands are ignored. Every command may be answered with a `status` line
 
 `ALPR`, `ACOUSTIC`, `DRONE`, `TOOL`, `LE_GEAR`, `TRACKER`, `TRAFFIC_SENSOR`, `CAMERA`,
 `VEHICLE`, `PHONE`, `WEARABLE`, `IOT`, `BEACON`, `NETWORK`, `CELL_SITE`, `UNKNOWN`.
+
+## Local FCC license pack — who owns that carrier
+
+Everything a HackRF or RTL-SDR hears below about 1 GHz that is not an unlicensed ISM band is
+on a frequency somebody holds an FCC license for, with a name, a call sign and usually a
+site. [`tools/fcc_local_pack.py`](tools/fcc_local_pack.py) pulls those out of the FCC
+Universal Licensing System bulk files for one area — a state and some counties, or a radius
+around a point — into a small JSON pack. Hand it to the bridge with `--fcc-pack` and a sweep
+hit at 453.21 MHz comes through as
+
+```
+Licensed: <County> Sheriff's Office · WQAB123 · public safety     (LE_GEAR · Likely)
+```
+
+with the licensee, call sign, service and place in the detail view, instead of "UHF carrier".
+The category hint comes from the licensee's name and radio service (police / sheriff →
+LE gear; DOT / transit → traffic sensor; towing / taxi → vehicle; utilities → IoT; everything
+else unclassified but named). Decoded `rtl_433` hits with no known model get the same
+treatment on their frequency.
+
+```
+mkdir uls && cd uls && curl -O https://data.fcc.gov/download/pub/uls/complete/l_LMpriv.zip && cd ..
+./tools/fcc_local_pack.py --zip uls/l_LMpriv.zip --state FL --county Pinellas --county Hillsborough -o fcc-local.json
+./pi/wavelens_bridge.py --hackrf-sweep --fcc-pack fcc-local.json
+```
+
+Rebuild the pack when you move; the bulk files are refreshed weekly. With **Share my
+position with the companion** on in the app (off by default), the bridge ranks licensees
+sharing a frequency by the distance to their nearest licensed site and reports that distance;
+the position lives only in the bridge's memory.
+
+What this does and does not tell you: a licensed public-safety frequency carrying traffic
+means that agency's radios are in range — a dispatcher, a cruiser, a repeater on a tower
+ten miles off — not that one is watching you. Unlicensed bands (Wi-Fi, BLE, 433 / 915 MHz
+ISM, 5.8 GHz video) have no license records; the app's own signature pack covers those.
 
 ## What a companion does not fix
 
