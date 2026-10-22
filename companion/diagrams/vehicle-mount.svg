@@ -1,0 +1,53 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 980 620' width='980' height='620' font-family='Inter, Helvetica, Arial, sans-serif'>
+<defs><marker id='arr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#9aa5b1'/></marker><marker id='arrb' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#7c3aed'/></marker><marker id='arrr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b45309'/></marker><marker id='arrp' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b91c1c'/></marker><marker id='arrd' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#1d4ed8'/></marker></defs>
+<rect width='980' height='620' fill='#ffffff'/>
+<text x='24' y='34' font-size='20' font-weight='700' fill='#1f2933'>Mounting a directional antenna on the vehicle</text>
+<text x='24' y='56' font-size='12' font-weight='400' fill='#6b7280' text-anchor='start'>Top view. A directional antenna trades all-round coverage for reach in one direction.</text>
+<text x='24' y='72' font-size='12' font-weight='400' fill='#6b7280' text-anchor='start'>Forward is almost always the right direction: it is where fixed hardware appears first.</text>
+<rect x='240' y='260' width='120' height='260' rx='40' fill='#f3f4f6' stroke='#1f2933' stroke-width='2'/>
+<rect x='252' y='310' width='96' height='130' rx='14' fill='#e5e7eb' stroke='#1f2933' stroke-width='1'/>
+<text x='390' y='270' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>forward ▲</text>
+<line x1='300' y1='370' x2='300' y2='290' stroke='#b45309' stroke-width='3'/>
+<line x1='278' y1='360' x2='322' y2='360' stroke='#b45309' stroke-width='3'/>
+<line x1='281' y1='344' x2='319' y2='344' stroke='#b45309' stroke-width='3'/>
+<line x1='284' y1='328' x2='316' y2='328' stroke='#b45309' stroke-width='3'/>
+<line x1='286' y1='312' x2='314' y2='312' stroke='#b45309' stroke-width='3'/>
+<line x1='288' y1='296' x2='312' y2='296' stroke='#b45309' stroke-width='3'/>
+<path d='M324,328 L370,328' fill='none' stroke='#b45309' stroke-width='1' stroke-dasharray='2,3'/>
+<text x='375' y='332' font-size='10' font-weight='600' fill='#b45309' text-anchor='start'>Yagi, mag-mount, roof front</text>
+<path d='M300,290 L245,155 A140,140 0 0 1 355,155 Z' fill='#b45309' fill-opacity='0.12' stroke='#b45309' stroke-opacity='0.5' stroke-dasharray='4,4'/>
+<text x='300' y='140' font-size='10' font-weight='600' fill='#b45309' text-anchor='middle'>≈ 30–45° · 2–3× the range of the phone</text>
+<text x='170' y='390' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>weak</text>
+<text x='450' y='490' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>weak</text>
+<text x='300' y='542' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>behind: much weaker — a tail is the phone&#39;s job, not the Yagi&#39;s</text>
+<rect x='289' y='378' width='22' height='16' rx='3' fill='#ecfdf5' stroke='#0f766e' stroke-width='1.5'/>
+<path d='M312,386 L370,386' fill='none' stroke='#0f766e' stroke-width='1' stroke-dasharray='2,3'/>
+<text x='375' y='390' font-size='10' font-weight='600' fill='#0f766e' text-anchor='start'>phone on the dash</text>
+<rect x='288' y='418' width='24' height='16' rx='2' fill='#fff7ed' stroke='#b45309'/>
+<path d='M312,426 L370,426' fill='none' stroke='#b45309' stroke-width='1' stroke-dasharray='2,3'/>
+<text x='375' y='430' font-size='10' font-weight='600' fill='#b45309' text-anchor='start'>companion under the seat</text>
+<path d='M300,370 C330,380 330,410 302,418' fill='none' stroke='#b45309' stroke-width='1.5' stroke-dasharray='3,3'/>
+<text x='375' y='410' font-size='10' font-weight='400' fill='#6b7280' text-anchor='start'>coax via the door seal</text>
+<rect x='520' y='120' width='430' height='156' rx='6' fill='#f3f4f6' stroke='#9aa5b1' stroke-width='1'/>
+<text x='530' y='138' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Choosing the antenna</text>
+<text x='530' y='152' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'></text>
+<text x='530' y='166' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>2.4 GHz (Wi-Fi + BLE)     9–15 dBi Yagi, or 8 dBi panel. Yagi is longer and narrower;</text>
+<text x='530' y='180' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>                          the panel is flatter and forgiving of aim.</text>
+<text x='530' y='194' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>5 GHz (body-cam hotspots) 14 dBi panel; Yagis are fiddly at 5 GHz.</text>
+<text x='530' y='208' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>315 / 433 / 915 MHz        log-periodic (LPDA). 400–1000 MHz covers all three.</text>
+<text x='530' y='222' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>5.8 GHz (video)            14 dBi patch on the RX5808; tiny.</text>
+<text x='530' y='236' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'></text>
+<text x='530' y='250' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Gain is in dBi: every +3 dB roughly +40% range. 12 dBi ≈ 4× the</text>
+<text x='530' y='264' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>power of the phone&#39;s antenna in the beam, and ≈ none out of it.</text>
+<rect x='520' y='310' width='430' height='156' rx='6' fill='#f3f4f6' stroke='#9aa5b1' stroke-width='1'/>
+<text x='530' y='328' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Rules of thumb</text>
+<text x='530' y='342' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'></text>
+<text x='530' y='356' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Roof, not dash: glass and the roof line eat 2.4 GHz. A mag-mount on</text>
+<text x='530' y='370' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  the steel roof gives the antenna its ground plane for free.</text>
+<text x='530' y='384' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Short coax. RG-58 loses ~1 dB per metre at 2.4 GHz; LMR-240 half that.</text>
+<text x='530' y='398' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Aim slightly up (5–10°): poles and cameras are 4–6 m high.</text>
+<text x='530' y='412' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Keep the phone in the beam if the ESP32 shares the antenna for BLE,</text>
+<text x='530' y='426' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  or give BLE its own stub antenna on dual-u.FL boards.</text>
+<text x='530' y='440' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Transmit power down (esp_wifi_set_max_tx_power) with high-gain</text>
+<text x='530' y='454' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  antennas: the EIRP limit still applies to a sniffer that advertises.</text>
+</svg>

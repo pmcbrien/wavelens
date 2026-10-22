@@ -1,0 +1,94 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 980 700' width='980' height='700' font-family='Inter, Helvetica, Arial, sans-serif'>
+<defs><marker id='arr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#9aa5b1'/></marker><marker id='arrb' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#7c3aed'/></marker><marker id='arrr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b45309'/></marker><marker id='arrp' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b91c1c'/></marker><marker id='arrd' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#1d4ed8'/></marker></defs>
+<rect width='980' height='700' fill='#ffffff'/>
+<text x='24' y='34' font-size='20' font-weight='700' fill='#1f2933'>ESP32 companion with an external directional antenna</text>
+<text x='24' y='56' font-size='12' font-weight='400' fill='#6b7280' text-anchor='start'>Use a board with a u.FL / IPEX connector (ESP32-S3-WROOM-1U, ESP32-WROOM-32U, Seeed XIAO ESP32-C3).</text>
+<text x='24' y='72' font-size='12' font-weight='400' fill='#6b7280' text-anchor='start'>Boards with only a PCB antenna cannot take an external one without surgery.</text>
+<rect x='330' y='150' width='230' height='300' rx='10' fill='#f1f5f9' stroke='#1f2933' stroke-width='2'/>
+<text x='445' y='176' font-size='13' font-weight='700' fill='#1f2933' text-anchor='middle'>ESP32-S3-WROOM-1U dev board</text>
+<rect x='370' y='195' width='150' height='70' rx='4' fill='#cbd5e1' stroke='#1f2933'/>
+<text x='445' y='225' font-size='11' font-weight='600' fill='#1f2933' text-anchor='middle'>ESP32-S3-WROOM-1U</text>
+<text x='445' y='243' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>module (shield can)</text>
+<circle cx='525' cy='205' r='5' fill='#b45309'/>
+<text x='533' y='223' font-size='10' font-weight='700' fill='#b45309' text-anchor='start'>u.FL</text>
+<rect x='428' y='428' width='34' height='22' rx='3' fill='#cbd5e1' stroke='#1f2933'/>
+<text x='445' y='466' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>USB-C</text>
+<rect x='338' y='282' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='292' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>GPIO23</text>
+<text x='300' y='292' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>RX5808 CH1 data</text>
+<rect x='338' y='304' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='314' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>GPIO22</text>
+<text x='300' y='314' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>RX5808 CH2 LE</text>
+<rect x='338' y='326' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='336' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>GPIO21</text>
+<text x='300' y='336' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>RX5808 CH3 clock</text>
+<rect x='338' y='348' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='358' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>GPIO34</text>
+<text x='300' y='358' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>RX5808 RSSI (ADC)</text>
+<rect x='338' y='370' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='380' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>3V3</text>
+<text x='300' y='380' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>RX5808 V+</text>
+<rect x='338' y='392' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='402' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>GND</text>
+<text x='300' y='402' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>RX5808 GND</text>
+<path d='M525,205 C560,205 560,160 600,160' fill='none' stroke='#b45309' stroke-width='2.2'/>
+<rect x='600' y='150' width='22' height='20' rx='3' fill='#fff7ed' stroke='#b45309' stroke-width='1.5'/>
+<text x='611' y='190' font-size='9' font-weight='600' fill='#b45309' text-anchor='middle'>SMA bulkhead</text>
+<text x='611' y='203' font-size='9' font-weight='400' fill='#b45309' text-anchor='middle'>u.FL → SMA pigtail, 10–20 cm</text>
+<path d='M622,160 L700,160' fill='none' stroke='#b45309' stroke-width='3'/>
+<text x='661' y='146' font-size='10' font-weight='600' fill='#b45309' text-anchor='middle'>short coax (LMR-240)</text>
+<line x1='715' y1='160' x2='796.0' y2='160' stroke='#b45309' stroke-width='3'/>
+<line x1='715.0' y1='133.0' x2='715.0' y2='187.0' stroke='#b45309' stroke-width='3'/>
+<line x1='729.4' y1='136.6' x2='729.4' y2='183.4' stroke='#b45309' stroke-width='3'/>
+<line x1='743.8' y1='139.3' x2='743.8' y2='180.7' stroke='#b45309' stroke-width='3'/>
+<line x1='758.2' y1='142.0' x2='758.2' y2='178.0' stroke='#b45309' stroke-width='3'/>
+<line x1='772.6' y1='143.8' x2='772.6' y2='176.2' stroke='#b45309' stroke-width='3'/>
+<line x1='787.0' y1='145.6' x2='787.0' y2='174.4' stroke='#b45309' stroke-width='3'/>
+<text x='760' y='218' font-size='10' font-weight='600' fill='#b45309' text-anchor='middle'>2.4 GHz directional:</text>
+<text x='760' y='231' font-size='10' font-weight='400' fill='#b45309' text-anchor='middle'>9–15 dBi Yagi or 8 dBi panel</text>
+<path d='M797,160 L917,116.32357188805571 A120,120 0 0 1 917,203.6764281119443 Z' fill='#b45309' fill-opacity='0.12' stroke='#b45309' stroke-opacity='0.5' stroke-dasharray='4,4'/>
+<text x='870' y='128' font-size='10' font-weight='600' fill='#b45309' text-anchor='middle'>≈ 30–45° beam</text>
+<path d='M445,450 L445,520' fill='none' stroke='#b91c1c' stroke-width='2'/>
+<rect x='380' y='520' width='130' height='60' rx='8' fill='#fef2f2' stroke='#b91c1c' stroke-width='1.5'/>
+<text x='392' y='542' font-size='13' font-weight='700' fill='#b91c1c' text-anchor='start'>USB 5 V</text>
+<text x='392' y='560' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>car adapter or the</text>
+<text x='392' y='574' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>mount&#39;s USB port</text>
+<rect x='80' y='200' width='92' height='170' rx='12' fill='#ecfdf5' stroke='#0f766e' stroke-width='2'/>
+<rect x='88' y='214' width='76' height='132' rx='4' fill='#ffffff' stroke='#0f766e' stroke-width='1'/>
+<rect x='94' y='222' width='64' height='10' rx='2' fill='#0f766e' fill-opacity='0.5'/>
+<rect x='94' y='240' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.12'/>
+<rect x='94' y='264' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.16999999999999998'/>
+<rect x='94' y='288' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.22'/>
+<rect x='94' y='312' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.27'/>
+<text x='126' y='390' font-size='12' font-weight='700' fill='#0f766e' text-anchor='middle'>Phone · Wavelens</text>
+<text x='126' y='406' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>on the dash, charging</text>
+<line x1='330' y1='232' x2='172' y2='232' stroke='#7c3aed' stroke-width='1.6' marker-end='url(#arrb)' marker-start='url(#arrb)'/>
+<text x='251' y='222' font-size='11' font-weight='600' fill='#7c3aed' text-anchor='middle'>BLE GATT</text>
+<text x='251' y='248' font-size='9' font-weight='400' fill='#7c3aed' text-anchor='middle'>built-in radio; shares</text>
+<text x='251' y='260' font-size='9' font-weight='400' fill='#7c3aed' text-anchor='middle'>the external antenna</text>
+<rect x='610' y='300' width='230' height='110' rx='8' fill='#f9fafb' stroke='#6b7280' stroke-width='1.5'/>
+<text x='622' y='322' font-size='13' font-weight='700' fill='#6b7280' text-anchor='start'>Optional: RX5808 5.8 GHz receiver</text>
+<text x='622' y='340' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>SPI-tuned analog video receiver,</text>
+<text x='622' y='354' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>sweeps 5645–5945 MHz, reports carriers</text>
+<text x='622' y='368' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>as DRONE · Possible. $10 module.</text>
+<text x='622' y='382' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>RSSI pin 0–1.1 V → ADC (GPIO34).</text>
+<rect x='860' y='318' width='60' height='50' rx='4' fill='#fff7ed' stroke='#6b7280' stroke-width='2'/>
+<rect x='872.0' y='328.0' width='36.0' height='30.0' rx='3' fill='none' stroke='#6b7280' stroke-width='1.2'/>
+<text x='890.0' y='384' font-size='11' font-weight='600' fill='#6b7280' text-anchor='middle'>5.8 GHz patch</text>
+<line x1='840' y1='343' x2='858' y2='343' stroke='#6b7280' stroke-width='2' marker-end='url(#arr)'/>
+<path d='M560,290 C590,290 590,320 610,320' fill='none' stroke='#6b7280' stroke-width='1' stroke-dasharray='3,3'/>
+<path d='M560,312 C590,312 590,328 610,328' fill='none' stroke='#6b7280' stroke-width='1' stroke-dasharray='3,3'/>
+<path d='M560,334 C590,334 590,336 610,336' fill='none' stroke='#6b7280' stroke-width='1' stroke-dasharray='3,3'/>
+<path d='M560,356 C590,356 590,344 610,344' fill='none' stroke='#6b7280' stroke-width='1' stroke-dasharray='3,3'/>
+<rect x='24' y='470' width='320' height='156' rx='6' fill='#f3f4f6' stroke='#9aa5b1' stroke-width='1'/>
+<text x='34' y='488' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Antenna notes</text>
+<text x='34' y='502' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'></text>
+<text x='34' y='516' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• The ESP32 transmits on the same antenna it sniffs with,</text>
+<text x='34' y='530' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  so a high-gain Yagi also narrows the BLE link to the phone.</text>
+<text x='34' y='544' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  Keep the phone roughly in the beam, or use the second</text>
+<text x='34' y='558' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  u.FL on dual-antenna boards for BLE.</text>
+<text x='34' y='572' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Power limit: esp_wifi_set_max_tx_power(8) (2 dBm) keeps</text>
+<text x='34' y='586' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  EIRP legal with a 15 dBi antenna.</text>
+<text x='34' y='600' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Mag-mount on the roof pointing forward; coax through</text>
+<text x='34' y='614' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  the door seal; board inside, out of the sun.</text>
+</svg>
