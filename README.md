@@ -168,7 +168,7 @@ Every setting, in the order it appears on the screen. Defaults in **bold**.
 #### Radios
 | Setting | Default | What it does |
 |---|---|---|
-| Classic Bluetooth discovery | **on** | Runs a BR/EDR inquiry every few minutes alongside BLE. Finds older hands‑free kits, some body cams and OBD dongles that don't advertise on BLE. Costs a little battery; the inquiry briefly pauses BLE results. |
+| Classic Bluetooth discovery | **off** | Runs a BR/EDR inquiry every 90 s alongside BLE. Finds older hands‑free kits and OBD dongles that are discoverable (pairing mode) and don't advertise on BLE. Off by default because each inquiry takes the radio away from LE scanning for about 12 s, and on some phones LE did not come back afterwards; when on, the app now stops and restarts the LE scan around each inquiry itself. |
 | Wi‑Fi scanning | **on** | Reads nearby access points and client probes. This is how ALPR units, body cams and dash cams with a hotspot are found. Android throttles scans to four per two minutes unless *Developer options → Wi‑Fi scan throttling* is off. |
 | Cellular neighbour cells | **on** | Logs the serving and neighbour cell sites for the RF tab and the cell CSV. Needs location permission. |
 
