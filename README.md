@@ -138,7 +138,7 @@ What is close to you *right now*. Every device heard in the last 10 s / 30 s / 1
 A driving view: one giant band for the single most important emitter (flagged > following > riding with you > category threat), big chips, and a status strip (emitters heard, seconds since the last packet, scanner restarts). Tap anywhere to switch between *priority* and *strongest‑signal* ordering; long‑press the top band to flag it.
 
 ### Alerts
-Every alert that fired, newest first, with a **Recurring devices** block at the top. The alert log is also written to disk as CSV as it happens, so a crash or battery death loses nothing. Export from Setup.
+Built for "what was that?". One row per alert, newest first, repeats of the same device collapsed with a count; filter chips for cameras & LE gear, trackers, drones, riding & following, recurring; a dot on anything that fired since you last looked, and a count on the tab itself. Each row says what matched, how strong it was then, whether the device is **still here** (with its signal now), and how far from here you were when it fired. Tap one and the device opens — live if it is still in range, otherwise the snapshot from the moment it alerted — with when and where, the tail replay if there is one, Flag / Mine / Ignore, "What is this?", open the spot in your maps app, copy or share the details. A **Recurring devices** block sits at the top and the raw scanner event log folds away underneath. The alert log is also written to disk as CSV as it happens, so a crash or battery death loses nothing and last night's alerts are still there after a restart. Export from Setup.
 
 ### Map
 Trails of moving devices by name over a chosen time window, and **convoys** — groups of devices that keep turning up together.
