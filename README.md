@@ -97,6 +97,17 @@ The APK here is the current build; it is replaced in place whenever a new versio
 | IoT sensor, beacon, AP / network gear | smart home, iBeacon/Eddystone, routers | green |
 | Cell site | your serving and neighbour towers (RF tab) | grey |
 
+With a [companion radio](#companion-radios) — an ESP32, a Pi with an SDR, or a carputer feeding the app over Bluetooth — the list grows to what a phone's radios can't reach:
+
+| With a companion | Examples | How sure |
+|---|---|---|
+| Hotspots on any channel | Body-cam and in-car hotspots on 5 GHz, hidden-SSID setup networks, anything on the channel you park on | Likely — every beacon on a parked channel instead of one sweep in forty; same vendor-prefix rules |
+| Sub-GHz devices | TPMS, garage and gate remotes, weather and door sensors, LoRa / 915 MHz telemetry | Likely — decoded by name with rtl_433 on an RTL-SDR, or a CC1101 / SX1276 on the ESP32 |
+| 5.8 GHz video links | FPV drones, analog camera links, wireless video senders | Possible — a carrier where video lives (RX5808 or a HackRF sweep); nothing names it |
+| Licensed radio, by owner | Sheriff and police dispatch, county DOT, transit, utilities, towing and taxi fleets — by name, call sign and distance to their site | Likely — from the FCC's public license records for your county ([local pack](companion/README.md#local-fcc-license-pack--who-owns-that-carrier)); says whose radios are in range, not that one is watching you |
+| Aircraft overhead | Anything transmitting ADS‑B: callsign, altitude, position | Certain, unclassified — dump1090 on an RTL‑SDR; an airliner is not a drone, so it is shown but never alerted |
+| Any carrier to 6 GHz | 1.2 GHz links, 900 MHz ISM, 433 and 315 MHz bursts, anything that stands out of the noise | Possible — HackRF sweeps report energy by band: "something is transmitting here", never a name without a licence record behind it |
+
 Everything else is bucketed by manufacturer using the IEEE OUI and Bluetooth SIG company registries, which ship inside the app. Confidence is shown as **Possible / Likely / Confirmed**. *Confirmed* is reserved for devices that describe themselves — Remote ID, Find My / FMDN frames, a specific service — or a model name backed by the matching vendor. A vendor prefix or company ID alone says "this maker's hardware" and tops out at *Likely*, however many registry rules agree, because the same radio sits in a body cam, its dock and a transit bus. Treat Likely as a reason to look, and Confirmed as a reason to act.
 
 <p align="center">
@@ -325,6 +336,7 @@ Everything to build one is in [`companion/`](companion/): the one‑page [line p
 | ESP32 (‑U board with u.FL) | 2.4 GHz Wi‑Fi hotspots and BLE adverts · optional 5.8 GHz video carriers · optional 433/315 MHz decoders | Yes |
 | Raspberry Pi + RTL‑SDR | rtl_433's sub‑GHz decoders (TPMS, fobs, sensors) · band sweeps below 1.7 GHz · ADS‑B · monitor‑mode Wi‑Fi | No |
 | Pi or carputer + HackRF | Energy sweeps 1 MHz–6 GHz: 5.8 GHz video, 1.2 GHz links, 900 MHz LoRa, 433/315 MHz bursts | No |
+| Any SDR build + local FCC pack | Licensed carriers named: which agency or business holds the frequency, and how far its site is | — |
 | Arduino | Only with a BLE module and a radio module — [build the ESP32 instead](companion/diagrams/arduino.svg) | — |
 
 **Status:** the app side ships in the current build. The firmware and bridge are written against the documented APIs and have not yet been run on hardware; expect to fix a signature or two on first build, and please send a pull request when you do. A directional antenna makes the app hear more and sooner; it does not keep an oncoming car at highway speed in range any longer — see [Does it work?](https://wavelensapp.us/results.html).
