@@ -319,6 +319,18 @@ The signature pack that ships inside the app: rules are AND‑matched on OUI pre
 
 A pack can also be dropped on the phone as an override and reloaded from Setup without reinstalling the app. **More → Signature packs** shows the active and bundled pack versions, imports a pack with a diff (added / removed / changed rules, "12 new ALPR vendors"), and refuses an older pack unless you confirm the downgrade. There is no rule sharing or crowd-sourcing of any kind; pack updates ship with the app. The rule schema is documented in [docs/SIGNATURES.md](docs/SIGNATURES.md). Found something the pack doesn't know? Open an issue with the capture row (the CSV export has everything needed) and what the device turned out to be.
 
+**Where the rules come from.** Pack 4 has 272 rules, and every one carries the URL it was taken from. Registry facts come first: IEEE MA‑L vendor prefixes, Bluetooth SIG company IDs (identical to Nordic's [bluetooth-numbers-database](https://github.com/NordicSemiconductor/bluetooth-numbers-database)), SIG member service UUIDs (from Wireshark's `data-bluetooth.c`), and published frame specs: IETF DULT for separated trackers, Google FMDN, ASTM F3411 Remote ID and the SIG TPMS service. Device behaviour comes from open research: [AirGuard](https://github.com/seemoo-lab/AirGuard) (tracker frames and separated states), Kismet's UAV table (drone SSID plus vendor‑prefix pairs), flock‑you and its forks plus WiGLE audits (Flock SSIDs only together with the module vendors that carry them), ArduRemoteID, tpms_ble, Tesla's vehicle‑command SDK, Brilliant Labs' firmware and smart‑glasses captures. Rules that rest on a name or SSID are marked heuristic and are never *Confirmed*.
+
+Every proposed rule goes through `tools/signatures/validate.py` before it ships. The script rejects any vendor prefix that isn't in the IEEE registry, and any company ID that isn't in the SIG register. It also rejects a duplicate of an existing rule, and any name or SSID pattern that matches ordinary names such as "iPhone", "JBL Flip 6" or "xfinitywifi" in an alerting category. The 22 Oct pass also corrected rules that community lists had wrong:
+- Camera prefixes listed as Motorola body‑cam gear were Pelco and Avigilon shop cameras.
+- A transit "AVL" prefix was an enterprise Wi‑Fi vendor.
+- A "Tile" company ID was Quuppa.
+- Teltonika's bus routers were filed as covert trackers.
+- Flipper patterns caught Sennheiser MOMENTUM headphones.
+- Plain‑substring vendor matching put 231 engineering firms under Ring cameras and Zildjian under DJI drones.
+
+The device sheet now names every company ID and service UUID it shows (from the bundled tables, offline).
+
 ---
 
 ## Companion radios
