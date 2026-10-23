@@ -30,13 +30,26 @@ Wiring and antenna diagrams: [diagrams/](diagrams/) — overview, ESP32, Pi + SD
 
 ## Pairing
 
-1. Power the companion. It advertises the Wavelens service.
-2. In the app: More → Companion radio → turn on **Use a companion radio**.
-3. Start a scan. The phone's own BLE scan hears the companion, lists it, and — if none
-   is chosen — adopts it automatically. It stays connected for the session and reconnects
-   if the link drops.
-4. Pick where it listens: radio (Wi-Fi / BLE / both / other RF), Wi-Fi band, channels
+1. Power the companion near the phone. It blinks twice, then advertises the Wavelens
+   service as **Wavelens-XXXX** — XXXX is the end of its Bluetooth address, printed on
+   the serial console at boot (`… advertising as Wavelens-3F2A (pair code 3F2A)`).
+2. In the app: **More → Companion radio**. The screen starts looking on its own; tap
+   **Find** to look again. No scan session is needed — it runs a short scan filtered to
+   the Wavelens service, so the companion shows up within a second or two, strongest
+   first, with its code.
+3. Tap **Pair** on yours. It connects immediately; **Blink LED** flashes the board's LED
+   (or the Pi's activity LED) so you know you picked the right box, and **Test link**
+   shows the round-trip time.
+4. That's it. From then on it connects whenever a scan runs or the screen opens, and
+   after a drop it reconnects in the background (OS auto-connect with 3 s → 60 s
+   backoff), so a companion powered by the car's accessory socket just comes back.
+5. Pick where it listens: radio (Wi-Fi / BLE / both / other RF), Wi-Fi band, channels
    (hop or park). The choice is sent on every reconnect.
+
+The link is Bluetooth only, on purpose: the app holds no INTERNET permission, and any
+Wi-Fi socket — even to a box on the dash — would need one. **Not showing up?** on the
+same screen covers the usual causes (held by another app, Bluetooth permission, error
+133) and has a pair-by-address field.
 
 ## Line protocol
 
@@ -55,7 +68,7 @@ an MTU of 247; assume 20-byte chunks if it fails.
 ### Companion → phone
 
 ```jsonc
-{"t":"hello","fw":"wavelens-esp32 0.1","name":"Wavelens ESP32","caps":["wifi","ble","rf"]}
+{"t":"hello","fw":"wavelens-esp32 0.2","name":"Wavelens-3F2A","code":"3F2A","caps":["wifi","ble","rf"]}
 {"t":"status","msg":"parked on 1 channel","band":"all","mode":"both","ch":6}
 
 // Wi-Fi AP / hotspot (beacon or probe response). id = BSSID. ch or f (MHz); the phone derives the other.
@@ -85,6 +98,7 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 
 ```jsonc
 {"c":"ping"}                         // reply with hello + status
+{"c":"blink","v":5}                  // identify: flash the LED for v seconds (1–30)
 {"c":"mode","v":"both"}              // wifi | ble | both | rf
 {"c":"band","v":"2g"}                // 2g | 5g | all     (say so in a status if the hardware can't)
 {"c":"ch","v":"hop"}                 // hop every channel of the band

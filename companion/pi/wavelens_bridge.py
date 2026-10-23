@@ -26,6 +26,7 @@ import argparse
 import bisect
 import json
 import math
+import os
 import shlex
 import socket
 import subprocess
@@ -55,7 +56,7 @@ CAPS = ["rf"]
 
 
 def hello() -> None:
-    emit({"t": "hello", "fw": FW, "name": "Wavelens Pi", "caps": sorted(set(CAPS))})
+    emit({"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""), "caps": sorted(set(CAPS))})
 
 
 # ---------------------------------------------------------------- local FCC license pack
@@ -364,10 +365,37 @@ def feed_stdin(mode: str) -> None:
 
 # ---------------------------------------------------------------- BLE peripheral
 
+def blink(secs: int) -> None:
+    """Identify: flash the Pi's activity LED (needs root) and say so on the console either way."""
+    secs = max(1, min(30, secs))
+    print(f"{FW}: identify — blinking for {secs} s (code {state.get('code', '?')})", file=sys.stderr)
+    led = next((p for p in ("/sys/class/leds/ACT", "/sys/class/leds/led0") if os.path.isdir(p)), None)
+    if not led:
+        return
+    try:
+        with open(f"{led}/trigger", "w") as f:
+            f.write("none")
+        end = time.time() + secs
+        on = False
+        while time.time() < end:
+            on = not on
+            with open(f"{led}/brightness", "w") as f:
+                f.write("1" if on else "0")
+            time.sleep(0.15)
+        with open(f"{led}/trigger", "w") as f:
+            f.write("mmc0")
+    except OSError:
+        pass
+
+
 def run_peripheral(name: str) -> None:
     from bluezero import adapter, peripheral
 
     dongle = list(adapter.Adapter.available())[0]
+    code = dongle.address.replace(":", "")[-4:].upper()
+    if name in ("", "Wavelens Pi", "Wavelens-Pi"):
+        name = f"Wavelens-{code}"          # same scheme as the ESP32: the code is the end of the BT address
+    state["name"], state["code"] = name, code
     dev = peripheral.Peripheral(dongle.address, local_name=name)
     dev.add_service(srv_id=1, uuid=SVC, primary=True)
 
@@ -380,6 +408,9 @@ def run_peripheral(name: str) -> None:
         if c == "ping":
             hello()
             emit({"t": "status", "msg": "ok", "band": state["band"], "mode": state["mode"]})
+        elif c == "blink":
+            threading.Thread(target=blink, args=(int(cmd.get("v") or 5),), daemon=True).start()
+            emit({"t": "status", "msg": "blinking", "band": state["band"], "mode": state["mode"]})
         elif c == "pos":
             # Opt-in from the phone: its GPS fix, so licensed sites can be ranked by distance.
             # Kept in memory only, never written anywhere, forgotten after two minutes.
@@ -427,7 +458,7 @@ def run_peripheral(name: str) -> None:
                 time.sleep(0.005)
 
     threading.Thread(target=pump, daemon=True).start()
-    print(f"{FW}: advertising as {name!r} on {dongle.address}", file=sys.stderr)
+    print(f"{FW}: advertising as {name!r} on {dongle.address}  (pair code {code})", file=sys.stderr)
     dev.publish()
 
 
@@ -441,7 +472,7 @@ def main() -> None:
     ap.add_argument("--dump1090", metavar="HOST:PORT", help="relay aircraft from a dump1090/readsb SBS port")
     ap.add_argument("--kismet-json", metavar="PATH", help="relay Wi-Fi devices from a Kismet JSON export")
     ap.add_argument("--fcc-pack", metavar="PATH", help="local FCC license pack from tools/fcc_local_pack.py; labels licensed carriers")
-    ap.add_argument("--name", default="Wavelens Pi")
+    ap.add_argument("--name", default="", help="advertised name (default Wavelens-XXXX from the adapter address)")
     a = ap.parse_args()
 
     global FCC

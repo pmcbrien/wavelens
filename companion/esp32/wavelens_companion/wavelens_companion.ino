@@ -28,11 +28,14 @@
 #include <NimBLEDevice.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
+#include "esp_mac.h"
 
 // ------------------------------------------------------------------ config
 
-#define FW_NAME     "wavelens-esp32 0.1"
-#define DEV_NAME    "Wavelens ESP32"
+#define FW_NAME     "wavelens-esp32 0.2"
+#ifndef LED_PIN
+#define LED_PIN     2            // on-board LED on most DevKit boards; set -1 if yours has none
+#endif
 #define SVC_UUID    "57617665-6c65-6e73-0100-000000000001"
 #define TX_UUID     "57617665-6c65-6e73-0100-000000000002"
 #define RX_UUID     "57617665-6c65-6e73-0100-000000000003"
@@ -55,6 +58,9 @@ enum Mode { M_BOTH, M_WIFI, M_BLE, M_RF };
 static Mode     mode = M_BOTH;
 static char     band[8] = "all";
 static bool     hopping = true;
+static char     devName[24] = "Wavelens-0000";   // "Wavelens-" + last 4 hex of the BT address
+static char     pairCode[5] = "0000";
+static uint32_t blinkUntil = 0;
 static uint8_t  chList[32];
 static uint8_t  chCount = 0;
 static uint8_t  chIdx = 0;
@@ -146,8 +152,8 @@ static void status(const char* msg) {
 static void hello() {
   char line[QL];
   snprintf(line, sizeof line,
-           "{\"t\":\"hello\",\"fw\":\"%s\",\"name\":\"%s\",\"caps\":[\"wifi\",\"ble\"%s%s]}\n",
-           FW_NAME, DEV_NAME,
+           "{\"t\":\"hello\",\"fw\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\"%s%s]}\n",
+           FW_NAME, devName, pairCode,
 #ifdef HAS_RX5808
            ",\"rf\"",
 #else
@@ -385,6 +391,14 @@ static void applyCommand(const char* line) {
   if (!c) return;
   c += 5;
   if (!strncmp(c, "ping", 4)) { hello(); status("ok"); return; }
+  if (!strncmp(c, "blink", 5)) {
+    const char* bv = strstr(line, "\"v\":");
+    int secs = bv ? atoi(bv + 4) : 5; if (secs < 1 || secs > 30) secs = 5;
+    blinkUntil = millis() + secs * 1000UL;
+    Serial.printf("identify: blinking for %d s (code %s)\n", secs, pairCode);
+    status("blinking");
+    return;
+  }
   const char* v = strstr(line, "\"v\":");
   if (!v) return;
   v += 4;
@@ -439,9 +453,20 @@ static ServerCB serverCb;
 
 // ------------------------------------------------------------------ setup / loop
 
+static void ledTick(uint32_t now) {
+  if (LED_PIN < 0) return;
+  bool on = (int32_t)(blinkUntil - now) > 0 && ((now / 150) & 1);
+  digitalWrite(LED_PIN, on ? HIGH : LOW);
+}
+
 void setup() {
   Serial.begin(115200);
-  NimBLEDevice::init(DEV_NAME);
+  if (LED_PIN >= 0) { pinMode(LED_PIN, OUTPUT); for (int i = 0; i < 2; i++) { digitalWrite(LED_PIN, HIGH); delay(120); digitalWrite(LED_PIN, LOW); delay(120); } }
+  // Name and pair code from the Bluetooth MAC, so two boards in one car are told apart.
+  uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_BT);
+  snprintf(pairCode, sizeof pairCode, "%02X%02X", mac[4], mac[5]);
+  snprintf(devName, sizeof devName, "Wavelens-%s", pairCode);
+  NimBLEDevice::init(devName);
   NimBLEDevice::setMTU(247);
   server = NimBLEDevice::createServer();
   server->setCallbacks(&serverCb);
@@ -452,14 +477,17 @@ void setup() {
   svc->start();
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
-  adv->setName(DEV_NAME);
+  // 128-bit UUID + flags fill most of the 31-byte advert; the name rides in the scan response.
+  NimBLEAdvertisementData sr;
+  sr.setName(devName);
+  adv->setScanResponseData(sr);
   adv->start();
 
   wifiStart();
   bleScanStart();
   rfInit();
   subghzInit();
-  Serial.printf("%s up; advertising as %s\n", FW_NAME, DEV_NAME);
+  Serial.printf("%s up; advertising as %s  (pair code %s)\n", FW_NAME, devName, pairCode);
 }
 
 void loop() {
@@ -467,6 +495,7 @@ void loop() {
   wifiTick(now);
   rfTick(now);
   subghzTick();
+  ledTick(now);
   drain();
   delay(5);
 }
