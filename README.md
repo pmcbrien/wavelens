@@ -25,9 +25,9 @@ It never connects to, pairs with or transmits to anything. It has **no network a
 </p>
 
 <p align="center">
+  <img src="docs/screenshots/alerts-today.png" width="30%" alt="Alerts screen: a body cam and an Inspire 3 drone today, with confidence, signal and range">
   <img src="docs/screenshots/hud-drone.png" width="30%" alt="Driving HUD: a DJI Air 3S drone at -90 dBm, about 35 m away">
   <img src="docs/screenshots/hud-item-tracker.png" width="30%" alt="Driving HUD: a new item tracker 10 m away, four more listed below">
-  <img src="docs/screenshots/live-tracker-detail.png" width="30%" alt="Expanded card for an item tracker: Apple Continuity, with owner, battery full">
 </p>
 
 *Screenshots are from real drives; GPS coordinates are masked. A few are from earlier builds that still carried the working title "SIGINT Scope".*
