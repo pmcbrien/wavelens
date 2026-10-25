@@ -28,6 +28,23 @@ Wiring and antenna diagrams: [diagrams/](diagrams/) — overview, ESP32, Pi + SD
 - **ESP32 + CC1101 / SX1276**: a subset of rtl_433's decoders on a $5 module, tuned to one frequency at a time. The no-Pi way to hear TPMS and 433 MHz.
 - **ADS-B** (`dump1090`, `readsb`): aircraft overhead with callsign, altitude and position in the detail view. Unclassified on purpose — an airliner is not a drone.
 
+## Raspberry Pi: start at boot
+
+To run the bridge headless whenever the car powers the Pi, install it as a service from `pi/`:
+
+```
+cd wavelens/companion/pi
+sudo ./install-service.sh
+```
+
+It copies the bridge to `/usr/local/lib/wavelens`, installs `wavelens-bridge.service`, blacklists the
+kernel TV driver that grabs RTL-SDR dongles, and starts it. Which radios it feeds is set in
+`/etc/default/wavelens-bridge` — by default rtl_433 hopping 315 / 433.92 / 915 MHz; add
+`--hackrf-sweep` or `--dump1090 …` to `WAVELENS_ARGS`. After editing,
+`sudo systemctl restart wavelens-bridge`. Logs: `journalctl -u wavelens-bridge -f`.
+Remove with `sudo ./install-service.sh --remove`. It waits for the Bluetooth adapter at boot and
+restarts itself if a radio is unplugged.
+
 ## Pairing
 
 1. Power the companion near the phone. It blinks twice, then advertises the Wavelens

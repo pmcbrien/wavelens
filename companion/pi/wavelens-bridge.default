@@ -1,0 +1,14 @@
+# /etc/default/wavelens-bridge — settings for wavelens-bridge.service.
+# After editing: sudo systemctl restart wavelens-bridge
+
+# RTL-SDR decoding with rtl_433. Hops 315 / 433.92 / 915 MHz every 30 s with fixed gain.
+# Leave empty if no RTL-SDR is plugged in.
+WAVELENS_RTL433="-f 315M -f 433.92M -f 915M -H 30 -g 40"
+
+# Extra bridge flags. Examples:
+#   --hackrf-sweep                          HackRF energy sweep, 300 MHz–6 GHz
+#   --hackrf-sweep --hackrf-range 5600:5950 HackRF on 5.8 GHz video only (faster passes)
+#   --dump1090 localhost:30003              aircraft from dump1090 / readsb (needs a second dongle)
+#   --fcc-pack /usr/local/lib/wavelens/fcc-local.json
+#   --name Wavelens-Car                     the name the app lists under Find
+WAVELENS_ARGS=""

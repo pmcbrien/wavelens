@@ -1,0 +1,19 @@
+[Unit]
+Description=Wavelens companion bridge (receive-only radios -> Wavelens app over BLE)
+Requires=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=simple
+# Feeds and options live in /etc/default/wavelens-bridge; edit that, not this file.
+EnvironmentFile=-/etc/default/wavelens-bridge
+ExecStart=/usr/local/lib/wavelens/run-bridge.sh
+Restart=always
+RestartSec=5
+# The bridge registers a GATT server and advertisement with BlueZ over D-Bus and
+# opens the SDR's USB device; root is the reliable way to get both on Raspberry Pi OS.
+User=root
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
