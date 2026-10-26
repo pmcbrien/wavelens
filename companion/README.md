@@ -53,7 +53,9 @@ The full step-by-step guide, with every command, is on the website:
 - **Two dongles:** pin each by serial so they can't swap after a reboot. `rtl_test -t` lists serials
   (`No E4000 tuner found` and `PLL not locked` there are normal for R820T dongles). Decoder:
   `WAVELENS_RTL433="-d :SERIAL_A -f 433.92M -f 315M -H 15 -g 40"`; sweep:
-  `WAVELENS_ARGS="--rtl-power 150M:174M:12.5k --rtl-power 806M:815M:12.5k --rtl-power-device SERIAL_B"`.
+  `WAVELENS_ARGS="--rtl-power 902M:928M:25k --rtl-power 1240M:1300M:100k --rtl-power 1559M:1610M:100k --rtl-power-device SERIAL_B --rtl-power-dwell 6"`
+  — 900 MHz ISM / LoRa, 1.2 GHz video links, and the GPS band, where a strong signal is labelled a possible
+  GPS jammer (that band's noise floor is kept from creeping up so a jammer riding with you stays visible).
   Several `--rtl-power` ranges take turns on one dongle (`--rtl-power-dwell`, default 15 s).
   Duplicate serials: `rtl_eeprom -d 1 -s 00000002`, then replug.
 - **Whole range on two dongles:** `WAVELENS_RTL433=""` and

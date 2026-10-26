@@ -164,7 +164,10 @@ BANDS = [
     (777, 798, "Phone transmitting nearby (700 MHz LTE uplink)", "PHONE", "POSSIBLE"),
     (1710, 1780, "Phone transmitting nearby (AWS LTE uplink)", "PHONE", "POSSIBLE"),
     (1240, 1300, "1.2–1.3 GHz video / telemetry link", "DRONE", "POSSIBLE"),
-    (1559, 1610, None, None, None),                       # GNSS: skip
+    # GNSS (GPS L1, Galileo, BeiDou, GLONASS). Satellite signals arrive far below the noise floor,
+    # so anything that rises clearly above it here is local: most often a GPS jammer, sometimes a
+    # GPS repeater (hangars, garages) or interference.
+    (1559, 1610, "GPS band: strong local signal — possible GPS jammer nearby", "TOOL", "POSSIBLE"),
     (902, 928, "900 MHz ISM burst (LoRa, telemetry, meters)", "IOT", "POSSIBLE"),
     (863, 870, "868 MHz ISM burst (EU LoRa, sensors)", "IOT", "POSSIBLE"),
     (433.05, 434.79, "433 MHz ISM burst (remotes, sensors, TPMS)", "IOT", "POSSIBLE"),
@@ -179,6 +182,9 @@ BANDS = [
     (400, 420, "UHF data / telemetry", "UNKNOWN", "POSSIBLE"),
     (450, 470, "UHF voice / data", "UNKNOWN", "POSSIBLE"),
 ]
+
+
+GPS_LO, GPS_HI = 1559e6, 1610e6
 
 
 def band_of(mhz: float):
@@ -215,12 +221,20 @@ class Sweep:
             if f is None:
                 self.floor[hz] = db
                 continue
-            # slow floor: a carrier that stays for minutes becomes the floor, which is what we want for a drive
-            self.floor[hz] = f * 0.97 + db * 0.03
+            # slow floor: a carrier that stays for minutes becomes the floor, which is what we want for a drive.
+            # Not in the GPS band: there the true floor is the empty band, and a jammer riding with you must
+            # not fade into it, so the floor rises ~30x more slowly there (and falls at the normal rate).
+            gps = GPS_LO <= hz <= GPS_HI
+            k = 0.001 if (gps and db > f) else 0.03
+            self.floor[hz] = f * (1 - k) + db * k
             if db - f < self.th:
                 continue
             mhz = hz / 1e6
             x = {"over_floor_db": f"{db - f:.0f}", "bin_hz": f"{step:.0f}"}
+            if gps:
+                x["gps"] = ("satellites are far below the noise floor; a signal this strong is local — "
+                            "usually a jammer, sometimes a GPS repeater or interference. "
+                            "Check whether the phone's location is drifting or dropping out.")
             lic = FCC.label(mhz, tol_khz=max(step / 1000.0, 12.5)) if FCC else None
             if lic:
                 name, cat, conf, lx = lic
