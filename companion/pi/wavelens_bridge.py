@@ -107,14 +107,28 @@ class FccPack:
         hits = self.lookup(mhz, tol_khz)
         if not hits:
             return None
-        e, d = hits[0]
-        name = f"Licensed: {e['name'] or e['call']} · {e['call']} · {e['service_label']}"
+        # A mobile/handheld (station class MO…) frequency is a repeater input: radios transmit there
+        # toward the tower, and a low-power handheld is only audible from close by. Prefer that reading.
+        inputs = [(h, dd) for h, dd in hits if is_input(h)]
+        e, d = (inputs or hits)[0]
+        who = e['name'] or e['call']
+        if is_input(e):
+            name = f"Radio transmitting nearby · {who} repeater input · {e['call']}"
+        else:
+            name = f"Licensed: {who} · {e['call']} · {e['service_label']}"
         x = {"licensee": e["name"], "call_sign": e["call"], "service": e["service_label"], "place": e.get("place", "")}
+        if is_input(e):
+            x["repeater_input"] = "a mobile or handheld transmitting up to its repeater — heard only from close by"
         if d is not None and d < 1e8:
             x["site_km"] = f"{d:.1f}"
         if len(hits) > 1:
             x["other_licensees"] = "; ".join(f"{h['name'] or h['call']} ({h['call']})" for h, _ in hits[1:4])
         return name, e.get("cat") or "UNKNOWN", "LIKELY", x
+
+
+def is_input(e: dict) -> bool:
+    """FCC station class MO, MO3 … = mobile / portable units; on a repeater pair that is the input side."""
+    return str(e.get("class", "")).upper().startswith("MO")
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -144,8 +158,8 @@ BANDS = [
     (433.05, 434.79, "433 MHz ISM burst (remotes, sensors, TPMS)", "IOT", "POSSIBLE"),
     (314, 316, "315 MHz burst (TPMS, key fob)", "VEHICLE", "POSSIBLE"),
     (136, 174, "VHF voice / data", "UNKNOWN", "POSSIBLE"),
-    (806, 824, "800 MHz mobile / portable radio keying up nearby", "UNKNOWN", "POSSIBLE"),
-    (851, 869, "800 MHz tower / trunked site output", "UNKNOWN", "POSSIBLE"),
+    (806, 824, "Radio keying up nearby (800 MHz repeater input)", "UNKNOWN", "POSSIBLE"),
+    (851, 869, "800 MHz tower output (regional, not nearby)", "UNKNOWN", "POSSIBLE"),
     (400, 420, "UHF data / telemetry", "UNKNOWN", "POSSIBLE"),
     (450, 470, "UHF voice / data", "UNKNOWN", "POSSIBLE"),
 ]

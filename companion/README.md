@@ -161,6 +161,15 @@ position with the companion** on in the app (off by default), the bridge ranks l
 sharing a frequency by the distance to their nearest licensed site and reports that distance;
 the position lives only in the bridge's memory.
 
+Repeater inputs: most licensed systems are pairs — the tower transmits on one frequency, handhelds and
+mobiles transmit up to it on another. The pack keeps each frequency's FCC station class, and a hit on a
+mobile (`MO…`) frequency — or anywhere in 806–824 MHz — comes through as *Radio transmitting nearby ·
+<licensee> repeater input*, because a handheld on an input is only audible from close by. Tower outputs
+keep the plain *Licensed:* label.
+
+Check your state's law before sweeping public-safety bands from a vehicle; some restrict it (Florida
+s. 843.16, with an exemption for licensed amateur operators).
+
 What this does and does not tell you: a licensed public-safety frequency carrying traffic
 means that agency's radios are in range — a dispatcher, a cruiser, a repeater on a tower
 ten miles off — not that one is watching you. Unlicensed bands (Wi-Fi, BLE, 433 / 915 MHz
