@@ -45,7 +45,7 @@ RX = "57617665-6c65-6e73-0100-000000000003"
 FW = "wavelens-bridge 0.1"
 
 out: "Queue[str]" = Queue(maxsize=256)
-state = {"linked": False, "band": "all", "mode": "rf", "ch": "hop", "lat": None, "lon": None, "pos_at": 0.0}
+state = {"linked": False, "band": "all", "mode": "rf", "ch": "hop", "park": "off", "lat": None, "lon": None, "pos_at": 0.0}
 
 
 ECHO = False      # --echo: also print every line sent to the phone (watch with journalctl -f)
@@ -147,6 +147,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 FCC: "FccPack | None" = None
+HACKRF_ON = False
 
 
 # ---------------------------------------------------------------- spectrum sweeps (HackRF, rtl_power)
@@ -312,6 +313,15 @@ PERSIST = {"DRONE"}  # these categories must be over the floor on two passes in 
 STEADY_N = 3         # passes in a row over the floor before a carrier counts as steady
 CHAIN_S = 30.0       # a bin's run of hot passes breaks if it isn't revisited within this long
 BG_RATE_S = 60.0     # background bands: at most one report per band per minute
+FLOOR_S = 40.0       # rolling floor time constant (a carrier that stays this long becomes the floor)
+FLOOR_UP_GNSS_S = 1200.0   # ... rising in the GNSS bands, so a jammer riding with you stays visible
+
+# Parked: the HackRF stops sweeping 1 MHz–6 GHz and stays on one 20 MHz slice, so a short transmission
+# there is caught on the pass it happens instead of within a second. "le" is the body-cam-and-radio
+# preset the phone sends: 796–816 MHz, where public-safety handhelds and car radios transmit (700 MHz
+# public-safety mobile 799–805, 800 MHz repeater inputs 806–815). Energy only: "a radio keyed up
+# nearby", never who or what was said. Set another slice with --hackrf-park-range.
+PARK_RANGES = {"le": "796:816"}
 
 
 _band_cache = {}
@@ -379,8 +389,11 @@ class Sweep:
             # slow floor: a carrier that stays for minutes becomes the floor, which is what we want for a drive.
             # Not in the GNSS bands: there the true floor is the empty band, and a jammer riding with you must
             # not fade into it, so the floor rises ~30x more slowly there (and falls at the normal rate).
+            # Time-based, so the floor moves at the same speed whether a pass takes a second (full sweep)
+            # or a few milliseconds (parked): about 40 s to follow a change, ~20 min upward in GNSS.
             w = gnss_window(hz)
-            k = 0.001 if (w and db > f) else 0.03
+            dt = min(max((now - prev_visit) if prev_visit is not None else 1.2, 0.001), 30.0)
+            k = min(1.0, dt / (FLOOR_UP_GNSS_S if (w and db > f) else FLOOR_S))
             self.floor[hz] = f * (1 - k) + db * k
             if w:
                 if not w[2] <= hz <= w[3]:
@@ -500,8 +513,33 @@ def feed_process(cmd: str, handler) -> None:
 
 
 def feed_hackrf(range_mhz: str, bin_hz: int) -> None:
+    """hackrf_sweep over range_mhz, or over the parked slice while the phone has asked to park.
+    A park change stops the running sweep and starts the other one."""
     sw = Sweep("hackrf")
-    feed_process(f"hackrf_sweep -f {range_mhz} -w {bin_hz} -l 32 -g 20", sw.row)
+    while True:
+        park = state.get("park", "off")
+        rng = PARK_RANGES.get(park, range_mhz)
+        cmd = f"hackrf_sweep -f {rng} -w {bin_hz} -l 32 -g 20"
+        try:
+            p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        except FileNotFoundError:
+            print("bridge: hackrf_sweep not found on PATH", file=sys.stderr)
+            return
+        print(f"bridge: hackrf_sweep {rng} MHz" + (f" (parked: {park})" if park in PARK_RANGES else ""), file=sys.stderr)
+
+        def watch(proc=p, was=park):
+            while proc.poll() is None:
+                if state.get("park", "off") != was:
+                    proc.terminate()
+                    return
+                time.sleep(0.2)
+
+        threading.Thread(target=watch, daemon=True).start()
+        for line in p.stdout:
+            sw.row(line)
+        p.wait()
+        if state.get("park", "off") == park:
+            time.sleep(2)                    # it exited by itself (unplugged, error): retry like feed_process
 
 
 def _mhz(v: str) -> float:
@@ -753,6 +791,16 @@ def run_peripheral(name: str) -> None:
                     state["pos_at"] = time.time()
                 except (KeyError, TypeError, ValueError):
                     pass
+        elif c == "park":
+            v = str(cmd.get("v") or "off")
+            state["park"] = v if v in PARK_RANGES else "off"
+            if state["park"] != "off" and not HACKRF_ON:
+                msg = "park noted; no HackRF on this bridge (add --hackrf-sweep)"
+            elif state["park"] != "off":
+                msg = f"parked: HackRF on {PARK_RANGES[state['park']].replace(':', '–')} MHz (radios keying up nearby)"
+            else:
+                msg = "sweeping the full range"
+            emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"], "park": state["park"]})
         elif c in ("band", "mode", "ch"):
             state[c] = cmd.get("v")
             # An SDR bridge has nothing to park; say so once rather than pretend.
@@ -799,6 +847,8 @@ def main() -> None:
     ap.add_argument("--hackrf-sweep", action="store_true", help="run hackrf_sweep and report carriers by band")
     ap.add_argument("--hackrf-range", default="1:6000", help="MHz range for hackrf_sweep (default 1:6000, the whole range)")
     ap.add_argument("--hackrf-bin", type=int, default=500000, help="bin width Hz (default 500000)")
+    ap.add_argument("--hackrf-park-range", metavar="LO:HI", default="",
+                    help="MHz slice the HackRF parks on when the phone asks (default 796:816, public-safety radios)")
     ap.add_argument("--rtl-power", metavar="SPEC", action="append", default=[],
                     help="run rtl_power with this -f spec, e.g. 150M:174M:12.5k; repeat for several ranges, which take turns; "
                          "add @SERIAL to put a range on a specific dongle (one sweep per dongle runs in parallel)")
@@ -813,7 +863,7 @@ def main() -> None:
     ap.add_argument("--name", default="", help="advertised name (default Wavelens-XXXX from the adapter address)")
     a = ap.parse_args()
 
-    global FCC, ECHO
+    global FCC, ECHO, HACKRF_ON
     ECHO = a.echo
     if a.fcc_pack:
         FCC = FccPack(a.fcc_pack)
@@ -823,8 +873,12 @@ def main() -> None:
     if a.kismet_json:
         CAPS.append("wifi")
         threading.Thread(target=feed_kismet_json, args=(a.kismet_json,), daemon=True).start()
+    if a.hackrf_park_range:
+        PARK_RANGES["le"] = a.hackrf_park_range
     if a.hackrf_sweep:
+        HACKRF_ON = True
         CAPS.append("sweep")
+        CAPS.append("park")
         threading.Thread(target=feed_hackrf, args=(a.hackrf_range, a.hackrf_bin), daemon=True).start()
     if a.rtl_power:
         CAPS.append("sweep")

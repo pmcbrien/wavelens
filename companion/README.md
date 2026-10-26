@@ -84,6 +84,16 @@ rolling floor absorbs one that stays. Out of reach entirely: radar guns (10.5 / 
 Starlink (above 10 GHz), and anything that would need decoding to tell apart — a sweep cannot tell
 a fake cell tower from a real one, so the bridge never claims to.
 
+**Parked for body cams & radios.** *More → Tools → Companion radio → Park for body cams & radios*
+trades breadth for speed. An ESP32 keeps BLE on and parks Wi-Fi on channels 1 · 6 · 11 (each
+revisited every 0.75 s instead of every 3.25 s), which is where body-cam and in-car-video hotspots
+and the BLE advertisements of body cams and radio accessories are caught. A HackRF bridge stops the
+full sweep and stays on **796–816 MHz** — 700 MHz public-safety mobile and 800 MHz repeater inputs,
+where handhelds and car radios transmit — so a radio keying up nearby shows on the pass it happens
+(milliseconds) rather than within a second. Energy only: it says a radio transmitted nearby, never
+whose or what. Change the slice with `--hackrf-park-range 450:470` (for example, where your county's
+radios are UHF). Everything else, drones and 5.8 GHz video included, goes quiet while parked.
+
 A Pi with all three receivers: [diagrams/pi-hackrf-2sdr.svg](diagrams/pi-hackrf-2sdr.svg). Put them
 on a **powered USB hub**; a Pi 4 cannot supply a HackRF and two RTL-SDRs on its own.
 
@@ -215,6 +225,8 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 {"c":"band","v":"2g"}                // 2g | 5g | all     (say so in a status if the hardware can't)
 {"c":"ch","v":"hop"}                 // hop every channel of the band
 {"c":"ch","v":[1,6,11]}              // or park on these
+{"c":"park","v":"le"}                // body cams & radios preset (the app also sends mode/band/ch for it);
+                                     // a HackRF bridge parks on 796–816 MHz. "off" = sweep everything again
 {"c":"pos","lat":27.9,"lon":-82.8}   // opt-in only: the phone's fix, every 10 s, so the companion can rank
                                      // licensed sites by distance. lat null = sharing turned off; forget it.
 ```
