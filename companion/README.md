@@ -45,6 +45,32 @@ kernel TV driver that grabs RTL-SDR dongles, and starts it. Which radios it feed
 Remove with `sudo ./install-service.sh --remove`. It waits for the Bluetooth adapter at boot and
 restarts itself if a radio is unplugged.
 
+### Two RTL-SDRs, older cards, and other things learned on real hardware
+
+The full step-by-step guide, with every command, is on the website:
+[wavelensapp.us/companion.html#pi-setup](https://wavelensapp.us/companion.html#pi-setup). The short version of what tends to trip people up:
+
+- **Two dongles:** pin each by serial so they can't swap after a reboot. `rtl_test -t` lists serials
+  (`No E4000 tuner found` and `PLL not locked` there are normal for R820T dongles). Decoder:
+  `WAVELENS_RTL433="-d :SERIAL_A -f 433.92M -f 315M -H 15 -g 40"`; sweep:
+  `WAVELENS_ARGS="--rtl-power 150M:174M:12.5k --rtl-power 806M:824M:12.5k --rtl-power-device SERIAL_B"`.
+  Several `--rtl-power` ranges take turns on one dongle (`--rtl-power-dwell`, default 15 s).
+  Duplicate serials: `rtl_eeprom -d 1 -s 00000002`, then replug.
+- **Antennas:** dongles sold for aircraft come with ~7 cm 1090/978 MHz antennas; use ~17 cm elements for 433 MHz.
+- **One program per dongle:** PiAware/dump1090 holds one. `sudo systemctl disable --now piaware dump1090-fa` frees it.
+- **FCC pack:** add `--fcc-pack` only once the file exists; a missing pack makes the service restart in a loop.
+- **Raspbian Buster (old PiAware cards):** comment out dead third-party apt sources
+  (`sudo sed -i 's|^deb .*flightaware.*|#&|' /etc/apt/sources.list /etc/apt/sources.list.d/*.list`); drop
+  `--break-system-packages` from pip; build rtl_433 from source (`git clone https://github.com/merbanan/rtl_433`,
+  `cmake`, `make`, `sudo make install`); don't run `apt autoremove` (it can remove `rtl-sdr`).
+- **`dpkg: … files list file for package 'X' is missing final newline`:** `sudo mv /var/lib/dpkg/info/X.list ~/`,
+  `sudo apt install --reinstall -y X`, `sudo dpkg --configure -a`, `sudo dpkg --audit`. Several damaged
+  packages means the SD card is failing.
+- **No Bluetooth (`bluetoothctl show` empty):** check for a `disable-bt` overlay in `/boot/config.txt`, that
+  `bluez`, `pi-bluetooth` and `bluez-firmware` are installed, that `hciuart` and `bluetooth` are enabled, and
+  `systemctl status hciuart` / `dmesg | grep -iE "hci|bluetooth|brcm"`.
+- **Update:** `cd ~/wavelens && git pull && cd companion/pi && sudo ./install-service.sh` (settings are kept).
+
 ## Pairing
 
 1. Power the companion near the phone. It blinks twice, then advertises the Wavelens
