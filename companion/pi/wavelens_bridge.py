@@ -10,6 +10,8 @@ writing Wavelens lines (see ../README.md) to stdin.
   ./wavelens_bridge.py --hackrf-sweep                    # HackRF: 1 MHz–6 GHz energy sweep → carriers by band
   ./wavelens_bridge.py --rtl-power 300M:1000M:50k        # RTL-SDR: the same idea below 1.7 GHz
   ./wavelens_bridge.py --rtl-power 150M:174M:12.5k --rtl-power 806M:815M:12.5k --rtl-power-device 00001090
+  ./wavelens_bridge.py --rtl-power 24M:895M:250k@00000978 --rtl-power 895M:1766M:250k@00001090
+                                                         # two dongles splitting the whole RTL-SDR range
                                                          # several ranges take turns on one dongle; pin it by serial
   ./wavelens_bridge.py --dump1090 localhost:30003        # ADS-B aircraft from dump1090 / readsb (SBS port)
   ./wavelens_bridge.py --kismet-json /tmp/kismet.json    # Kismet export from a monitor-mode Wi-Fi adapter
@@ -156,6 +158,11 @@ BANDS = [
     (5645, 5945, "5.8 GHz carrier (FPV video, or Wi-Fi ch 149+)", "DRONE", "POSSIBLE"),
     (5150, 5644, None, None, None),                       # 5 GHz Wi-Fi: skip
     (2400, 2500, None, None, None),                       # 2.4 GHz Wi-Fi / BLE: skip
+    # Phone uplinks (handset → tower). A strong burst here is a phone nearby, very often your own.
+    (663, 698, "Phone transmitting nearby (600 MHz LTE uplink)", "PHONE", "POSSIBLE"),
+    (699, 716, "Phone transmitting nearby (700 MHz LTE uplink)", "PHONE", "POSSIBLE"),
+    (777, 798, "Phone transmitting nearby (700 MHz LTE uplink)", "PHONE", "POSSIBLE"),
+    (1710, 1780, "Phone transmitting nearby (AWS LTE uplink)", "PHONE", "POSSIBLE"),
     (1240, 1300, "1.2–1.3 GHz video / telemetry link", "DRONE", "POSSIBLE"),
     (1559, 1610, None, None, None),                       # GNSS: skip
     (902, 928, "900 MHz ISM burst (LoRa, telemetry, meters)", "IOT", "POSSIBLE"),
@@ -256,20 +263,48 @@ def feed_hackrf(range_mhz: str, bin_hz: int) -> None:
     feed_process(f"hackrf_sweep -f {range_mhz} -w {bin_hz} -l 32 -g 20", sw.row)
 
 
+def _mhz(v: str) -> float:
+    v = v.strip().upper()
+    mult = {"K": 1e-3, "M": 1.0, "G": 1e3}.get(v[-1:], 1e-6)
+    return float(v.rstrip("KMG")) * mult
+
+
+def sweep_interval_s(spec: str) -> int:
+    """rtl_power wants its integration interval to cover one full pass of the range
+    ("buggy if a full sweep takes longer than the interval"). A hop covers ~2 MHz and takes
+    roughly 30 ms, so a 50 MHz range gets 1 s and the full 24–1766 MHz about 26 s."""
+    try:
+        lo, hi = spec.split(":")[:2]
+        hops = abs(_mhz(hi) - _mhz(lo)) / 2.0
+    except (ValueError, IndexError):
+        return 1
+    return max(1, math.ceil(hops * 0.03))
+
+
 def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15) -> None:
     """One range: rtl_power runs continuously. Several: they take turns on the same dongle,
     dwell_s seconds each (rtl_power -e), so VHF and 800 MHz can share one RTL-SDR.
-    device is an index or serial (rtl_power -d matches either)."""
+    device is an index or serial (rtl_power -d matches either). Each dongle gets its own thread."""
     sw = Sweep("rtlpower")          # one floor map keyed by Hz, so the ranges don't disturb each other
     dev = f" -d {shlex.quote(device)}" if device else ""
     if len(specs) == 1:
-        feed_process(f"rtl_power -f {specs[0]}{dev} -i 1 -g 30 -", sw.row)
+        feed_process(f"rtl_power -f {specs[0]}{dev} -i {sweep_interval_s(specs[0])} -g 30 -", sw.row)
         return
     while True:
         for spec in specs:
-            if not run_once(f"rtl_power -f {spec}{dev} -i 1 -g 30 -e {dwell_s}s -", sw.row):
+            i = sweep_interval_s(spec)
+            if not run_once(f"rtl_power -f {spec}{dev} -i {i} -g 30 -e {max(dwell_s, 2 * i)}s -", sw.row):
                 return
             time.sleep(0.5)         # let the dongle close before the next range opens it
+
+
+def group_sweeps(specs: "list[str]", default_device: str) -> "dict[str, list[str]]":
+    """'24M:895M:250k@00000978' pins that range to a dongle; ranges without @ use --rtl-power-device."""
+    groups: "dict[str, list[str]]" = {}
+    for s in specs:
+        spec, _, dev = s.partition("@")
+        groups.setdefault(dev or default_device, []).append(spec)
+    return groups
 
 
 # ---------------------------------------------------------------- ADS-B (dump1090 / readsb, SBS BaseStation port 30003)
@@ -518,7 +553,8 @@ def main() -> None:
     ap.add_argument("--hackrf-range", default="300:6000", help="MHz range for hackrf_sweep (default 300:6000)")
     ap.add_argument("--hackrf-bin", type=int, default=500000, help="bin width Hz (default 500000)")
     ap.add_argument("--rtl-power", metavar="SPEC", action="append", default=[],
-                    help="run rtl_power with this -f spec, e.g. 150M:174M:12.5k; repeat for several ranges, which take turns")
+                    help="run rtl_power with this -f spec, e.g. 150M:174M:12.5k; repeat for several ranges, which take turns; "
+                         "add @SERIAL to put a range on a specific dongle (one sweep per dongle runs in parallel)")
     ap.add_argument("--rtl-power-device", metavar="N|SERIAL", default="",
                     help="which RTL-SDR rtl_power uses: index or serial (see rtl_test); default the first free one")
     ap.add_argument("--rtl-power-dwell", metavar="SECONDS", type=int, default=15,
@@ -545,8 +581,8 @@ def main() -> None:
         threading.Thread(target=feed_hackrf, args=(a.hackrf_range, a.hackrf_bin), daemon=True).start()
     if a.rtl_power:
         CAPS.append("sweep")
-        threading.Thread(target=feed_rtl_power, args=(a.rtl_power, a.rtl_power_device, max(3, a.rtl_power_dwell)),
-                         daemon=True).start()
+        for dev, specs in group_sweeps(a.rtl_power, a.rtl_power_device).items():
+            threading.Thread(target=feed_rtl_power, args=(specs, dev, max(3, a.rtl_power_dwell)), daemon=True).start()
     if a.dump1090:
         CAPS.append("adsb")
         threading.Thread(target=feed_dump1090, args=(a.dump1090,), daemon=True).start()

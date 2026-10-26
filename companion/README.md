@@ -56,6 +56,10 @@ The full step-by-step guide, with every command, is on the website:
   `WAVELENS_ARGS="--rtl-power 150M:174M:12.5k --rtl-power 806M:815M:12.5k --rtl-power-device SERIAL_B"`.
   Several `--rtl-power` ranges take turns on one dongle (`--rtl-power-dwell`, default 15 s).
   Duplicate serials: `rtl_eeprom -d 1 -s 00000002`, then replug.
+- **Whole range on two dongles:** `WAVELENS_RTL433=""` and
+  `WAVELENS_ARGS="--rtl-power 24M:895M:250k@SERIAL_A --rtl-power 895M:1766M:250k@SERIAL_B"` — `@SERIAL` pins a range
+  to a dongle and each dongle sweeps in parallel, a full pass of its half roughly every 14 s. Catches steady
+  carriers; misses short bursts (fobs, TPMS, brief key-ups) and names nothing. Phone uplink bands are labelled as phones.
 - **Antennas:** dongles sold for aircraft come with ~7 cm 1090/978 MHz antennas; use ~17 cm elements for 433 MHz.
 - **One program per dongle:** PiAware/dump1090 holds one. `sudo systemctl disable --now piaware dump1090-fa dump978-fa` frees them
   (serial 00000978 is usually dump978's; `usb_claim_interface error -6` means a dongle is held).
