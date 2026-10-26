@@ -185,6 +185,11 @@ BANDS = [
 
 
 GPS_LO, GPS_HI = 1559e6, 1610e6
+# Where a jammer is judged: GPS L1 (1575.42 MHz) ± 12 MHz, which every common jammer covers.
+# The rest of the GNSS band (Galileo/BeiDou edges, GLONASS at 1598–1606) is swept for the floor
+# but never reported, and keeping clear of the sweep's edges avoids the dongle's edge artefacts.
+JAM_LO, JAM_HI = 1563e6, 1587e6
+SETTLE_S = 2.0       # ignore rtl_power's first rows after it opens the dongle: gain and PLL still settling
 
 
 def band_of(mhz: float):
@@ -205,6 +210,7 @@ class Sweep:
         self.floor = {}       # bin start Hz → EMA of dB
         self.last = {}        # bucket → last report time
         self.gps_prev = {}    # GPS-band row start (MHz) → last time that row looked jammed
+        self.settle_until = 0.0
 
     def row(self, line: str) -> None:
         parts = [p.strip() for p in line.split(",")]
@@ -216,6 +222,8 @@ class Sweep:
         except ValueError:
             return
         now = time.time()
+        if now < self.settle_until:
+            return
         gps_bins, gps_hot = 0, []       # this row's GPS-band bins, and the ones well over the floor
         for i, db in enumerate(vals):
             hz = lo + i * step
@@ -230,6 +238,8 @@ class Sweep:
             k = 0.001 if (gps and db > f) else 0.03
             self.floor[hz] = f * (1 - k) + db * k
             if gps:
+                if not JAM_LO <= hz <= JAM_HI:
+                    continue                 # GNSS but outside the L1 window: floor only, never reported
                 # Judged per row below: a jammer is wide and steady, so one hot bin is not enough.
                 gps_bins += 1
                 if db - f >= self.th:
@@ -336,11 +346,17 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15) -> N
     sw = Sweep("rtlpower")          # one floor map keyed by Hz, so the ranges don't disturb each other
     dev = f" -d {shlex.quote(device)}" if device else ""
     if len(specs) == 1:
-        feed_process(f"rtl_power -f {specs[0]}{dev} -i {sweep_interval_s(specs[0])} -g 30 -", sw.row)
+        cmd = f"rtl_power -f {specs[0]}{dev} -i {sweep_interval_s(specs[0])} -g 30 -"
+        while True:
+            sw.settle_until = time.time() + SETTLE_S + sweep_interval_s(specs[0])
+            if not run_once(cmd, sw.row):
+                return
+            time.sleep(2)
         return
     while True:
         for spec in specs:
             i = sweep_interval_s(spec)
+            sw.settle_until = time.time() + SETTLE_S + i      # first integration after a retune is discarded
             if not run_once(f"rtl_power -f {spec}{dev} -i {i} -g 30 -e {max(dwell_s, 2 * i)}s -", sw.row):
                 return
             time.sleep(0.5)         # let the dongle close before the next range opens it
