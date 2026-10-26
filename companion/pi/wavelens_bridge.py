@@ -163,7 +163,13 @@ BANDS = [
     (699, 716, "Phone transmitting nearby (700 MHz LTE uplink)", "PHONE", "POSSIBLE"),
     (777, 798, "Phone transmitting nearby (700 MHz LTE uplink)", "PHONE", "POSSIBLE"),
     (1710, 1780, "Phone transmitting nearby (AWS LTE uplink)", "PHONE", "POSSIBLE"),
-    (1240, 1300, "1.2–1.3 GHz video / telemetry link", "DRONE", "POSSIBLE"),
+    # L-band: long-range air-traffic and military radars (1215–1390 MHz) sweep past every ~10 s as
+    # one very strong burst, and GPS L2 sits at 1227.6. Not interesting to the app: skip outright.
+    (1215, 1240, None, None, None),
+    (1300, 1390, None, None, None),
+    # 1240–1300 is shared by radar, amateur 23 cm and video/telemetry links; only a carrier that stays
+    # on across passes is reported (see PERSIST), which a rotating radar's burst never does.
+    (1240, 1300, "1.2 GHz carrier: video or telemetry link (also ham 23 cm)", "DRONE", "POSSIBLE"),
     # GNSS (GPS L1, Galileo, BeiDou, GLONASS). Satellite signals arrive far below the noise floor,
     # so anything that rises clearly above it here is local: most often a GPS jammer, sometimes a
     # GPS repeater (hangars, garages) or interference.
@@ -192,6 +198,11 @@ JAM_LO, JAM_HI = 1563e6, 1587e6
 SETTLE_S = 2.0       # ignore rtl_power's first rows after it opens the dongle: gain and PLL still settling
 
 
+# Categories that must be over the floor on two passes in a row (0.5–4 s apart) before they're reported.
+PERSIST = {"DRONE"}
+PERSIST_S = 4.0
+
+
 def band_of(mhz: float):
     for lo, hi, name, cat, conf in BANDS:
         if lo <= mhz <= hi:
@@ -211,6 +222,7 @@ class Sweep:
         self.last = {}        # bucket → last report time
         self.gps_prev = {}    # GPS-band row start (MHz) → last time that row looked jammed
         self.settle_until = 0.0
+        self.hot_at = {}      # bin Hz → time it was over the floor on the previous pass (for PERSIST)
 
     def row(self, line: str) -> None:
         parts = [p.strip() for p in line.split(",")]
@@ -246,6 +258,7 @@ class Sweep:
                     gps_hot.append((hz, db, db - f))
                 continue
             if db - f < self.th:
+                self.hot_at.pop(hz, None)       # quiet on this pass: any earlier burst no longer counts
                 continue
             mhz = hz / 1e6
             x = {"over_floor_db": f"{db - f:.0f}", "bin_hz": f"{step:.0f}"}
@@ -260,6 +273,12 @@ class Sweep:
                     continue
                 ident = None
             bucket = round(mhz / self.bucket)
+            if cat in PERSIST:
+                # a video link transmits continuously; a radar sweep or a glitch shows once
+                prev = self.hot_at.get(hz)
+                self.hot_at[hz] = now
+                if prev is None or not 0.5 < now - prev < PERSIST_S:
+                    continue
             if now - self.last.get(bucket, 0) < self.rate:
                 continue
             self.last[bucket] = now
