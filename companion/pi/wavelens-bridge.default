@@ -8,7 +8,7 @@ WAVELENS_RTL433="-f 315M -f 433.92M -f 915M -H 30 -g 40"
 # Extra bridge flags. Examples:
 #   --hackrf-sweep                          HackRF energy sweep, 300 MHz–6 GHz
 #   --hackrf-sweep --hackrf-range 5600:5950 HackRF on 5.8 GHz video only (faster passes)
-#   --rtl-power 150M:174M:12.5k --rtl-power 806M:824M:12.5k --rtl-power-device 00001090
+#   --rtl-power 150M:174M:12.5k --rtl-power 806M:815M:12.5k --rtl-power-device 00001090
 #                                           RTL-SDR sweeps, VHF and 800 MHz taking turns on the dongle
 #                                           with that serial (rtl_test lists serials); give rtl_433 the
 #                                           other one with -d :SERIAL in WAVELENS_RTL433

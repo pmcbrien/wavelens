@@ -9,7 +9,7 @@ writing Wavelens lines (see ../README.md) to stdin.
   rtl_433 -F json | ./wavelens_bridge.py --rtl433        # RTL-SDR: 433/315/915 MHz decoders (TPMS, remotes, sensors)
   ./wavelens_bridge.py --hackrf-sweep                    # HackRF: 1 MHz–6 GHz energy sweep → carriers by band
   ./wavelens_bridge.py --rtl-power 300M:1000M:50k        # RTL-SDR: the same idea below 1.7 GHz
-  ./wavelens_bridge.py --rtl-power 150M:174M:12.5k --rtl-power 806M:824M:12.5k --rtl-power-device 00001090
+  ./wavelens_bridge.py --rtl-power 150M:174M:12.5k --rtl-power 806M:815M:12.5k --rtl-power-device 00001090
                                                          # several ranges take turns on one dongle; pin it by serial
   ./wavelens_bridge.py --dump1090 localhost:30003        # ADS-B aircraft from dump1090 / readsb (SBS port)
   ./wavelens_bridge.py --kismet-json /tmp/kismet.json    # Kismet export from a monitor-mode Wi-Fi adapter
@@ -46,8 +46,13 @@ out: "Queue[str]" = Queue(maxsize=256)
 state = {"linked": False, "band": "all", "mode": "rf", "ch": "hop", "lat": None, "lon": None, "pos_at": 0.0}
 
 
+ECHO = False      # --echo: also print every line sent to the phone (watch with journalctl -f)
+
+
 def emit(obj: dict) -> None:
     line = json.dumps(obj, separators=(",", ":")) + "\n"
+    if ECHO:
+        print("sent " + line.rstrip(), file=sys.stderr)
     try:
         out.put_nowait(line)
     except Exception:
@@ -158,7 +163,11 @@ BANDS = [
     (433.05, 434.79, "433 MHz ISM burst (remotes, sensors, TPMS)", "IOT", "POSSIBLE"),
     (314, 316, "315 MHz burst (TPMS, key fob)", "VEHICLE", "POSSIBLE"),
     (136, 174, "VHF voice / data", "UNKNOWN", "POSSIBLE"),
-    (806, 824, "Radio keying up nearby (800 MHz repeater input)", "UNKNOWN", "POSSIBLE"),
+    # 800 MHz after rebanding: 806–815 is land-mobile repeater input; 815–824 is now LTE band 26
+    # uplink (phones transmitting to a tower), so a hit there is most likely a phone nearby.
+    (806, 815, "Radio keying up nearby (800 MHz repeater input)", "UNKNOWN", "POSSIBLE"),
+    (815, 824, "Phone transmitting nearby (LTE band 26 uplink)", "PHONE", "POSSIBLE"),
+    (824, 849, "Phone transmitting nearby (850 MHz cellular uplink)", "PHONE", "POSSIBLE"),
     (851, 869, "800 MHz tower output (regional, not nearby)", "UNKNOWN", "POSSIBLE"),
     (400, 420, "UHF data / telemetry", "UNKNOWN", "POSSIBLE"),
     (450, 470, "UHF voice / data", "UNKNOWN", "POSSIBLE"),
@@ -517,10 +526,12 @@ def main() -> None:
     ap.add_argument("--dump1090", metavar="HOST:PORT", help="relay aircraft from a dump1090/readsb SBS port")
     ap.add_argument("--kismet-json", metavar="PATH", help="relay Wi-Fi devices from a Kismet JSON export")
     ap.add_argument("--fcc-pack", metavar="PATH", help="local FCC license pack from tools/fcc_local_pack.py; labels licensed carriers")
+    ap.add_argument("--echo", action="store_true", help="print every line sent to the phone on stderr (see it with journalctl -u wavelens-bridge -f)")
     ap.add_argument("--name", default="", help="advertised name (default Wavelens-XXXX from the adapter address)")
     a = ap.parse_args()
 
-    global FCC
+    global FCC, ECHO
+    ECHO = a.echo
     if a.fcc_pack:
         FCC = FccPack(a.fcc_pack)
         CAPS.append("fcc")

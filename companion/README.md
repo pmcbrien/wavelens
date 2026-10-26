@@ -53,7 +53,7 @@ The full step-by-step guide, with every command, is on the website:
 - **Two dongles:** pin each by serial so they can't swap after a reboot. `rtl_test -t` lists serials
   (`No E4000 tuner found` and `PLL not locked` there are normal for R820T dongles). Decoder:
   `WAVELENS_RTL433="-d :SERIAL_A -f 433.92M -f 315M -H 15 -g 40"`; sweep:
-  `WAVELENS_ARGS="--rtl-power 150M:174M:12.5k --rtl-power 806M:824M:12.5k --rtl-power-device SERIAL_B"`.
+  `WAVELENS_ARGS="--rtl-power 150M:174M:12.5k --rtl-power 806M:815M:12.5k --rtl-power-device SERIAL_B"`.
   Several `--rtl-power` ranges take turns on one dongle (`--rtl-power-dwell`, default 15 s).
   Duplicate serials: `rtl_eeprom -d 1 -s 00000002`, then replug.
 - **Antennas:** dongles sold for aircraft come with ~7 cm 1090/978 MHz antennas; use ~17 cm elements for 433 MHz.
@@ -193,7 +193,7 @@ the position lives only in the bridge's memory.
 
 Repeater inputs: most licensed systems are pairs — the tower transmits on one frequency, handhelds and
 mobiles transmit up to it on another. The pack keeps each frequency's FCC station class, and a hit on a
-mobile (`MO…`) frequency — or anywhere in 806–824 MHz — comes through as *Radio transmitting nearby ·
+mobile (`MO…`) frequency — or anywhere in 806–815 MHz (815–849 MHz is phone uplink and is labelled as a phone) — comes through as *Radio transmitting nearby ·
 <licensee> repeater input*, because a handheld on an input is only audible from close by. Tower outputs
 keep the plain *Licensed:* label.
 
