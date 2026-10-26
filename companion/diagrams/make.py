@@ -297,6 +297,85 @@ def pi():
     d.save("pi-sdr-directional.svg")
 
 
+# ---------------------------------------------------------------- 3b. Pi + two RTL-SDRs + HackRF
+
+def pi_hackrf():
+    d = D(1000, 720, "Raspberry Pi + HackRF + two RTL-SDRs")
+    d.lines(24, 56, ["One Pi, three receivers on a powered hub: RTL-SDR A decodes, RTL-SDR B sweeps below 1.7 GHz,",
+                     "the HackRF sweeps the whole 1 MHz–6 GHz range. wavelens_bridge.py sends all of it to the phone over BLE."], 12, MUTED, 16)
+
+    # Pi
+    px, py = 290, 150
+    d.parts.append(f"<rect x='{px}' y='{py}' width='210' height='170' rx='10' fill='#f1f5f9' stroke='{DATA}' stroke-width='2'/>")
+    d.text(px + 105, py + 26, "Raspberry Pi 4", 13, DATA, "700", "middle")
+    d.lines(px + 16, py + 48, ["rtl_433 · rtl_power", "hackrf_sweep · BlueZ 5.x", "python3-bluezero", "wavelens-bridge.service"], 11, INK, 15)
+    for i in range(4):
+        d.parts.append(f"<rect x='{px + 186}' y='{py + 18 + i * 30}' width='18' height='20' rx='2' fill='{'#93c5fd' if i == 0 else '#cbd5e1'}' stroke='{INK}'/>")
+    d.text(px + 195, py + 150, "USB 3", 9, MUTED, anchor="middle")
+    d.parts.append(f"<rect x='{px + 85}' y='{py + 170}' width='40' height='14' rx='2' fill='#cbd5e1' stroke='{INK}'/>")
+
+    # Phone + BLE
+    d.phone(70, 150, "Phone · Wavelens", ["More → Tools →", "Companion radio"])
+    d.arrow(px, 235, 162, 235, BLE, "BLE (Pi built-in)", both=True, lx=226, ly=223)
+
+    # Powered hub
+    hx, hy = 560, 150
+    d.arrow(px + 204, py + 28, hx, py + 28, DATA, width=2)
+    d.parts.append(f"<rect x='{hx}' y='{hy}' width='70' height='330' rx='8' fill='#eff6ff' stroke='{DATA}' stroke-width='2'/>")
+    d.text(hx + 35, hy + 22, "Powered", 11, DATA, "700", "middle")
+    d.text(hx + 35, hy + 36, "USB hub", 11, DATA, "700", "middle")
+    for i in range(3):
+        d.parts.append(f"<rect x='{hx + 48}' y='{hy + 60 + i * 100}' width='18' height='20' rx='2' fill='#cbd5e1' stroke='{INK}'/>")
+    d.path(f"M{hx + 35},{hy + 330} L{hx + 35},{hy + 370}", POWER, width=2, arrow=False)
+    d.box(hx - 45, hy + 370, 160, 50, "Hub power", ["wall adapter or 12 V → 5 V"], POWER, "#fef2f2")
+
+    # Three receivers
+    rx = 680
+    rows = [
+        ("RTL-SDR A · decoder", ["rtl_433, pinned by serial", "315 / 433.92 / 915 MHz", "TPMS, fobs, sensors by name"], DATA,
+         "whip or log-periodic", "315 / 433 / 915 MHz"),
+        ("RTL-SDR B · sweeps", ["rtl_power, pinned by serial", "900 MHz · 1.2 GHz · GPS", "(or ADS-B with dump1090)"], DATA,
+         "wideband discone", "24–1766 MHz"),
+        ("HackRF One · sweeps", ["hackrf_sweep 1 MHz–6 GHz", "~1 s per full pass", "every band labelled"], RF,
+         "ANT500 / 5.8 GHz patch", "1 MHz–6 GHz"),
+    ]
+    for i, (title, lines_, col, ant, band) in enumerate(rows):
+        y = hy + 40 + i * 100
+        d.arrow(hx + 66, y + 30, rx, y + 30, DATA, width=2)
+        d.box(rx, y, 180, 74, title, lines_, col)
+        d.path(f"M{rx + 180},{y + 30} L{rx + 210},{y + 30}", RF, width=3, arrow=False)
+        d.yagi(rx + 214, y + 30, "", RF, 0.42)
+        d.text(rx + 234, y + 64, ant, 9, RF, "600", "middle")
+        d.text(rx + 234, y + 76, band, 9, RF, anchor="middle")
+
+    # Pi power
+    d.path(f"M{px + 105},{py + 184} L{px + 105},{py + 230}", POWER, width=2, arrow=False)
+    d.text(px + 115, py + 210, "USB-C 5 V / 3 A", 10, POWER, "600")
+
+    # Data flow
+    d.box(40, 500, 400, 190, "Data flow on the Pi", [], INK, "#ffffff")
+    flow = [
+        ("rtl_433 -F json", "RTL-SDR A: decoded devices"),
+        ("rtl_power", "RTL-SDR B: carriers below 1.7 GHz"),
+        ("hackrf_sweep", "HackRF: carriers to 6 GHz"),
+        ("wavelens_bridge.py", "band labels, floor, steady vs burst"),
+        ("BlueZ GATT peripheral", "Wavelens lines to the phone"),
+    ]
+    for i, (a_, b_) in enumerate(flow):
+        yy = 540 + i * 28
+        d.text(52, yy, a_, 10, DATA, "700", mono=True)
+        d.text(210, yy, b_, 10, MUTED)
+
+    d.note(470, 590, 510, [
+        "/etc/default/wavelens-bridge",
+        "WAVELENS_RTL433=\"-d :SERIAL_A -f 433.92M -f 315M -f 915M -H 15 -g 40\"",
+        "WAVELENS_ARGS=\"--rtl-power 902M:928M:25k --rtl-power 1559M:1610M:100k",
+        "  --rtl-power-device SERIAL_B --hackrf-sweep\"",
+        "Receive only: nothing here transmits.",
+    ], INK)
+    d.save("pi-hackrf-2sdr.svg")
+
+
 # ---------------------------------------------------------------- 4. carputer
 
 def carputer():
@@ -483,4 +562,4 @@ def vehicle():
 
 
 if __name__ == "__main__":
-    overview(); esp32(); pi(); carputer(); arduino(); vehicle()
+    overview(); esp32(); pi(); pi_hackrf(); carputer(); arduino(); vehicle()

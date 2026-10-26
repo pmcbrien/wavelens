@@ -7,7 +7,7 @@ whatever the radios attached to it produce. Feeds can be combined; add your own 
 writing Wavelens lines (see ../README.md) to stdin.
 
   rtl_433 -F json | ./wavelens_bridge.py --rtl433        # RTL-SDR: 433/315/915 MHz decoders (TPMS, remotes, sensors)
-  ./wavelens_bridge.py --hackrf-sweep                    # HackRF: 1 MHz–6 GHz energy sweep → carriers by band
+  ./wavelens_bridge.py --hackrf-sweep                    # HackRF: whole 1 MHz–6 GHz range, every carrier labelled by band
   ./wavelens_bridge.py --rtl-power 300M:1000M:50k        # RTL-SDR: the same idea below 1.7 GHz
   ./wavelens_bridge.py --rtl-power 150M:174M:12.5k --rtl-power 806M:815M:12.5k --rtl-power-device 00001090
   ./wavelens_bridge.py --rtl-power 24M:895M:250k@00000978 --rtl-power 895M:1766M:250k@00001090
@@ -151,63 +151,193 @@ FCC: "FccPack | None" = None
 
 # ---------------------------------------------------------------- spectrum sweeps (HackRF, rtl_power)
 
-# What a lone carrier in a band most likely is. The phone treats these as hints only.
-# (lo_MHz, hi_MHz, name, category, confidence); first match wins; bands not listed are
-# reported as an unclassified carrier. Wi-Fi/BLE bands are skipped: everything is there.
+# What a carrier in each part of 1 MHz–6 GHz most likely is, from the US frequency allocation
+# table. Energy only: a sweep sees that something is on the air, never what it says, so every
+# label is a hint (POSSIBLE) and nothing is demodulated. The phone treats these as hints only.
+#
+# First match wins, so narrow entries come before the wide bands they sit in.
+#   kind ""         report it (1 MHz buckets, at most every 2 s each)
+#   kind "persist"  report only once it is over the floor on two passes in a row (video links are
+#                   continuous; a rotating radar or a glitch shows once)
+#   kind "bg"       background: broadcast, tower and satellite downlinks, fixed navigation beacons and
+#                   radars. Everywhere, so one entry per band at most once a minute
+#   steady=(...)    the same band means two different things: a carrier still there after STEADY_N passes
+#                   in a row gets the steady label, one that comes and goes gets the burst label
+#   name None       skipped (2.4 / 5 GHz Wi-Fi and Bluetooth: everything is there)
+def B(lo, hi, name, cat="UNKNOWN", conf="POSSIBLE", kind="", steady=None):
+    return {"lo": lo, "hi": hi, "name": name, "cat": cat, "conf": conf, "kind": kind, "steady": steady,
+            "key": f"{lo:g}-{hi:g}"}
+
+
 BANDS = [
-    (5645, 5945, "5.8 GHz carrier (FPV video, or Wi-Fi ch 149+)", "DRONE", "POSSIBLE"),
-    (5150, 5644, None, None, None),                       # 5 GHz Wi-Fi: skip
-    (2400, 2500, None, None, None),                       # 2.4 GHz Wi-Fi / BLE: skip
-    # Phone uplinks (handset → tower). A strong burst here is a phone nearby, very often your own.
-    (663, 698, "Phone transmitting nearby (600 MHz LTE uplink)", "PHONE", "POSSIBLE"),
-    (699, 716, "Phone transmitting nearby (700 MHz LTE uplink)", "PHONE", "POSSIBLE"),
-    (777, 798, "Phone transmitting nearby (700 MHz LTE uplink)", "PHONE", "POSSIBLE"),
-    (1710, 1780, "Phone transmitting nearby (AWS LTE uplink)", "PHONE", "POSSIBLE"),
-    # L-band: long-range air-traffic and military radars (1215–1390 MHz) sweep past every ~10 s as
-    # one very strong burst, and GPS L2 sits at 1227.6. Not interesting to the app: skip outright.
-    (1215, 1240, None, None, None),
-    (1300, 1390, None, None, None),
-    # 1240–1300 is shared by radar, amateur 23 cm and video/telemetry links; only a carrier that stays
-    # on across passes is reported (see PERSIST), which a rotating radar's burst never does.
-    (1240, 1300, "1.2 GHz carrier: video or telemetry link (also ham 23 cm)", "DRONE", "POSSIBLE"),
-    # GNSS (GPS L1, Galileo, BeiDou, GLONASS). Satellite signals arrive far below the noise floor,
-    # so anything that rises clearly above it here is local: most often a GPS jammer, sometimes a
-    # GPS repeater (hangars, garages) or interference.
-    (1559, 1610, "GPS band: strong local signal — possible GPS jammer nearby", "TOOL", "POSSIBLE"),
-    (902, 928, "900 MHz ISM burst (LoRa, telemetry, meters)", "IOT", "POSSIBLE"),
-    (863, 870, "868 MHz ISM burst (EU LoRa, sensors)", "IOT", "POSSIBLE"),
-    (433.05, 434.79, "433 MHz ISM burst (remotes, sensors, TPMS)", "IOT", "POSSIBLE"),
-    (314, 316, "315 MHz burst (TPMS, key fob)", "VEHICLE", "POSSIBLE"),
-    (136, 174, "VHF voice / data", "UNKNOWN", "POSSIBLE"),
-    # 800 MHz after rebanding: 806–815 is land-mobile repeater input; 815–824 is now LTE band 26
-    # uplink (phones transmitting to a tower), so a hit there is most likely a phone nearby.
-    (806, 815, "Radio keying up nearby (800 MHz repeater input)", "UNKNOWN", "POSSIBLE"),
-    (815, 824, "Phone transmitting nearby (LTE band 26 uplink)", "PHONE", "POSSIBLE"),
-    (824, 849, "Phone transmitting nearby (850 MHz cellular uplink)", "PHONE", "POSSIBLE"),
-    (851, 869, "800 MHz tower output (regional, not nearby)", "UNKNOWN", "POSSIBLE"),
-    (400, 420, "UHF data / telemetry", "UNKNOWN", "POSSIBLE"),
-    (450, 470, "UHF voice / data", "UNKNOWN", "POSSIBLE"),
+    # ---- skipped outright
+    B(2400, 2500, None),                              # 2.4 GHz Wi-Fi / BLE / microwave ovens
+    B(5150, 5644, None),                              # 5 GHz Wi-Fi (also airport weather radar 5600–5650)
+    B(5926, 6000, None),                              # Wi-Fi 6E
+    B(1215, 1240, None),                              # GPS L2 + long-range air-traffic radar bursts
+    B(1300, 1390, None),                              # long-range air-traffic and military radar
+    B(1400, 1427, None),                              # radio astronomy: protected, nothing should transmit
+
+    # ---- narrow, specific
+    B(121.4, 121.6, "Aviation emergency frequency 121.5 MHz (ELT beacon or guard call)"),
+    B(242.9, 243.1, "Military aviation emergency frequency 243.0 MHz (beacon or guard call)"),
+    B(406.0, 406.1, "406 MHz distress beacon (EPIRB / PLB / ELT)"),
+    B(161.95, 162.05, "AIS: ship or boat position transponder nearby"),
+    B(144.37, 144.41, "APRS 144.39 MHz: amateur position beacon"),
+    B(462.54, 462.74, "Walkie-talkie nearby (FRS / GMRS)"),
+    B(467.54, 467.74, "Walkie-talkie nearby (FRS / GMRS)"),
+    B(978, 978.5, "Aircraft ADS-B (978 MHz UAT): small plane nearby"),
+    B(1029.5, 1030.5, "Secondary radar interrogation (1030 MHz): airport or military radar nearby"),
+    B(1089.5, 1090.5, "Aircraft transponder (1090 MHz, Mode S / ADS-B) nearby"),
+    B(26.96, 27.41, "CB radio transmitting nearby (trucks, CB users)", "VEHICLE"),
+
+    # ---- unlicensed Part 15 / ISM devices
+    B(314, 316, "315 MHz burst (TPMS, key fob)", "VEHICLE"),
+    B(299, 319, "Key fob or garage remote (300–318 MHz)", "VEHICLE"),
+    B(389.5, 390.5, "Garage remote (390 MHz)", "VEHICLE"),
+    B(433.05, 434.79, "433 MHz ISM burst (remotes, sensors, TPMS)", "IOT"),
+    B(902, 928, "900 MHz ISM burst (LoRa, telemetry, meters)", "IOT",
+      steady=("Steady 900 MHz carrier: toll gantry or RFID / gate reader", "TRAFFIC_SENSOR", "POSSIBLE")),
+    B(863, 870, "868 MHz ISM burst (EU LoRa, sensors)", "IOT"),
+    B(49.8, 49.9, "49 MHz baby monitor, toy or old cordless phone", "IOT"),
+    B(72, 76, "72 MHz radio-control model (RC aircraft)", "DRONE"),
+
+    # ---- video and drone links
+    B(5645, 5849, "5.8 GHz carrier (FPV video, or Wi-Fi ch 149+)", "DRONE", kind="persist"),
+    B(5850, 5925, "5.9 GHz burst: connected-vehicle radio (C-V2X roadside unit or vehicle)", "VEHICLE",
+      steady=("5.9 GHz steady carrier: FPV video on a high channel", "DRONE", "POSSIBLE")),
+    B(5030, 5091, "Drone command-link band (5030–5091 MHz, aviation UAS control)", "DRONE", kind="persist"),
+    B(5091, 5150, "Airport surface network (AeroMACS)", "NETWORK"),
+    B(1240, 1300, "1.2 GHz carrier: video or telemetry link (also ham 23 cm)", "DRONE", kind="persist"),
+    B(2025, 2110, "News / broadcast video link (2 GHz: ENG trucks, news helicopters)", "CAMERA", kind="persist"),
+    B(4940, 4990, "4.9 GHz public-safety link (camera / video backhaul, mesh)", "NETWORK", kind="persist"),
+
+    # ---- aircraft
+    B(4200, 4400, "Radio altimeter: aircraft flying low overhead (helicopter, plane on approach, large drone)"),
+    B(118, 137, "Aircraft or airport radio (VHF air band)"),
+    B(108, 118, "Aviation navigation beacon (VOR / ILS)", kind="bg"),
+    B(960, 1215, "Aviation navigation (DME / TACAN beacons)", kind="bg"),
+    B(225, 400, "Military / government UHF: military aviation, tactical radio, SATCOM"),
+    B(1435, 1525, "Flight-test / aeronautical telemetry (L-band)"),
+    B(2360, 2395, "Flight-test / aeronautical telemetry (S-band)"),
+    B(2200, 2290, "Federal telemetry: space operations, flight test, military UAV links"),
+
+    # ---- phones and satellite terminals transmitting (uplinks: a strong burst is a transmitter nearby,
+    #      very often your own phone)
+    B(663, 698, "Phone transmitting nearby (600 MHz LTE uplink)", "PHONE"),
+    B(699, 716, "Phone transmitting nearby (700 MHz LTE uplink)", "PHONE"),
+    B(777, 787, "Phone transmitting nearby (700 MHz LTE uplink)", "PHONE"),
+    B(788, 798, "Phone or public-safety LTE (FirstNet) transmitting nearby", "PHONE"),
+    B(799, 805, "Radio keying up nearby (700 MHz public-safety mobile)"),
+    B(806, 815, "Radio keying up nearby (800 MHz repeater input)"),
+    B(815, 824, "Phone transmitting nearby (LTE band 26 uplink)", "PHONE"),
+    B(824, 849, "Phone transmitting nearby (850 MHz cellular uplink)", "PHONE"),
+    B(1710, 1780, "Phone transmitting nearby (AWS LTE uplink)", "PHONE"),
+    B(1850, 1920, "Phone transmitting nearby (PCS uplink)", "PHONE"),
+    B(2000, 2020, "Phone transmitting nearby (AWS-4 uplink)", "PHONE"),
+    B(2305, 2315, "Phone transmitting nearby (WCS uplink)", "PHONE"),
+    B(1610, 1626.5, "Satellite phone or tracker transmitting nearby (Globalstar / Iridium)", "PHONE"),
+    B(1626.5, 1660.5, "Satellite terminal transmitting nearby (Inmarsat: maritime, aviation)", "PHONE"),
+
+    # ---- two-way radio, by band
+    B(156, 162.05, "Marine VHF radio (boats, harbors)"),
+    B(160.2, 161.6, "Railroad radio"),
+    B(162.4, 162.55, "NOAA Weather Radio", kind="bg"),
+    B(162.05, 174, "Federal government VHF"),
+    B(138, 144, "Federal / military VHF"),
+    B(148, 150.8, "Federal / military VHF"),
+    B(150.8, 174, "VHF two-way radio (public safety, business)"),
+    B(144, 148, "Amateur radio (2 m)"),
+    B(219, 225, "Amateur radio (1.25 m) / telemetry"),
+    B(30, 50, "VHF low-band two-way radio"),
+    B(50, 54, "Amateur radio (6 m)"),
+    B(400, 406, "Weather balloon (radiosonde) or federal telemetry"),
+    B(406.1, 420, "Federal government UHF"),
+    B(420, 450, "Amateur radio (70 cm) / military radar"),
+    B(450, 470, "UHF two-way radio (public safety, business)"),
+    B(608, 614, "Hospital medical telemetry (WMTS)", "IOT"),
+    B(769, 775, "700 MHz public-safety radio (base / repeater)", kind="bg"),
+    B(896, 902, "900 MHz business radio / private LTE"),
+    B(935, 941, "900 MHz business radio / private LTE", kind="bg"),
+    B(1390, 1400, "Hospital medical telemetry (WMTS)", "IOT"),
+    B(1427, 1435, "Hospital medical telemetry (WMTS)", "IOT"),
+    B(1780, 1850, "Federal / military (1780–1850 MHz: tactical links, satellite control)"),
+    B(4400, 4940, "Federal / military microwave (4.4–4.94 GHz)"),
+
+    # ---- radars
+    B(2700, 2900, "Airport or weather radar (S-band)", kind="bg"),
+    B(2900, 3100, "Ship radar (S-band)"),
+    B(3100, 3450, "Military radar (S-band)"),
+
+    # ---- background: broadcast, towers, satellites — everywhere, reported once a minute per band
+    B(1, 1.7, "AM broadcast", kind="bg"),
+    B(1.7, 30, "HF: shortwave, amateur, maritime, aviation", kind="bg"),
+    B(54, 88, "TV broadcast (VHF low)", kind="bg"),
+    B(88, 108, "FM broadcast", kind="bg"),
+    B(137, 138, "Weather / low-orbit satellite downlink", kind="bg"),
+    B(174, 216, "TV broadcast (VHF high)", kind="bg"),
+    B(470, 608, "TV broadcast (UHF)", kind="bg"),
+    B(614, 652, "Cell tower (600 MHz downlink)", "CELL_SITE", kind="bg"),
+    B(716, 768, "Cell tower (700 MHz downlink)", "CELL_SITE", kind="bg"),
+    B(851, 869, "800 MHz tower output (regional, not nearby)", kind="bg"),
+    B(869, 894, "Cell tower (850 MHz downlink)", "CELL_SITE", kind="bg"),
+    B(929, 932, "Paging transmitter", kind="bg"),
+    B(941, 960, "Fixed point-to-point links / paging", kind="bg"),
+    B(1525, 1559, "Mobile satellite downlink (Inmarsat, Ligado)", kind="bg"),
+    B(1660.5, 1710, "Weather satellite / radiosonde downlink", kind="bg"),
+    B(1920, 2000, "Cell tower (PCS downlink)", "CELL_SITE", kind="bg"),
+    B(2110, 2200, "Cell tower (AWS downlink)", "CELL_SITE", kind="bg"),
+    B(2315, 2345, "Satellite radio (SiriusXM) and its street repeaters", kind="bg"),
+    B(2345, 2360, "Cell tower (WCS downlink)", "CELL_SITE", kind="bg"),
+    B(2496, 2690, "5G (2.5 GHz band 41): tower or phone", "CELL_SITE", kind="bg"),
+    B(3450, 3550, "Cell tower (3.45 GHz 5G)", "CELL_SITE", kind="bg"),
+    B(3550, 3700, "CBRS: private LTE / 5G, fixed wireless", "NETWORK", kind="bg"),
+    B(3700, 3980, "Cell tower (C-band 5G)", "CELL_SITE", kind="bg"),
+    B(3980, 4200, "Satellite C-band downlink", kind="bg"),
 ]
 
 
-GPS_LO, GPS_HI = 1559e6, 1610e6
-# Where a jammer is judged: GPS L1 (1575.42 MHz) ± 12 MHz, which every common jammer covers.
-# The rest of the GNSS band (Galileo/BeiDou edges, GLONASS at 1598–1606) is swept for the floor
-# but never reported, and keeping clear of the sweep's edges avoids the dongle's edge artefacts.
-JAM_LO, JAM_HI = 1563e6, 1587e6
+# GNSS: satellite signals arrive far below the noise floor, so a wide signal that rises clearly above
+# it is local — most often a GPS jammer, sometimes a GPS repeater (hangars, garages) or interference.
+# (band lo, band hi, judged lo, judged hi, label). The whole band is swept for the floor; only the part
+# around the centre frequency (± 12 MHz, which every common jammer covers) is judged, which also keeps
+# clear of the sweep's edges. GLONASS (1598–1606) and the Galileo/BeiDou edges are floor only.
+GNSS = [
+    (1559e6, 1610e6, 1563e6, 1587e6, "GPS band (L1)"),
+    (1164e6, 1189e6, 1166e6, 1187e6, "GPS band (L5)"),
+]
 SETTLE_S = 2.0       # ignore rtl_power's first rows after it opens the dongle: gain and PLL still settling
 
+PERSIST = {"DRONE"}  # these categories must be over the floor on two passes in a row before they're reported
+STEADY_N = 3         # passes in a row over the floor before a carrier counts as steady
+CHAIN_S = 30.0       # a bin's run of hot passes breaks if it isn't revisited within this long
+BG_RATE_S = 60.0     # background bands: at most one report per band per minute
 
-# Categories that must be over the floor on two passes in a row (0.5–4 s apart) before they're reported.
-PERSIST = {"DRONE"}
-PERSIST_S = 4.0
+
+_band_cache = {}
 
 
 def band_of(mhz: float):
-    for lo, hi, name, cat, conf in BANDS:
-        if lo <= mhz <= hi:
-            return name, cat, conf
-    return f"{mhz:.1f} MHz carrier", "UNKNOWN", "POSSIBLE"
+    """The BANDS entry for a frequency, or a generic one for anything not in the table."""
+    k = round(mhz * 1000)
+    b = _band_cache.get(k)
+    if b is None:
+        for e in BANDS:
+            if e["lo"] <= mhz <= e["hi"]:
+                b = e
+                break
+        else:
+            b = {"lo": mhz, "hi": mhz, "name": f"{mhz:.1f} MHz carrier", "cat": "UNKNOWN", "conf": "POSSIBLE",
+                 "kind": "", "steady": None, "key": "other"}
+        _band_cache[k] = b
+    return b
+
+
+def gnss_window(hz: float):
+    for w in GNSS:
+        if w[0] <= hz <= w[1]:
+            return w
+    return None
 
 
 class Sweep:
@@ -220,9 +350,10 @@ class Sweep:
         self.src, self.th, self.rate, self.bucket = src, threshold_db, rate_s, bucket_mhz
         self.floor = {}       # bin start Hz → EMA of dB
         self.last = {}        # bucket → last report time
-        self.gps_prev = {}    # GPS-band row start (MHz) → last time that row looked jammed
+        self.gps_prev = {}    # GNSS row start (MHz) → last time that row looked jammed
         self.settle_until = 0.0
-        self.hot_at = {}      # bin Hz → time it was over the floor on the previous pass (for PERSIST)
+        self.seen = {}        # bin Hz → time of the previous visit
+        self.runs = {}        # bin Hz → [passes in a row over the floor, last dB, bin width]
 
     def row(self, line: str) -> None:
         parts = [p.strip() for p in line.split(",")]
@@ -236,58 +367,91 @@ class Sweep:
         now = time.time()
         if now < self.settle_until:
             return
-        gps_bins, gps_hot = 0, []       # this row's GPS-band bins, and the ones well over the floor
+        gnss_rows = {}      # GNSS window → [bins judged, hot bins]
         for i, db in enumerate(vals):
             hz = lo + i * step
+            prev_visit = self.seen.get(hz)
+            self.seen[hz] = now
             f = self.floor.get(hz)
             if f is None:
                 self.floor[hz] = db
                 continue
             # slow floor: a carrier that stays for minutes becomes the floor, which is what we want for a drive.
-            # Not in the GPS band: there the true floor is the empty band, and a jammer riding with you must
+            # Not in the GNSS bands: there the true floor is the empty band, and a jammer riding with you must
             # not fade into it, so the floor rises ~30x more slowly there (and falls at the normal rate).
-            gps = GPS_LO <= hz <= GPS_HI
-            k = 0.001 if (gps and db > f) else 0.03
+            w = gnss_window(hz)
+            k = 0.001 if (w and db > f) else 0.03
             self.floor[hz] = f * (1 - k) + db * k
-            if gps:
-                if not JAM_LO <= hz <= JAM_HI:
-                    continue                 # GNSS but outside the L1 window: floor only, never reported
+            if w:
+                if not w[2] <= hz <= w[3]:
+                    continue                 # GNSS but outside the judged window: floor only, never reported
                 # Judged per row below: a jammer is wide and steady, so one hot bin is not enough.
-                gps_bins += 1
+                g = gnss_rows.setdefault(w, [0, []])
+                g[0] += 1
                 if db - f >= self.th:
-                    gps_hot.append((hz, db, db - f))
-                continue
-            if db - f < self.th:
-                self.hot_at.pop(hz, None)       # quiet on this pass: any earlier burst no longer counts
+                    g[1].append((hz, db, db - f))
                 continue
             mhz = hz / 1e6
+            if db - f < self.th:
+                run = self.runs.pop(hz, None)       # quiet on this pass: the run of hot passes is over
+                if run and run[0] < STEADY_N:
+                    b = band_of(mhz)
+                    if b["steady"] and not (FCC and FCC.label(mhz, tol_khz=max(step / 1000.0, 12.5))):
+                        # it came and went: report it now with the burst label
+                        self.report(mhz, run[1], step, run[1] - f, b["name"], b["cat"], b["conf"], b, None, now, {})
+                continue
+            run = self.runs.get(hz)
+            if run and prev_visit is not None and 0.2 < now - prev_visit <= CHAIN_S:
+                run[0] += 1
+                run[1] = db
+            elif not run or prev_visit is None or now - prev_visit > CHAIN_S:
+                run = self.runs[hz] = [1, db, step]
+            n = run[0]
             x = {"over_floor_db": f"{db - f:.0f}", "bin_hz": f"{step:.0f}"}
             lic = FCC.label(mhz, tol_khz=max(step / 1000.0, 12.5)) if FCC else None
             if lic:
                 name, cat, conf, lx = lic
                 x.update(lx)
-                ident = f"fcc/{lx['call_sign']}/{mhz:.3f}"
-            else:
-                name, cat, conf = band_of(mhz)
-                if name is None:
+                if cat in PERSIST and n < 2:
                     continue
-                ident = None
-            bucket = round(mhz / self.bucket)
-            if cat in PERSIST:
-                # a video link transmits continuously; a radar sweep or a glitch shows once
-                prev = self.hot_at.get(hz)
-                self.hot_at[hz] = now
-                if prev is None or not 0.5 < now - prev < PERSIST_S:
-                    continue
-            if now - self.last.get(bucket, 0) < self.rate:
+                self.report(mhz, db, step, db - f, name, cat, conf, None, f"fcc/{lx['call_sign']}/{mhz:.3f}", now, x)
                 continue
-            self.last[bucket] = now
-            emit({"t": "rf", "id": ident or f"{self.src}/{bucket * self.bucket:.0f}", "n": name,
-                  "f": int(round(mhz)), "r": int(round(db)), "cat": cat, "conf": conf, "src": self.src, "x": x})
-        if gps_bins:
-            self.gps_row(lo, step, gps_bins, gps_hot, now)
+            b = band_of(mhz)
+            if b["name"] is None:
+                continue
+            if b["steady"]:
+                if n < STEADY_N:
+                    continue                 # wait: steady label at STEADY_N passes, burst label when it drops
+                name, cat, conf = b["steady"]
+                x["steady"] = f"over the floor on {n} passes in a row"
+            else:
+                name, cat, conf = b["name"], b["cat"], b["conf"]
+                if (b["kind"] == "persist" or cat in PERSIST) and n < 2:
+                    continue                 # a video link transmits continuously; a radar sweep or a glitch shows once
+            self.report(mhz, db, step, db - f, name, cat, conf, b, None, now, x)
+        for w, (n, hot) in gnss_rows.items():
+            self.gps_row(lo, step, n, hot, now, w[4])
 
-    def gps_row(self, lo: float, step: float, n: int, hot: list, now: float) -> None:
+    def report(self, mhz, db, step, over, name, cat, conf, b, ident, now, x) -> None:
+        if not x:
+            x = {"over_floor_db": f"{over:.0f}", "bin_hz": f"{step:.0f}"}
+        if b is not None and b["kind"] == "bg":
+            key, rate = "bg/" + b["key"], BG_RATE_S
+            ident = ident or f"{self.src}/bg/{b['key']}"
+            x["background"] = "broadcast, tower or beacon: everywhere, shown for completeness"
+        else:
+            bucket = round(mhz / self.bucket)
+            key, rate = (bucket, cat if b is not None and b["steady"] and cat == b["steady"][1] else ""), self.rate
+            ident = ident or f"{self.src}/{bucket * self.bucket:.0f}"
+        if now - self.last.get(key, 0) < rate:
+            return
+        self.last[key] = now
+        if b is not None:
+            x.setdefault("band", f"{b['lo']:g}–{b['hi']:g} MHz")
+        emit({"t": "rf", "id": ident, "n": name, "f": int(round(mhz)), "r": int(round(db)),
+              "cat": cat, "conf": conf, "src": self.src, "x": x})
+
+    def gps_row(self, lo: float, step: float, n: int, hot: list, now: float, label: str = "GPS band (L1)") -> None:
         """Possible GPS jammer only when a wide part of this row is raised (at least a quarter of its
         bins, and 3+) and the same row looked that way on the previous pass too. A single narrow
         spike — interference, a retune glitch — is ignored."""
@@ -300,12 +464,12 @@ class Sweep:
         self.gps_prev[key] = now
         if not prev or now - prev > 90:
             return                                  # first pass that looks jammed: wait for a second
-        if now - self.last.get("gps", 0) < self.rate:
+        if now - self.last.get("gps/" + label, 0) < self.rate:
             return
-        self.last["gps"] = now
+        self.last["gps/" + label] = now
         overs = sorted(o for _, _, o in hot)
         mid = sum(h for h, _, _ in hot) / len(hot) / 1e6
-        emit({"t": "rf", "id": f"{self.src}/gps", "n": "GPS band: strong local signal — possible GPS jammer nearby",
+        emit({"t": "rf", "id": f"{self.src}/gps" + ("" if "L1" in label else "-l5"), "n": f"{label}: strong local signal — possible GPS jammer nearby",
               "f": int(round(mid)), "r": int(round(max(d for _, d, _ in hot))), "cat": "TOOL", "conf": "POSSIBLE",
               "src": self.src, "x": {
                   "over_floor_db": f"{overs[len(overs) // 2]:.0f}",
@@ -633,7 +797,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rtl433", action="store_true", help="stdin is rtl_433 -F json")
     ap.add_argument("--hackrf-sweep", action="store_true", help="run hackrf_sweep and report carriers by band")
-    ap.add_argument("--hackrf-range", default="300:6000", help="MHz range for hackrf_sweep (default 300:6000)")
+    ap.add_argument("--hackrf-range", default="1:6000", help="MHz range for hackrf_sweep (default 1:6000, the whole range)")
     ap.add_argument("--hackrf-bin", type=int, default=500000, help="bin width Hz (default 500000)")
     ap.add_argument("--rtl-power", metavar="SPEC", action="append", default=[],
                     help="run rtl_power with this -f spec, e.g. 150M:174M:12.5k; repeat for several ranges, which take turns; "

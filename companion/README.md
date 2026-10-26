@@ -14,12 +14,12 @@ permission, and nothing the companion hears leaves the phone.
 |---|---|---|---|
 | [ESP32](esp32/) (S3 / C3 / classic, **-U variant** for an external antenna) | 2.4 GHz Wi-Fi beacons + BLE adverts · optional RX5808 → 5.8 GHz video carriers · optional CC1101 / SX1276 → rtl_433 decoders at 433 / 315 MHz (TPMS, fobs, sensors) | Channels yes; 5 GHz only on an ESP32-C5 | Flash a sketch, $10–30 |
 | [Raspberry Pi + RTL-SDR](pi/) | rtl_433 (hundreds of sub-GHz decoders) · rtl_power band sweeps below 1.7 GHz · dump1090 ADS-B aircraft · monitor-mode USB Wi-Fi via Kismet | No (relays what the tools give it) | A Python script, $60–120 |
-| Pi / carputer + **HackRF** | hackrf_sweep: carriers anywhere from 1 MHz to 6 GHz — 5.8 GHz video, 1.2 GHz links, 900 MHz LoRa, 433 / 315 MHz bursts — as "something is transmitting here" | No | Same script, +$300 |
+| Pi / carputer + **HackRF** | hackrf_sweep: the whole 1 MHz–6 GHz range in about a second, every carrier labelled by band ([what it labels](#hackrf-what-the-full-sweep-labels)) — video and drone links, low aircraft, military air, toll readers, phones and sat phones, 4.9 GHz public-safety links — as "something is transmitting here" | No | Same script, +$300 |
 | Carputer (any Linux box) | All of the above at once, as many radios as it has USB ports | No | Same script |
 | Any SDR build + [local FCC pack](#local-fcc-license-pack--who-owns-that-carrier) | Licensed carriers named: which agency or business holds the frequency, and how far its site is | — | One script run per area |
 | Arduino | Only with a BLE module (HM-10) *and* a radio module; an ESP32 does both for less | — | Not recommended; see [diagrams](diagrams/) |
 
-Wiring and antenna diagrams: [diagrams/](diagrams/) — overview, ESP32, Pi + SDR, carputer, Arduino, vehicle mounting.
+Wiring and antenna diagrams: [diagrams/](diagrams/) — overview, ESP32, Pi + SDR, [Pi + HackRF + two RTL-SDRs](diagrams/pi-hackrf-2sdr.svg), carputer, Arduino, vehicle mounting.
 
 ### What the SDRs do and don't add
 
@@ -27,6 +27,65 @@ Wiring and antenna diagrams: [diagrams/](diagrams/) — overview, ESP32, Pi + SD
 - **HackRF** (1 MHz–6 GHz): energy, via `hackrf_sweep`. It reaches the bands the RTL-SDR can't, but a sweep sees *carriers*, not packets: "30 dB over the floor at 5745 MHz" could be a video link or a Wi-Fi access point on channel 149. The bridge labels these honestly and the app shows them as *Possible*. It does not demodulate Wi-Fi usefully (a $15 monitor-mode adapter does that better) and cannot tell a camera's LTE modem from the phones around you. **Receive only** — the bridge never transmits, and neither should you.
 - **ESP32 + CC1101 / SX1276**: a subset of rtl_433's decoders on a $5 module, tuned to one frequency at a time. The no-Pi way to hear TPMS and 433 MHz.
 - **ADS-B** (`dump1090`, `readsb`): aircraft overhead with callsign, altitude and position in the detail view. Unclassified on purpose — an airliner is not a drone.
+
+## HackRF: what the full sweep labels
+
+`--hackrf-sweep` sweeps 1 MHz–6 GHz by default (`--hackrf-range 1:6000`), about one full pass a
+second on a Pi 4 with 500 kHz bins. Every bin that rises 18 dB over its own rolling floor is
+labelled from the US frequency allocation table. **Energy only:** a sweep shows that something is
+on the air, never what it says, so every label is *Possible*, nothing is demodulated, and no radio
+IDs are decoded. With a [local FCC pack](#local-fcc-license-pack--who-owns-that-carrier) loaded, a
+licensed frequency gets the licensee's name instead.
+
+| Band | Label | Category |
+|---|---|---|
+| 4200–4400 MHz | Radio altimeter: aircraft flying low overhead (helicopter, plane on approach, large drone) | UNKNOWN |
+| 118–137 MHz · 121.5 | Aircraft or airport radio · aviation emergency frequency (ELT / guard) | UNKNOWN |
+| 225–400 MHz · 243.0 | Military / government UHF (military aviation, tactical, SATCOM) · military emergency frequency | UNKNOWN |
+| 978 · 1030 · 1090 MHz | ADS-B UAT · secondary radar interrogation · aircraft transponder | UNKNOWN |
+| 1435–1525 · 2200–2290 · 2360–2395 MHz | Flight-test / aeronautical / federal telemetry (incl. military UAV links) | UNKNOWN |
+| 5645–5849 MHz | 5.8 GHz carrier (FPV video, or Wi-Fi ch 149+) — two passes in a row | DRONE |
+| 5850–5925 MHz | **Burst:** connected-vehicle radio (C-V2X roadside unit or vehicle) · **steady:** FPV video on a high channel | VEHICLE / DRONE |
+| 5030–5091 MHz | Drone command-link band (aviation UAS control) — two passes | DRONE |
+| 1240–1300 MHz | 1.2 GHz video or telemetry link — two passes | DRONE |
+| 2025–2110 MHz | News / broadcast video link (ENG trucks, news helicopters) — two passes | CAMERA |
+| 4940–4990 MHz | 4.9 GHz public-safety link (camera / video backhaul, mesh) — two passes | NETWORK |
+| 902–928 MHz | **Burst:** LoRa, telemetry, meters · **steady:** toll gantry or RFID / gate reader | IOT / TRAFFIC_SENSOR |
+| 300–318 · 390 · 433 · 868 · 49 · 72 MHz | Key fobs, garage remotes, TPMS, ISM sensors, baby monitors, RC models | VEHICLE / IOT / DRONE |
+| 600 / 700 / 800 / 850 MHz, AWS, PCS (1850–1920), AWS-4, WCS uplinks | Phone transmitting nearby (very often your own) | PHONE |
+| 1610–1626.5 · 1626.5–1660.5 MHz | Satellite phone or tracker (Globalstar / Iridium) · Inmarsat terminal transmitting | PHONE |
+| 462 / 467 MHz | Walkie-talkie nearby (FRS / GMRS) | UNKNOWN |
+| 799–805 · 806–815 MHz | Radio keying up nearby (700 / 800 MHz public-safety mobile, repeater input) | UNKNOWN |
+| 161.975 / 162.025 · 156–162 · 160–161.6 MHz | AIS ship transponder · marine VHF · railroad radio | UNKNOWN |
+| 406.0–406.1 MHz | 406 MHz distress beacon (EPIRB / PLB / ELT) | UNKNOWN |
+| 144.39 · amateur bands | APRS beacon · 6 m, 2 m, 1.25 m, 70 cm, 23 cm amateur | UNKNOWN |
+| Other VHF / UHF land mobile, federal VHF / UHF, 1780–1850, 4.4–4.94 GHz | Two-way radio by band · federal / military | UNKNOWN |
+| 2.9–3.1 · 3.1–3.45 GHz | Ship radar · military radar (S-band) | UNKNOWN |
+| 1559–1610 · 1164–1189 MHz | Possible GPS jammer (L1 or L5) — a wide rise on two passes; that band's floor rises slowly so a jammer riding with you stays visible | TOOL |
+| 608–614 · 1390–1400 · 1427–1435 MHz | Hospital medical telemetry (WMTS) | IOT |
+
+**Background**, at most once a minute per band (they're everywhere): AM / HF / FM / TV broadcast,
+VOR / ILS / DME navigation beacons, NOAA Weather Radio, paging, every cell-tower downlink (600 MHz
+through C-band, 2.5 GHz band 41, CBRS), satellite downlinks (Inmarsat, weather satellites,
+SiriusXM) and airport / weather radar. **Skipped:** 2.4 GHz and 5 GHz Wi-Fi and Bluetooth, Wi-Fi 6E,
+GPS L2 and long-range air-traffic radar (1215–1240, 1300–1390 MHz), and the radio-astronomy band
+(1400–1427 MHz). Anything else is reported as "*NNN.N* MHz carrier".
+
+**Steady vs burst.** In 902–928 and 5850–5925 MHz the same band means two things, so the bridge
+waits: a carrier still over the floor on three passes in a row gets the steady label (toll reader,
+FPV video); one that comes and goes gets the burst label (LoRa, V2X), reported when it drops.
+
+**What a sweep catches, and what it doesn't.** Each frequency is looked at for a few milliseconds
+per pass. Continuous signals — video links, radio altimeters, toll readers, a keyed walkie-talkie —
+show on every pass; short, rare bursts (a key fob, a tire sensor, a single V2X message) are mostly
+missed, which is why an RTL-SDR stays parked on 315 / 433 / 915 MHz with `rtl_433`. The HackRF has
+no front-end filter, so a very strong nearby tower can put a spur elsewhere in the sweep; the
+rolling floor absorbs one that stays. Out of reach entirely: radar guns (10.5 / 24 / 35 GHz),
+Starlink (above 10 GHz), and anything that would need decoding to tell apart — a sweep cannot tell
+a fake cell tower from a real one, so the bridge never claims to.
+
+A Pi with all three receivers: [diagrams/pi-hackrf-2sdr.svg](diagrams/pi-hackrf-2sdr.svg). Put them
+on a **powered USB hub**; a Pi 4 cannot supply a HackRF and two RTL-SDRs on its own.
 
 ## Raspberry Pi: start at boot
 
