@@ -396,6 +396,11 @@ def feed_stdin(mode: str) -> None:
         else:
             if line.startswith("{"):
                 out.put(line + "\n")
+    if mode == "rtl433":
+        # rtl_433 has exited (dongle busy, unplugged, wrong serial). Don't keep a Bluetooth link up
+        # with a dead radio behind it: exit so the service restarts both.
+        print("bridge: rtl_433 stopped sending; exiting so the service restarts it", file=sys.stderr)
+        os._exit(1)
 
 
 # ---------------------------------------------------------------- BLE peripheral

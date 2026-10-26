@@ -26,7 +26,9 @@ install -m 0644 wavelens-bridge.service /etc/systemd/system/
 [ -f /etc/modprobe.d/rtlsdr.conf ] || echo "blacklist dvb_usb_rtl28xxu" > /etc/modprobe.d/rtlsdr.conf
 
 systemctl daemon-reload
-systemctl enable --now wavelens-bridge
+systemctl enable wavelens-bridge
+# restart, not just start: on an update the service is already running the old copy
+systemctl restart wavelens-bridge
 sleep 3
 systemctl --no-pager --lines=5 status wavelens-bridge || true
 echo
