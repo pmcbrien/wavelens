@@ -9,6 +9,8 @@ writing Wavelens lines (see ../README.md) to stdin.
   rtl_433 -F json | ./wavelens_bridge.py --rtl433        # RTL-SDR: 433/315/915 MHz decoders (TPMS, remotes, sensors)
   ./wavelens_bridge.py --hackrf-sweep                    # HackRF: 1 MHz–6 GHz energy sweep → carriers by band
   ./wavelens_bridge.py --rtl-power 300M:1000M:50k        # RTL-SDR: the same idea below 1.7 GHz
+  ./wavelens_bridge.py --rtl-power 150M:174M:12.5k --rtl-power 806M:824M:12.5k --rtl-power-device 00001090
+                                                         # several ranges take turns on one dongle; pin it by serial
   ./wavelens_bridge.py --dump1090 localhost:30003        # ADS-B aircraft from dump1090 / readsb (SBS port)
   ./wavelens_bridge.py --kismet-json /tmp/kismet.json    # Kismet export from a monitor-mode Wi-Fi adapter
   ./wavelens_bridge.py --fcc-pack fcc-local.json ...     # label licensed carriers by name (see ../tools/fcc_local_pack.py)
@@ -142,6 +144,8 @@ BANDS = [
     (433.05, 434.79, "433 MHz ISM burst (remotes, sensors, TPMS)", "IOT", "POSSIBLE"),
     (314, 316, "315 MHz burst (TPMS, key fob)", "VEHICLE", "POSSIBLE"),
     (136, 174, "VHF voice / data", "UNKNOWN", "POSSIBLE"),
+    (806, 824, "800 MHz mobile / portable radio keying up nearby", "UNKNOWN", "POSSIBLE"),
+    (851, 869, "800 MHz tower / trunked site output", "UNKNOWN", "POSSIBLE"),
     (400, 420, "UHF data / telemetry", "UNKNOWN", "POSSIBLE"),
     (450, 470, "UHF voice / data", "UNKNOWN", "POSSIBLE"),
 ]
@@ -205,16 +209,22 @@ class Sweep:
                   "f": int(round(mhz)), "r": int(round(db)), "cat": cat, "conf": conf, "src": self.src, "x": x})
 
 
+def run_once(cmd: str, handler) -> bool:
+    """Run a tool until it exits, handing it each stdout line. False if it isn't installed."""
+    try:
+        p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except FileNotFoundError:
+        print(f"bridge: {cmd.split()[0]} not found on PATH", file=sys.stderr)
+        return False
+    for line in p.stdout:
+        handler(line)
+    p.wait()
+    return True
+
+
 def feed_process(cmd: str, handler) -> None:
     """Run a sweep tool and hand it each stdout line; restart it if it exits."""
-    while True:
-        try:
-            p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        except FileNotFoundError:
-            print(f"bridge: {cmd.split()[0]} not found on PATH", file=sys.stderr)
-            return
-        for line in p.stdout:
-            handler(line)
+    while run_once(cmd, handler):
         time.sleep(2)
 
 
@@ -223,9 +233,20 @@ def feed_hackrf(range_mhz: str, bin_hz: int) -> None:
     feed_process(f"hackrf_sweep -f {range_mhz} -w {bin_hz} -l 32 -g 20", sw.row)
 
 
-def feed_rtl_power(spec: str) -> None:
-    sw = Sweep("rtlpower")
-    feed_process(f"rtl_power -f {spec} -i 1 -g 30 -", sw.row)
+def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15) -> None:
+    """One range: rtl_power runs continuously. Several: they take turns on the same dongle,
+    dwell_s seconds each (rtl_power -e), so VHF and 800 MHz can share one RTL-SDR.
+    device is an index or serial (rtl_power -d matches either)."""
+    sw = Sweep("rtlpower")          # one floor map keyed by Hz, so the ranges don't disturb each other
+    dev = f" -d {shlex.quote(device)}" if device else ""
+    if len(specs) == 1:
+        feed_process(f"rtl_power -f {specs[0]}{dev} -i 1 -g 30 -", sw.row)
+        return
+    while True:
+        for spec in specs:
+            if not run_once(f"rtl_power -f {spec}{dev} -i 1 -g 30 -e {dwell_s}s -", sw.row):
+                return
+            time.sleep(0.5)         # let the dongle close before the next range opens it
 
 
 # ---------------------------------------------------------------- ADS-B (dump1090 / readsb, SBS BaseStation port 30003)
@@ -468,7 +489,12 @@ def main() -> None:
     ap.add_argument("--hackrf-sweep", action="store_true", help="run hackrf_sweep and report carriers by band")
     ap.add_argument("--hackrf-range", default="300:6000", help="MHz range for hackrf_sweep (default 300:6000)")
     ap.add_argument("--hackrf-bin", type=int, default=500000, help="bin width Hz (default 500000)")
-    ap.add_argument("--rtl-power", metavar="SPEC", help="run rtl_power with this -f spec, e.g. 300M:1000M:50k")
+    ap.add_argument("--rtl-power", metavar="SPEC", action="append", default=[],
+                    help="run rtl_power with this -f spec, e.g. 150M:174M:12.5k; repeat for several ranges, which take turns")
+    ap.add_argument("--rtl-power-device", metavar="N|SERIAL", default="",
+                    help="which RTL-SDR rtl_power uses: index or serial (see rtl_test); default the first free one")
+    ap.add_argument("--rtl-power-dwell", metavar="SECONDS", type=int, default=15,
+                    help="seconds on each range when several --rtl-power ranges are given (default 15)")
     ap.add_argument("--dump1090", metavar="HOST:PORT", help="relay aircraft from a dump1090/readsb SBS port")
     ap.add_argument("--kismet-json", metavar="PATH", help="relay Wi-Fi devices from a Kismet JSON export")
     ap.add_argument("--fcc-pack", metavar="PATH", help="local FCC license pack from tools/fcc_local_pack.py; labels licensed carriers")
@@ -489,7 +515,8 @@ def main() -> None:
         threading.Thread(target=feed_hackrf, args=(a.hackrf_range, a.hackrf_bin), daemon=True).start()
     if a.rtl_power:
         CAPS.append("sweep")
-        threading.Thread(target=feed_rtl_power, args=(a.rtl_power,), daemon=True).start()
+        threading.Thread(target=feed_rtl_power, args=(a.rtl_power, a.rtl_power_device, max(3, a.rtl_power_dwell)),
+                         daemon=True).start()
     if a.dump1090:
         CAPS.append("adsb")
         threading.Thread(target=feed_dump1090, args=(a.dump1090,), daemon=True).start()
