@@ -57,7 +57,8 @@ The full step-by-step guide, with every command, is on the website:
   Several `--rtl-power` ranges take turns on one dongle (`--rtl-power-dwell`, default 15 s).
   Duplicate serials: `rtl_eeprom -d 1 -s 00000002`, then replug.
 - **Antennas:** dongles sold for aircraft come with ~7 cm 1090/978 MHz antennas; use ~17 cm elements for 433 MHz.
-- **One program per dongle:** PiAware/dump1090 holds one. `sudo systemctl disable --now piaware dump1090-fa` frees it.
+- **One program per dongle:** PiAware/dump1090 holds one. `sudo systemctl disable --now piaware dump1090-fa dump978-fa` frees them
+  (serial 00000978 is usually dump978's; `usb_claim_interface error -6` means a dongle is held).
 - **FCC pack:** add `--fcc-pack` only once the file exists; a missing pack makes the service restart in a loop.
 - **Raspbian Buster (old PiAware cards):** comment out dead third-party apt sources
   (`sudo sed -i 's|^deb .*flightaware.*|#&|' /etc/apt/sources.list /etc/apt/sources.list.d/*.list`); drop
@@ -69,7 +70,10 @@ The full step-by-step guide, with every command, is on the website:
 - **No Bluetooth (`bluetoothctl show` empty):** check for a `disable-bt` overlay in `/boot/config.txt`, that
   `bluez`, `pi-bluetooth` and `bluez-firmware` are installed, that `hciuart` and `bluetooth` are enabled, and
   `systemctl status hciuart` / `dmesg | grep -iE "hci|bluetooth|brcm"`.
-- **Update:** `cd ~/wavelens && git pull && cd companion/pi && sudo ./install-service.sh` (settings are kept).
+- **Update:** `cd ~/wavelens && git config core.fileMode false && git pull && cd companion/pi && sudo ./install-service.sh`
+  (settings are kept). Without `core.fileMode false`, the `chmod +x` from setup counts as a local edit and blocks the pull
+  (`git stash` clears it). `unrecognized arguments` in the log means the installed bridge is older than your settings:
+  update, then rerun `install-service.sh`.
 
 ## Pairing
 
