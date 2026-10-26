@@ -204,6 +204,7 @@ class Sweep:
         self.src, self.th, self.rate, self.bucket = src, threshold_db, rate_s, bucket_mhz
         self.floor = {}       # bin start Hz → EMA of dB
         self.last = {}        # bucket → last report time
+        self.gps_prev = {}    # GPS-band row start (MHz) → last time that row looked jammed
 
     def row(self, line: str) -> None:
         parts = [p.strip() for p in line.split(",")]
@@ -215,6 +216,7 @@ class Sweep:
         except ValueError:
             return
         now = time.time()
+        gps_bins, gps_hot = 0, []       # this row's GPS-band bins, and the ones well over the floor
         for i, db in enumerate(vals):
             hz = lo + i * step
             f = self.floor.get(hz)
@@ -227,14 +229,16 @@ class Sweep:
             gps = GPS_LO <= hz <= GPS_HI
             k = 0.001 if (gps and db > f) else 0.03
             self.floor[hz] = f * (1 - k) + db * k
+            if gps:
+                # Judged per row below: a jammer is wide and steady, so one hot bin is not enough.
+                gps_bins += 1
+                if db - f >= self.th:
+                    gps_hot.append((hz, db, db - f))
+                continue
             if db - f < self.th:
                 continue
             mhz = hz / 1e6
             x = {"over_floor_db": f"{db - f:.0f}", "bin_hz": f"{step:.0f}"}
-            if gps:
-                x["gps"] = ("satellites are far below the noise floor; a signal this strong is local — "
-                            "usually a jammer, sometimes a GPS repeater or interference. "
-                            "Check whether the phone's location is drifting or dropping out.")
             lic = FCC.label(mhz, tol_khz=max(step / 1000.0, 12.5)) if FCC else None
             if lic:
                 name, cat, conf, lx = lic
@@ -251,6 +255,36 @@ class Sweep:
             self.last[bucket] = now
             emit({"t": "rf", "id": ident or f"{self.src}/{bucket * self.bucket:.0f}", "n": name,
                   "f": int(round(mhz)), "r": int(round(db)), "cat": cat, "conf": conf, "src": self.src, "x": x})
+        if gps_bins:
+            self.gps_row(lo, step, gps_bins, gps_hot, now)
+
+    def gps_row(self, lo: float, step: float, n: int, hot: list, now: float) -> None:
+        """Possible GPS jammer only when a wide part of this row is raised (at least a quarter of its
+        bins, and 3+) and the same row looked that way on the previous pass too. A single narrow
+        spike — interference, a retune glitch — is ignored."""
+        key = round(lo / 1e6)
+        wide = len(hot) >= max(3, n // 4)
+        if not wide:
+            self.gps_prev.pop(key, None)
+            return
+        prev = self.gps_prev.get(key, 0.0)
+        self.gps_prev[key] = now
+        if not prev or now - prev > 90:
+            return                                  # first pass that looks jammed: wait for a second
+        if now - self.last.get("gps", 0) < self.rate:
+            return
+        self.last["gps"] = now
+        overs = sorted(o for _, _, o in hot)
+        mid = sum(h for h, _, _ in hot) / len(hot) / 1e6
+        emit({"t": "rf", "id": f"{self.src}/gps", "n": "GPS band: strong local signal — possible GPS jammer nearby",
+              "f": int(round(mid)), "r": int(round(max(d for _, d, _ in hot))), "cat": "TOOL", "conf": "POSSIBLE",
+              "src": self.src, "x": {
+                  "over_floor_db": f"{overs[len(overs) // 2]:.0f}",
+                  "width_mhz": f"{len(hot) * step / 1e6:.1f}",
+                  "raised_bins": f"{len(hot)} of {n}, on two passes in a row",
+                  "gps": ("satellites are far below the noise floor, so a wide signal this strong is local — "
+                          "usually a jammer, sometimes a GPS repeater. Check whether the phone's location "
+                          "is drifting or dropping out.")}})
 
 
 def run_once(cmd: str, handler) -> bool:
