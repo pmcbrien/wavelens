@@ -405,8 +405,10 @@ class Sweep:
     """
 
     def __init__(self, src: str, threshold_db: float = 18.0, rate_s: float = 2.0, bucket_mhz: float = 1.0,
-                 mask: "list[tuple[float, float]] | None" = None):
+                 mask: "list[tuple[float, float]] | None" = None, ppm: float = 0.0):
         self.src, self.th, self.rate, self.bucket = src, threshold_db, rate_s, bucket_mhz
+        self.ppm = ppm            # reported MHz are scaled by (1 + ppm/1e6): the radio's crystal error, measured
+        self.peak_ok, self.tol_hz = True, 0.0
         self.mask = [(lo * 1e6, hi * 1e6) for lo, hi in (mask or [])]   # Hz ranges never reported (the unit's spurs)
         self.floor = {}       # bin start Hz → EMA of dB
         self.last = {}        # bucket → last report time
@@ -472,14 +474,26 @@ class Sweep:
                 if db - f >= self.th:
                     g[1].append((hz, db, db - f))
                 continue
-            mhz = (hz + step / 2) / 1e6          # the bin's centre: hz is its lower edge
+            # Where in the bin is the carrier? A carrier spreads over two or three bins (FFT leakage), so
+            # only the local peak reports, placed by a parabola through the peak and its neighbours
+            # (dB). That puts a narrow carrier within about a quarter bin: 446.075 reads 446.07, not 446.1.
+            left = vals[i - 1] if i > 0 else None
+            right = vals[i + 1] if i + 1 < len(vals) else None
+            self.peak_ok = (left is None or db >= left) and (right is None or db > right)
+            off, self.tol_hz = 0.0, step / 2
+            if left is not None and right is not None:
+                den = left - 2 * db + right
+                if den < 0:
+                    off = max(-0.5, min(0.5, 0.5 * (left - right) / den))
+                    self.tol_hz = step / 4
+            mhz = (hz + step / 2 + off * step) / 1e6 * (1 + self.ppm / 1e6)   # hz is the bin's lower edge
             if db - f < self.th:
                 run = self.runs.pop(hz, None)       # quiet on this pass: the run of hot passes is over
                 if run and run[0] < STEADY_N:
                     b = band_of(mhz)
                     if b["steady"] and not (FCC and FCC.label(mhz, tol_khz=max(step / 1000.0, 12.5))):
                         # it came and went: report it now with the burst label
-                        self.fresh = True
+                        self.fresh = self.peak_ok = True
                         self.report(mhz, run[1], step, run[1] - f, b["name"], b["cat"], b["conf"], b, None, now, {})
                 continue
             # How long this 1 MHz bucket has been hot without a break of CHAIN_S. Judged per bucket, not
@@ -537,11 +551,13 @@ class Sweep:
             self.gps_row(lo, step, n, hot, now, w[4])
 
     def report(self, mhz, db, step, over, name, cat, conf, b, ident, now, x) -> None:
+        if not self.peak_ok:
+            return                           # a shoulder of a carrier whose peak bin reports instead
         if not x:
             x = {"over_floor_db": f"{over:.0f}", "bin_hz": f"{step:.0f}"}
-        # f goes out rounded to whole MHz (and sweep ids are 1 MHz buckets); the bin centre is the
-        # best the sweep actually knows, to within half a bin plus the radio's own ppm error.
-        x.setdefault("exact_mhz", f"{mhz:.4f}".rstrip("0").rstrip(".") + f" ± {step / 2e6:g}")
+        # f goes out rounded to whole MHz (and sweep ids are 1 MHz buckets); exact_mhz is the best the
+        # sweep knows: the interpolated peak, to a quarter bin, plus the radio's ppm error unless --ppm is set.
+        x.setdefault("exact_mhz", f"{mhz:.4f}".rstrip("0").rstrip(".") + f" ± {self.tol_hz / 1e6:g}")
         fresh = getattr(self, "fresh", True)
         if b is not None and b["kind"] == "bg":
             key, rate = "bg/" + b["key"], BG_RATE_S
@@ -751,10 +767,10 @@ def parse_mask(spec: str) -> "list[tuple[float, float]]":
     return out
 
 
-def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20, mask: str = "") -> None:
+def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20, mask: str = "", ppm: float = 0.0) -> None:
     """hackrf_sweep over range_mhz, or over the parked slice while the phone has asked to park.
     A park change stops the running sweep and starts the other one."""
-    sw = Sweep("hackrf", mask=parse_mask(mask))
+    sw = Sweep("hackrf", mask=parse_mask(mask), ppm=ppm)
     if sw.mask:
         print("bridge: hackrf: masking " + ", ".join(f"{lo/1e6:g}-{hi/1e6:g} MHz" for lo, hi in sw.mask), file=sys.stderr)
     while True:
@@ -812,14 +828,14 @@ def sweep_interval_s(spec: str) -> int:
     return max(1, math.ceil(hops * 0.03))
 
 
-def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15) -> None:
+def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm: int = 0) -> None:
     """One range: rtl_power runs continuously. Several: they take turns on the same dongle,
     dwell_s seconds each (rtl_power -e), so VHF and 800 MHz can share one RTL-SDR.
     device is an index or serial (rtl_power -d matches either). Each dongle gets its own thread."""
     sw = Sweep("rtlpower")          # one floor map keyed by Hz, so the ranges don't disturb each other
     dev = f" -d {shlex.quote(device)}" if device else ""
     if len(specs) == 1:
-        cmd = f"rtl_power -f {specs[0]}{dev} -i {sweep_interval_s(specs[0])} -g 30 -"
+        cmd = f"rtl_power -f {specs[0]}{dev} -i {sweep_interval_s(specs[0])} -g 30{(' -p ' + str(ppm)) if ppm else ''} -"
         while True:
             sw.settle_until = time.time() + SETTLE_S + sweep_interval_s(specs[0])
             if not run_once(cmd, sw.row):
@@ -830,7 +846,7 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15) -> N
         for spec in specs:
             i = sweep_interval_s(spec)
             sw.settle_until = time.time() + SETTLE_S + i      # first integration after a retune is discarded
-            if not run_once(f"rtl_power -f {spec}{dev} -i {i} -g 30 -e {max(dwell_s, 2 * i)}s -", sw.row, planned=True):
+            if not run_once(f"rtl_power -f {spec}{dev} -i {i} -g 30{(' -p ' + str(ppm)) if ppm else ''} -e {max(dwell_s, 2 * i)}s -", sw.row, planned=True):
                 return
             time.sleep(0.5)         # let the dongle close before the next range opens it
 
@@ -1144,6 +1160,9 @@ def main() -> None:
     ap.add_argument("--hackrf-vga", type=int, default=20, help="HackRF baseband gain 0-62 dB in 2 dB steps (default 20)")
     ap.add_argument("--hackrf-mask", metavar="LO:HI[,LO:HI...]", default="",
                     help="MHz ranges never reported: this unit's own spurs, found with find_spurs.py (antenna off)")
+    ap.add_argument("--hackrf-ppm", type=float, default=0.0,
+                    help="HackRF crystal correction: reported MHz are scaled by (1 + ppm/1e6). Key a radio on a known "
+                         "frequency, read exact_mhz, then ppm = (known - read) / read * 1e6 (typically -20..20)")
     ap.add_argument("--hackrf-park-range", metavar="LO:HI", default="",
                     help="MHz slice the HackRF parks on when the phone asks (default 796:816, public-safety radios)")
     ap.add_argument("--rtl-power", metavar="SPEC", action="append", default=[],
@@ -1151,6 +1170,8 @@ def main() -> None:
                          "add @SERIAL to put a range on a specific dongle (one sweep per dongle runs in parallel)")
     ap.add_argument("--rtl-power-device", metavar="N|SERIAL", default="",
                     help="which RTL-SDR rtl_power uses: index or serial (see rtl_test); default the first free one")
+    ap.add_argument("--rtl-ppm", type=int, default=0,
+                    help="RTL-SDR crystal correction passed to rtl_power -p (rtl_test -p measures it; 0 for TCXO dongles)")
     ap.add_argument("--rtl-power-dwell", metavar="SECONDS", type=int, default=15,
                     help="seconds on each range when several --rtl-power ranges are given (default 15)")
     ap.add_argument("--dump1090", metavar="HOST:PORT", help="relay aircraft from a dump1090/readsb SBS port")
@@ -1176,11 +1197,11 @@ def main() -> None:
         HACKRF_ON = True
         CAPS.append("sweep")
         CAPS.append("park")
-        threading.Thread(target=feed_hackrf, args=(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask), daemon=True).start()
+        threading.Thread(target=feed_hackrf, args=(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask, a.hackrf_ppm), daemon=True).start()
     if a.rtl_power:
         CAPS.append("sweep")
         for dev, specs in group_sweeps(a.rtl_power, a.rtl_power_device).items():
-            threading.Thread(target=feed_rtl_power, args=(specs, dev, max(3, a.rtl_power_dwell)), daemon=True).start()
+            threading.Thread(target=feed_rtl_power, args=(specs, dev, max(3, a.rtl_power_dwell), a.rtl_ppm), daemon=True).start()
     if a.dump1090:
         CAPS.append("adsb")
         threading.Thread(target=feed_dump1090, args=(a.dump1090,), daemon=True).start()

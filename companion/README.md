@@ -195,6 +195,12 @@ SiriusXM) and airport / weather radar. **Skipped:** 2.4 GHz and 5 GHz Wi-Fi and 
 GPS L2 and long-range air-traffic radar (1215–1240, 1300–1390 MHz), and the radio-astronomy band
 (1400–1427 MHz). Anything else is reported as "*NNN.N* MHz carrier".
 
+**Precision.** Only a carrier's peak bin reports, placed by a parabola through the peak and its
+neighbours: within about a quarter bin (446.075 reads `446.0748 ± 0.025` with 100 kHz bins; the app
+shows it to the kHz). The radio's crystal error is on top: measure it once with a handheld on a known
+frequency, `ppm = (known − read) / read × 1e6`, and set `--hackrf-ppm`; `rtl_test -p` gives the
+RTL-SDR's, for `--rtl-ppm`.
+
 **The first minute.** After a start (or a park change) the HackRF reports nothing for 60 s (8 s parked)
 while the floor settles: its gains arrive late, so the first pass reads 30–40 dB low and everything,
 GPS windows included, would look hot for minutes.
