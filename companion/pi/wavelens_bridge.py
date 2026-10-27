@@ -950,7 +950,7 @@ LISTEN_RATE = 8000
 LISTEN_FRAME = 320          # samples per frame: 40 ms
 LISTEN_MODES = {"fm": "-M fm -s 16k", "am": "-M am -s 16k", "wbfm": "-M wbfm"}
 LISTEN = {"proc": None, "dev": "", "mhz": 0.0, "mode": "", "sq": 0, "until": 0.0, "seq": 0,
-          "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0}
+          "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0, "want": False}
 LISTEN_LOCK = threading.Lock()
 
 # Follow: a scanner. Every fresh sweep hit in a band where voice is analog and legal to hear gets tuned
@@ -1055,7 +1055,9 @@ def follow_watch() -> None:
 
 
 def listen_busy(dev: str) -> bool:
-    return LISTEN["proc"] is not None and LISTEN["dev"] == dev
+    # "want" is set the moment a listen is asked for, before rtl_fm has the dongle: otherwise the sweep
+    # restarts in that gap, grabs the dongle back, and rtl_fm can't open it (usb_claim_interface -6).
+    return (LISTEN["proc"] is not None or LISTEN["want"]) and LISTEN["dev"] == dev
 
 
 def listen_status(msg: str) -> None:
@@ -1087,7 +1089,7 @@ def listen_start(mhz: float, mode: str, sq: int) -> None:
         if same:
             return                           # a renewal: just push the deadline out
     listen_stop("retuning")
-    LISTEN.update({"mhz": mhz, "mode": mode, "sq": sq})
+    LISTEN.update({"mhz": mhz, "mode": mode, "sq": sq, "want": True})
     threading.Thread(target=run_listen, args=(mhz, mode, sq), daemon=True).start()
 
 
@@ -1099,6 +1101,7 @@ def run_listen(mhz: float, mode: str, sq: int) -> None:
         try:
             p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except FileNotFoundError:
+            LISTEN["want"] = False
             listen_status("rtl_fm not found on the Pi (apt install rtl-sdr)")
             return
         time.sleep(0.5)
@@ -1106,10 +1109,12 @@ def run_listen(mhz: float, mode: str, sq: int) -> None:
             break
         p = None
     if p is None:
+        LISTEN["want"] = False
         listen_status("could not open the RTL-SDR for listening (is it pinned with @SERIAL?)")
         return
     with LISTEN_LOCK:
         LISTEN["proc"] = p
+        LISTEN["want"] = False
         LISTEN["tuned_at"] = LISTEN["last_audio"] = time.time()
     print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})", file=sys.stderr)
     listen_status(f"listening on {mhz:.4f} MHz ({mode.upper()}); the RTL-SDR sweep is paused")
