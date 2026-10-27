@@ -98,7 +98,7 @@ licensed frequency gets the licensee's name instead.
 | 49.8–49.9 MHz | 49 MHz baby monitor, toy or old cordless phone | IoT / sensor | Each burst over the noise floor |
 | 72–76 MHz | 72 MHz radio-control model (RC aircraft) | Drone / video link | Only when it's on two passes in a row |
 | **Video and drone links** | | | |
-| 5645–5849 MHz | 5.8 GHz carrier (FPV video, or Wi-Fi ch 149+) | Drone / video link | Only when it's on two passes in a row |
+| 5645–5849 MHz | 5.8 GHz steady carrier: FPV video, or a busy Wi-Fi access point | Drone / video link | Only when it's on 6 passes in a row (Wi-Fi comes and goes; analog video doesn't) |
 | 5850–5925 MHz | 5.9 GHz burst: connected-vehicle radio (C-V2X roadside unit or vehicle) | Vehicle | Bursts as shown; a carrier still there after 3 passes becomes “5.9 GHz steady carrier: FPV video on a high channel” |
 | 5030–5091 MHz | Drone command-link band (5030–5091 MHz, aviation UAS control) | Drone / video link | Only when it's on two passes in a row |
 | 5091–5150 MHz | Airport surface network (AeroMACS) | Network | Each burst over the noise floor |

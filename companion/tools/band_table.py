@@ -77,6 +77,8 @@ def how(b):
         return "Background: once a minute per band, never an alert"
     if b["steady"]:
         return f"Bursts as shown; a carrier still there after 3 passes becomes “{b['steady'][0]}”"
+    if b["kind"] == "video":
+        return "Only when it's on 6 passes in a row (Wi-Fi comes and goes; analog video doesn't)"
     if b["kind"] == "persist" or b["cat"] == "DRONE":
         return "Only when it's on two passes in a row"
     return "Each burst over the noise floor"

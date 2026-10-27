@@ -206,7 +206,9 @@ BANDS = [
     B(72, 76, "72 MHz radio-control model (RC aircraft)", "DRONE"),
 
     # ---- video and drone links
-    B(5645, 5849, "5.8 GHz carrier (FPV video, or Wi-Fi ch 149+)", "DRONE", kind="persist"),
+    # 5645–5849 is shared with 5 GHz Wi-Fi (ch 132–165). Analog FPV video transmits continuously; Wi-Fi
+    # comes and goes with traffic. kind "video": reported only after VIDEO_N passes in a row.
+    B(5645, 5849, "5.8 GHz steady carrier: FPV video, or a busy Wi-Fi access point", "DRONE", kind="video"),
     B(5850, 5925, "5.9 GHz burst: connected-vehicle radio (C-V2X roadside unit or vehicle)", "VEHICLE",
       steady=("5.9 GHz steady carrier: FPV video on a high channel", "DRONE", "POSSIBLE")),
     B(5030, 5091, "Drone command-link band (5030–5091 MHz, aviation UAS control)", "DRONE", kind="persist"),
@@ -313,6 +315,7 @@ SETTLE_S = 2.0       # ignore rtl_power's first rows after it opens the dongle: 
 
 PERSIST = {"DRONE"}  # these categories must be over the floor on two passes in a row before they're reported
 STEADY_N = 3         # passes in a row over the floor before a carrier counts as steady
+VIDEO_N = 6          # kind "video": passes in a row before a carrier shared with Wi-Fi is reported
 CHAIN_S = 30.0       # a bin's run of hot passes breaks if it isn't revisited within this long
 BG_RATE_S = 60.0     # background bands: at most one report per band per minute
 FLOOR_S = 40.0       # rolling floor time constant (a carrier that stays this long becomes the floor)
@@ -444,6 +447,10 @@ class Sweep:
                 name, cat, conf = b["name"], b["cat"], b["conf"]
                 if (b["kind"] == "persist" or cat in PERSIST) and n < 2:
                     continue                 # a video link transmits continuously; a radar sweep or a glitch shows once
+                if b["kind"] == "video":
+                    if n < VIDEO_N:
+                        continue             # Wi-Fi bursts; analog video is on every pass
+                    x["steady"] = f"over the floor on {n} passes in a row"
             self.report(mhz, db, step, db - f, name, cat, conf, b, None, now, x)
         for w, (n, hot) in gnss_rows.items():
             self.gps_row(lo, step, n, hot, now, w[4])
