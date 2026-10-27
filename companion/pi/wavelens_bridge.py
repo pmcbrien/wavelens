@@ -516,9 +516,12 @@ def spawn(cmd: str):
     return p
 
 
-def reap(p, cmd: str) -> None:
-    """Wait for a tool; if it lasted under 10 s, log what it said, since that is a failure, not a sweep."""
+def reap(p, cmd: str, planned: bool = False) -> None:
+    """Wait for a tool; if it lasted under 10 s, log what it said, since that is a failure, not a sweep.
+    planned: the tool was told when to stop (rtl_power -e taking turns), so a clean exit is not logged."""
     p.wait()
+    if planned and p.returncode == 0:
+        return
     if time.time() - p.started_at < 10:
         time.sleep(0.2)                         # let the drain thread catch the last lines
         why = " | ".join(p.err_tail) or "no message"
@@ -526,14 +529,14 @@ def reap(p, cmd: str) -> None:
               file=sys.stderr)
 
 
-def run_once(cmd: str, handler) -> bool:
+def run_once(cmd: str, handler, planned: bool = False) -> bool:
     """Run a tool until it exits, handing it each stdout line. False if it isn't installed."""
     p = spawn(cmd)
     if p is None:
         return False
     for line in p.stdout:
         handler(line)
-    reap(p, cmd)
+    reap(p, cmd, planned)
     return True
 
 
@@ -616,7 +619,7 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15) -> N
         for spec in specs:
             i = sweep_interval_s(spec)
             sw.settle_until = time.time() + SETTLE_S + i      # first integration after a retune is discarded
-            if not run_once(f"rtl_power -f {spec}{dev} -i {i} -g 30 -e {max(dwell_s, 2 * i)}s -", sw.row):
+            if not run_once(f"rtl_power -f {spec}{dev} -i {i} -g 30 -e {max(dwell_s, 2 * i)}s -", sw.row, planned=True):
                 return
             time.sleep(0.5)         # let the dongle close before the next range opens it
 
