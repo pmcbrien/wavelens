@@ -884,12 +884,27 @@ def run_peripheral(name: str) -> None:
     from bluezero import adapter, peripheral
     from bluezero import advertisement as bz_ad
 
+    ADVERT_MARK = "/run/wavelens-advert-failed"   # run-bridge.sh restarts bluetooth when it finds this
+
     def ad_failed(error):
         # Without the advert the phone can't find the companion, while the radios keep running:
-        # a half-alive bridge. Exit so systemd restarts it (5 s later, once BlueZ has let go).
-        print(f"bridge: Bluetooth advertisement failed ({error}); exiting so the service retries", file=sys.stderr)
+        # a half-alive bridge. Leave a mark so the next start restarts BlueZ, and exit.
+        print(f"bridge: Bluetooth advertisement failed ({error}); exiting so the service restarts bluetooth and retries",
+              file=sys.stderr)
+        try:
+            open(ADVERT_MARK, "w").close()
+        except OSError:
+            pass
         os._exit(1)
-    bz_ad.register_ad_error_cb = ad_failed      # bluezero looks this name up when it registers
+
+    def ad_ok():
+        print("Advertisement registered", file=sys.stderr)
+        try:
+            os.remove(ADVERT_MARK)
+        except OSError:
+            pass
+    bz_ad.register_ad_error_cb = ad_failed      # bluezero looks these names up when it registers
+    bz_ad.register_ad_cb = ad_ok
 
     dongle = list(adapter.Adapter.available())[0]
     code = dongle.address.replace(":", "")[-4:].upper()

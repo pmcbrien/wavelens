@@ -9,6 +9,17 @@ set -eu
 
 BRIDGE=/usr/local/lib/wavelens/wavelens_bridge.py
 
+# The last run couldn't register its Bluetooth advert. On some Pi images BlueZ stays stuck that way
+# until it is restarted, so restart it before trying again (this service only Wants bluetooth, so
+# that doesn't stop us).
+MARK=/run/wavelens-advert-failed
+if [ -e "$MARK" ]; then
+    echo "bridge: last advert failed; restarting bluetooth first"
+    rm -f "$MARK"
+    systemctl restart bluetooth || true
+    sleep 4
+fi
+
 # Wait for the Bluetooth adapter to come up after boot (up to ~30 s).
 i=0
 while [ $i -lt 30 ]; do

@@ -1,6 +1,8 @@
 [Unit]
 Description=Wavelens companion bridge (receive-only radios -> Wavelens app over BLE)
-Requires=bluetooth.service
+# Wants, not Requires: run-bridge.sh restarts bluetooth itself after a failed advert, and with
+# Requires that restart would stop this service too.
+Wants=bluetooth.service
 After=bluetooth.service
 
 [Service]
@@ -10,6 +12,8 @@ EnvironmentFile=-/etc/default/wavelens-bridge
 ExecStart=/usr/local/lib/wavelens/run-bridge.sh
 Restart=always
 RestartSec=5
+# rtl_433 / rtl_power can hang on the USB device when told to quit; don't wait systemd's default 90 s.
+TimeoutStopSec=8
 # The bridge registers a GATT server and advertisement with BlueZ over D-Bus and
 # opens the SDR's USB device; root is the reliable way to get both on Raspberry Pi OS.
 User=root
