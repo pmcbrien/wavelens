@@ -355,7 +355,8 @@ PERSIST = {"DRONE"}  # these categories must be over the floor on two passes in 
 STEADY_N = 3         # passes in a row over the floor before a carrier counts as steady
 VIDEO_N = 6          # kind "video": passes in a row before a carrier shared with Wi-Fi is reported
 CHAIN_S = 30.0       # a bin's run of hot passes breaks if it isn't revisited within this long
-ALWAYS_N = 120       # hot passes in a row (a few minutes) before a bin counts as always on: background
+ALWAYS_S = 180.0     # a 1 MHz bucket hot for this long without a break counts as always on: background
+STORM_FRESH_S = 10.0 # a bucket hot for less than this is "fresh": only fresh hits make, or fall to, an overload burst
 BG_RATE_S = 60.0     # background bands: at most one report per band per minute
 FLOOR_S = 40.0       # rolling floor time constant (a carrier that stays this long becomes the floor)
 FLOOR_UP_GNSS_S = 1200.0   # ... rising in the GNSS bands, so a jammer riding with you stays visible
@@ -412,6 +413,7 @@ class Sweep:
         self.since = {}       # bin Hz → when it was first seen (the floor is "warm" after FLOOR_WARM_S)
         self.seen = {}        # bin Hz → time of the previous visit
         self.runs = {}        # bin Hz → [passes in a row over the floor, last dB, bin width]
+        self.bhot = {}        # 1 MHz bucket → [first hot, last hot]: a spur drifts across bins, the bucket holds
 
     def row(self, line: str) -> None:
         parts = [p.strip() for p in line.split(",")]
@@ -469,8 +471,17 @@ class Sweep:
                     b = band_of(mhz)
                     if b["steady"] and not (FCC and FCC.label(mhz, tol_khz=max(step / 1000.0, 12.5))):
                         # it came and went: report it now with the burst label
+                        self.fresh = True
                         self.report(mhz, run[1], step, run[1] - f, b["name"], b["cat"], b["conf"], b, None, now, {})
                 continue
+            # How long this 1 MHz bucket has been hot without a break of CHAIN_S. Judged per bucket, not
+            # per bin: a spur wanders across neighbouring bins, and a per-bin count would keep restarting.
+            bucket = round(mhz / self.bucket)
+            bh = self.bhot.get(bucket)
+            if bh is None or now - bh[1] > CHAIN_S:
+                bh = self.bhot[bucket] = [now, now]
+            bh[1] = now
+            hot_for = now - bh[0]
             run = self.runs.get(hz)
             if run and prev_visit is not None and 0.2 < now - prev_visit <= CHAIN_S:
                 run[0] += 1
@@ -478,10 +489,14 @@ class Sweep:
             elif not run or prev_visit is None or now - prev_visit > CHAIN_S:
                 run = self.runs[hz] = [1, db, step]
             n = run[0]
-            # Hot for ALWAYS_N passes straight: a fixed transmitter, or one of the receiver's own spurs
+            # Hot for ALWAYS_S without a break: a fixed transmitter, or one of the receiver's own spurs
             # (a HackRF shows a few, some near full scale). Background from here on: once a minute,
             # and never part of the overload judgement, where a strong spur would otherwise be "the cause".
-            self.always = n >= ALWAYS_N
+            self.always = hot_for >= ALWAYS_S
+            # Fresh: this bucket rose just now. Only fresh hits can be an overload burst, and only fresh
+            # hits are dropped as one. A bucket that has been hot for a while is established: it goes
+            # through, and it is not "a band that rose together" with anything.
+            self.fresh = hot_for < STORM_FRESH_S
             x = {"over_floor_db": f"{db - f:.0f}", "bin_hz": f"{step:.0f}"}
             lic = FCC.label(mhz, tol_khz=max(step / 1000.0, 12.5)) if FCC else None
             if lic:
@@ -519,6 +534,7 @@ class Sweep:
         # f goes out rounded to whole MHz (and sweep ids are 1 MHz buckets); the bin centre is the
         # best the sweep actually knows, to within half a bin plus the radio's own ppm error.
         x.setdefault("exact_mhz", f"{mhz:.4f}".rstrip("0").rstrip(".") + f" ± {step / 2e6:g}")
+        fresh = getattr(self, "fresh", True)
         if b is not None and b["kind"] == "bg":
             key, rate = "bg/" + b["key"], BG_RATE_S
             ident = ident or f"{self.src}/bg/{b['key']}"
@@ -547,7 +563,7 @@ class Sweep:
         if (b is not None and b["kind"] == "bg") or getattr(self, "always", False):
             emit(line)                       # background and always-on bins bypass the overload gate
         else:
-            storm_gate(self.src).push(now, b["key"] if b is not None else str(ident), line)
+            storm_gate(self.src).push(now, b["key"] if b is not None else str(ident), line, fresh)
 
     def gps_row(self, lo: float, step: float, n: int, hot: list, now: float, label: str = "GPS band (L1)") -> None:
         """Possible GPS jammer only when a wide part of this row is raised (at least a quarter of its
@@ -585,7 +601,10 @@ class Sweep:
 # across the whole spectrum at once, at about the same level: "military radar", "satellite C-band",
 # "flight-test telemetry" in a living room. Real signals rise one or two bands at a time. So sweep
 # reports are held for STORM_HOLD_S, and when STORM_BANDS or more unrelated bands rose within that
-# window, the whole batch is dropped and the phone gets one status line instead.
+# window, the fresh part of the batch is thinned to its strongest and the phone gets one status line.
+# "Rose together" means rose: a bucket that has been hot for a while (a spur, a steady carrier) is not
+# part of the burst and is never dropped by it. Without that, a receiver with a few permanent spurs
+# would be "overloaded" in every window, and a radio keyed up beside it would be dropped every time.
 # Bands that are only radar: a radar's pulses drift across several MHz, so these report as one entry
 # per band. Not 420–450 (70 cm amateur shares it) or 1030 MHz: there each carrier is its own transmitter.
 RADAR_BANDS = {"2700-2900", "2900-3100", "3100-3450"}
@@ -601,33 +620,45 @@ class StormGate:
         self.src, self.q, self.lock, self.noted = src, deque(), threading.Lock(), 0.0
         threading.Thread(target=self._loop, daemon=True).start()
 
-    def push(self, now: float, band: str, line: dict) -> None:
+    def push(self, now: float, band: str, line: dict, fresh: bool = True) -> None:
         with self.lock:
-            self.q.append((now, band, line))
+            self.q.append((now, band, line, fresh))
 
     def _loop(self) -> None:
         while True:
             time.sleep(0.25)
-            now = time.time()
+            self.flush(time.time())
+
+    def flush(self, now: float) -> None:
+        """Release every window that has been held for STORM_HOLD_S (call again until nothing is due)."""
+        while True:
             with self.lock:
                 if not self.q or now - self.q[0][0] < STORM_HOLD_S:
-                    continue
+                    return
                 t0 = self.q[0][0]
                 batch = []
                 while self.q and self.q[0][0] <= t0 + STORM_HOLD_S:
                     batch.append(self.q.popleft())
-            bands = {band for _, band, _ in batch}
+            self._judge(batch)
+
+    def _judge(self, batch: list) -> None:
+            now = time.time()
+            rose = [(band, line) for _, band, line, fresh in batch if fresh]
+            bands = {band for band, _ in rose}
             if len(bands) >= STORM_BANDS:
                 # Overload has a cause, and the cause is the strongest thing in the burst (a radar's main
                 # beam sweeping past, the phone keying up beside the antenna). Keep what's within
                 # STORM_KEEP_DB of the strongest; the weaker rest is the receiver's own false carriers.
-                top = max(line["r"] for _, _, line in batch)
-                keep = [line for _, _, line in batch
+                # Established hits (not fresh) were there before the burst and go through untouched.
+                top = max(line["r"] for _, line in rose)
+                keep = [line for _, line in rose
                         if line["r"] >= top - STORM_KEEP_DB
                         or float(line.get("x", {}).get("over_floor_db", 0)) >= STORM_KEEP_OVER_DB]
                 for line in keep:
                     line.setdefault("x", {})["burst"] = f"strongest of {len(bands)} bands that rose together"
-                    emit(line)
+                for _, _, line, fresh in batch:
+                    if not fresh or line in keep:
+                        emit(line)
                 if now - self.noted > STORM_NOTE_S:
                     self.noted = now
                     cause = ", ".join(sorted({l["n"] for l in keep}))[:120]
@@ -636,8 +667,8 @@ class StormGate:
                            "sweeping past, does this; lower the gain if it happens often.")
                     print("bridge: " + msg, file=sys.stderr)
                     emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
-                continue
-            for _, _, line in batch:
+                return
+            for _, _, line, _ in batch:
                 emit(line)
 
 

@@ -195,8 +195,11 @@ GPS L2 and long-range air-traffic radar (1215–1240, 1300–1390 MHz), and the 
 
 **Broadband bursts.** When four or more unrelated bands rise within 2.5 s, the HackRF is overloading:
 a strong transmitter beside it (the phone, the Pi's own Wi-Fi) or a radar's main beam sweeping past. The
-bridge keeps hits within 5 dB of the strongest (the likely cause), drops the rest, and sends one status
-line at most once a minute. Reports are held 2.5 s to judge this. Radar hits are one entry per radar band.
+bridge keeps hits within 5 dB of the strongest (the likely cause) and anything 30 dB over its floor, drops
+the rest, and sends one status line at most once a minute. Reports are held 2.5 s to judge this. Only bands
+that *rose* in the last 10 s take part: a bucket hot for longer (a spur, a steady carrier) is established,
+passes untouched and is not counted, so permanent spurs can't make every window look like overload. A 1 MHz
+bucket hot for 3 min straight is always-on: background, once a minute. Radar hits are one entry per radar band.
 Lower the gain with `--hackrf-lna 16` (and `--hackrf-vga`) if it happens often.
 
 **Steady vs burst.** In 902–928 and 5850–5925 MHz the same band means two things, so the bridge
