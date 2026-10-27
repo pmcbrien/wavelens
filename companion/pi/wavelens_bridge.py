@@ -324,6 +324,7 @@ FLOOR_UP_GNSS_S = 1200.0   # ... rising in the GNSS bands, so a jammer riding wi
 # public-safety mobile 799–805, 800 MHz repeater inputs 806–815). Energy only: "a radio keyed up
 # nearby", never who or what was said. Set another slice with --hackrf-park-range.
 PARK_RANGES = {"le": "796:816"}
+HACKRF_STALL_S = 10.0   # a full 1 MHz–6 GHz pass takes about a second; this long with no rows means it hung
 
 
 _band_cache = {}
@@ -555,15 +556,24 @@ def feed_hackrf(range_mhz: str, bin_hz: int) -> None:
             return
         print(f"bridge: hackrf_sweep {rng} MHz" + (f" (parked: {park})" if park in PARK_RANGES else ""), file=sys.stderr)
 
+        p.last_line = time.time()
+
         def watch(proc=p, was=park):
             while proc.poll() is None:
                 if state.get("park", "off") != was:
                     proc.terminate()
                     return
+                # A HackRF behind a busy USB hub can stop streaming without hackrf_sweep exiting: the radio
+                # sits on one frequency and nothing is reported. Kill it and start over.
+                if time.time() - proc.last_line > HACKRF_STALL_S:
+                    print(f"bridge: hackrf_sweep stalled (no data for {HACKRF_STALL_S:.0f} s); restarting", file=sys.stderr)
+                    proc.kill()
+                    return
                 time.sleep(0.2)
 
         threading.Thread(target=watch, daemon=True).start()
         for line in p.stdout:
+            p.last_line = time.time()
             sw.row(line)
         reap(p, cmd)
         if state.get("park", "off") == park:
