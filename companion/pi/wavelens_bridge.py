@@ -27,6 +27,7 @@ not yet run on a Pi by the author.
 """
 
 import argparse
+from collections import deque
 import bisect
 import json
 import math
@@ -493,16 +494,44 @@ class Sweep:
                           "is drifting or dropping out.")}})
 
 
-def run_once(cmd: str, handler) -> bool:
-    """Run a tool until it exits, handing it each stdout line. False if it isn't installed."""
+def spawn(cmd: str):
+    """Start a radio tool with stdout piped. Its stderr is drained on a thread (hackrf_sweep and
+    rtl_power write progress there constantly) and the last few lines kept, so that when the tool
+    exits early the journal says why. Returns the process, or None if the tool isn't installed."""
     try:
-        p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except FileNotFoundError:
         print(f"bridge: {cmd.split()[0]} not found on PATH", file=sys.stderr)
+        return None
+    tail = deque(maxlen=4)
+
+    def drain():
+        for ln in p.stderr:
+            if ln.strip():
+                tail.append(ln.strip())
+    threading.Thread(target=drain, daemon=True).start()
+    p.started_at, p.err_tail = time.time(), tail
+    return p
+
+
+def reap(p, cmd: str) -> None:
+    """Wait for a tool; if it lasted under 10 s, log what it said, since that is a failure, not a sweep."""
+    p.wait()
+    if time.time() - p.started_at < 10:
+        time.sleep(0.2)                         # let the drain thread catch the last lines
+        why = " | ".join(p.err_tail) or "no message"
+        print(f"bridge: {cmd.split()[0]} exited after {time.time() - p.started_at:.1f} s (code {p.returncode}): {why}",
+              file=sys.stderr)
+
+
+def run_once(cmd: str, handler) -> bool:
+    """Run a tool until it exits, handing it each stdout line. False if it isn't installed."""
+    p = spawn(cmd)
+    if p is None:
         return False
     for line in p.stdout:
         handler(line)
-    p.wait()
+    reap(p, cmd)
     return True
 
 
@@ -520,10 +549,8 @@ def feed_hackrf(range_mhz: str, bin_hz: int) -> None:
         park = state.get("park", "off")
         rng = PARK_RANGES.get(park, range_mhz)
         cmd = f"hackrf_sweep -f {rng} -w {bin_hz} -l 32 -g 20"
-        try:
-            p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-        except FileNotFoundError:
-            print("bridge: hackrf_sweep not found on PATH", file=sys.stderr)
+        p = spawn(cmd)
+        if p is None:
             return
         print(f"bridge: hackrf_sweep {rng} MHz" + (f" (parked: {park})" if park in PARK_RANGES else ""), file=sys.stderr)
 
@@ -537,7 +564,7 @@ def feed_hackrf(range_mhz: str, bin_hz: int) -> None:
         threading.Thread(target=watch, daemon=True).start()
         for line in p.stdout:
             sw.row(line)
-        p.wait()
+        reap(p, cmd)
         if state.get("park", "off") == park:
             time.sleep(2)                    # it exited by itself (unplugged, error): retry like feed_process
 
@@ -759,6 +786,14 @@ def blink(secs: int) -> None:
 
 def run_peripheral(name: str) -> None:
     from bluezero import adapter, peripheral
+    from bluezero import advertisement as bz_ad
+
+    def ad_failed(error):
+        # Without the advert the phone can't find the companion, while the radios keep running:
+        # a half-alive bridge. Exit so systemd restarts it (5 s later, once BlueZ has let go).
+        print(f"bridge: Bluetooth advertisement failed ({error}); exiting so the service retries", file=sys.stderr)
+        os._exit(1)
+    bz_ad.register_ad_error_cb = ad_failed      # bluezero looks this name up when it registers
 
     dongle = list(adapter.Adapter.available())[0]
     code = dongle.address.replace(":", "")[-4:].upper()
