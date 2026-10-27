@@ -1273,6 +1273,33 @@ def listen_worker() -> None:
 SYNC_RE = re.compile(r"Sync:\s*[+-]?\s*([A-Za-z0-9]+)")
 
 
+def stop_tools(procs: list) -> None:
+    """Stop a listen's tools, client first (dsd-fme, then rtl_tcp: rtl_tcp can sit on the dongle until its
+    client is gone), and kill what hasn't exited within a second and a half. A tool that lingers keeps the
+    dongle, and then neither the sweep nor the next listen can open it (usb_claim_interface -6)."""
+    for q in reversed(procs):
+        try:
+            q.terminate()
+        except Exception:
+            pass
+    deadline = time.time() + 1.5
+    for q in reversed(procs):
+        while q.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        if q.poll() is None:
+            try:
+                q.kill()
+                q.wait(timeout=1)
+            except Exception:
+                pass
+
+
+def kill_strays() -> None:
+    """A bridge that died mid-listen leaves rtl_tcp/dsd-fme holding the dongle: clear them before starting."""
+    subprocess.call(["pkill", "-f", f"rtl_tcp -a 127.0.0.1 -p {RTL_TCP_PORT}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.call(["pkill", "-f", f"udp:127.0.0.1:{DSD_UDP_PORT}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
     """Start a radio tool, retrying while the dongle is still being released by the sweep.
     Returns the process, None if it never came up, or False if the tool isn't installed."""
@@ -1310,6 +1337,7 @@ def serve_listen(req: tuple, gen: int) -> None:
     sock = None
     if mode in DIGITAL_MODES:
         flag, chans = DIGITAL_MODES[mode]
+        kill_strays()
         p = start_tool(f"rtl_tcp -a 127.0.0.1 -p {RTL_TCP_PORT}{dev}", gen)
         if p is False:
             listen_stop("rtl_tcp missing"); listen_status("rtl_tcp not found on the Pi (apt install rtl-sdr)"); return
@@ -1326,8 +1354,7 @@ def serve_listen(req: tuple, gen: int) -> None:
         d = start_tool(f"dsd-fme {flag} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:12:{sq}:2 "
                        f"-o udp:127.0.0.1:{DSD_UDP_PORT} -N", gen, attempts=4, watch_sync=True)
         if d is False or d is None:
-            for q in procs:
-                q.terminate()
+            stop_tools(procs)
             sock.close()
             if d is False:
                 listen_stop("dsd-fme missing")
@@ -1382,11 +1409,7 @@ def serve_listen(req: tuple, gen: int) -> None:
                         listen_resolve("fm", "carrier with no digital sync")
                         break
             time.sleep(0.5)
-        for q in procs:
-            try:
-                q.terminate()
-            except Exception:
-                pass
+        stop_tools(procs)
     threading.Thread(target=watch, daemon=True).start()
 
     def read_chunk():
@@ -1448,11 +1471,7 @@ def serve_listen(req: tuple, gen: int) -> None:
                     pass                     # the link is behind: drop this frame, keep the latest
     finally:
         LISTEN["proc"] = None
-        for q in procs:
-            try:
-                q.terminate()
-            except Exception:
-                pass
+        stop_tools(procs)
         if sock is not None:
             sock.close()
         if ended_itself and LISTEN["req"] is not None and LISTEN["gen"] == gen:
@@ -1878,6 +1897,7 @@ def main() -> None:
     if a.listen_device:
         LISTEN["dev"] = a.listen_device
         CAPS.append("listen")
+        kill_strays()
         threading.Thread(target=listen_worker, daemon=True).start()
         threading.Thread(target=follow_watch, daemon=True).start()
     if a.dump1090:
