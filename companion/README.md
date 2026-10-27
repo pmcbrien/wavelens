@@ -384,8 +384,9 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // licensed sites by distance. lat null = sharing turned off; forget it.
 {"c":"listen","mhz":446.075,"mode":"fm"}   // SDR bridge: demodulate this and stream audio (fm | am | wbfm);
 {"c":"listen","v":"follow"}          // scanner: tune every fresh voice-band hit (air AM, VHF/UHF FM, CB), play it
-{"c":"listen","v":"off"}             // until the squelch closes + 3 s, then the next. "sq": rtl_fm squelch,
-                                     // changeable any time. Renew within 5 min or it stops itself.
+{"c":"listen","v":"off"}             // until the squelch closes + 3 s or 30 s is up, then the newest waiting one;
+                                     // a channel just played waits 60 s before it's returned to. "sq": rtl_fm
+                                     // squelch, changeable any time. Renew within 5 min or it stops itself.
 ```
 
 **Listening (SDR bridge, capability `listen`).** The bridge borrows an RTL-SDR — by default the first

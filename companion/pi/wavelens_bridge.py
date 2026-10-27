@@ -950,7 +950,8 @@ LISTEN_RATE = 8000
 LISTEN_FRAME = 320          # samples per frame: 40 ms
 LISTEN_MODES = {"fm": "-M fm -s 16k", "am": "-M am -s 16k", "wbfm": "-M wbfm"}
 LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "mhz": 0.0, "mode": "", "sq": 0, "until": 0.0,
-          "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0}
+          "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0,
+          "recent": {}, "played": {}}      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
 LISTEN_CV = threading.Condition()
 
 # Follow: a scanner. Every fresh sweep hit in a band where voice is analog and legal to hear gets tuned
@@ -960,6 +961,9 @@ FOLLOW_BANDS = [(26.96, 27.41, "am"), (29.6, 54.0, "fm"), (118.0, 137.0, "am"), 
                 (216.0, 225.0, "fm"), (400.0, 470.0, "fm")]
 FOLLOW_HANG_S = 3.0
 FOLLOW_MIN_S = 4.0          # once tuned, give the squelch this long to open before another hit can take over
+FOLLOW_MAX_S = 30.0         # a channel gets at most this long, then the next waiting signal takes the dongle
+FOLLOW_COOLDOWN_S = 60.0    # a channel just played isn't returned to for this long (a busy repeater would hog it)
+FOLLOW_RECENT_S = 60.0      # a hit older than this is no longer a candidate
 
 
 def follow_mode(mhz: float):
@@ -1025,13 +1029,8 @@ class Ima:
         return bytes(out)
 
 
-def follow_watch() -> None:
-    while True:
-        time.sleep(5)
-        if LISTEN["follow"] and time.time() > LISTEN["follow_until"]:
-            LISTEN["follow"] = False
-            listen_stop("follow timed out (5 min without the app renewing it)")
-            listen_status("follow ended")
+def follow_key(mhz: float) -> int:
+    return int(round(mhz / 0.0125))         # one channel = one 12.5 kHz slot
 
 
 def follow_hit(obj: dict) -> None:
@@ -1046,22 +1045,58 @@ def follow_hit(obj: dict) -> None:
     if mode is None:
         return
     now = time.time()
+    LISTEN["recent"][follow_key(mhz)] = (now, mhz, mode)
     if LISTEN["req"] is not None:
         if abs(LISTEN["mhz"] - mhz) < 0.02:
             LISTEN["until"] = now + LISTEN_MAX_S
             return                           # already on it
         if LISTEN["proc"] is None or now - LISTEN["tuned_at"] < FOLLOW_MIN_S or now - LISTEN["last_audio"] < FOLLOW_HANG_S:
-            return                           # still tuning, or busy with a live one
+            return                           # still tuning, or busy with a live one: it's queued in "recent"
+    follow_next(now)
+
+
+def follow_next(now: float) -> bool:
+    """Tune the newest candidate that hasn't just been played. False when nothing is waiting."""
+    recent, played = LISTEN["recent"], LISTEN["played"]
+    for k in [k for k, (seen, _, _) in recent.items() if now - seen > FOLLOW_RECENT_S]:
+        del recent[k]
+    for k in [k for k, left in played.items() if now - left > FOLLOW_COOLDOWN_S]:
+        del played[k]
+    cur = follow_key(LISTEN["mhz"]) if LISTEN["req"] is not None else None
+    cands = [(seen, k, mhz, mode) for k, (seen, mhz, mode) in recent.items() if k not in played and k != cur]
+    if not cands:
+        return False
+    _, _, mhz, mode = max(cands)
     listen_start(mhz, mode, LISTEN["sq"])
+    return True
+
+
+def follow_leave(now: float, why: str) -> None:
+    """Done with the current channel: remember it so it isn't returned to at once, then move on or wait."""
+    if LISTEN["req"] is not None:
+        LISTEN["played"][follow_key(LISTEN["mhz"])] = now
+    if not follow_next(now):
+        listen_stop(why)
+        listen_status(f"follow: {why}; waiting for the next signal")
 
 
 def follow_watch() -> None:
     while True:
-        time.sleep(5)
-        if LISTEN["follow"] and time.time() > LISTEN["follow_until"]:
+        time.sleep(1)
+        now = time.time()
+        if not LISTEN["follow"]:
+            continue
+        if now > LISTEN["follow_until"]:
             LISTEN["follow"] = False
             listen_stop("follow timed out (5 min without the app renewing it)")
             listen_status("follow ended")
+            continue
+        if LISTEN["proc"] is None:
+            continue
+        if now - LISTEN["tuned_at"] >= FOLLOW_MAX_S:
+            follow_leave(now, f"{FOLLOW_MAX_S:.0f} s on {LISTEN['mhz']:.4f} MHz is enough")
+        elif now - LISTEN["tuned_at"] >= FOLLOW_MIN_S and now - LISTEN["last_audio"] >= FOLLOW_HANG_S:
+            follow_next(now)                 # it went quiet: take the newest waiting signal, if any
 
 
 def listen_busy(dev: str) -> bool:
