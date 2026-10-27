@@ -382,8 +382,10 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // a HackRF bridge parks on 796–816 MHz. "off" = sweep everything again
 {"c":"pos","lat":27.9,"lon":-82.8}   // opt-in only: the phone's fix, every 10 s, so the companion can rank
                                      // licensed sites by distance. lat null = sharing turned off; forget it.
-{"c":"listen","mhz":446.075,"mode":"fm"}   // SDR bridge: demodulate this and stream audio (fm | am | wbfm, or
-                                     // dmr | p25 | nxdn | dstar with dsd-fme installed — see install-dsd.sh);
+{"c":"listen","mhz":446.075,"mode":"auto","tol":0.025}   // SDR bridge: demodulate and stream audio. mode: auto
+                                     // (detect DMR/P25, else narrow FM) | fm | am | wbfm | dmr | p25 | nxdn | dstar
+                                     // (digital needs dsd-fme — install-dsd.sh). tol: how far the sweep's placing
+                                     // may be off (MHz); the bridge snaps to the likeliest channel within it;
 {"c":"listen","v":"follow"}          // scanner: tune every fresh voice-band hit (air AM, VHF/UHF FM, CB), play it
 {"c":"listen","v":"off"}             // until the squelch closes + 3 s or 30 s is up, then the newest waiting one;
                                      // a channel just played waits 60 s before it's returned to. "sq": rtl_fm
@@ -396,7 +398,21 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 frames — `seq` (u8), predictor (i16 LE), step index (u8), then 320 samples as 4-bit codes, high nibble
 first — one frame per 40 ms, about 4 kB/s. Each frame carries its own start state, so a dropped frame
 costs 40 ms and nothing after. `rtl_fm`'s squelch (`--listen-squelch`, default 30) keeps the link quiet
-between transmissions. Digital modes run `rtl_tcp` on the dongle and `dsd-fme` (install once with `install-dsd.sh`, ~10 min
+between transmissions. **Landing on the channel.** A sweep places a carrier to ±25 kHz (HackRF, 100 kHz bins) or ±3 kHz
+(RTL-SDR), but radios sit on channel rasters, so the listen starts on the likeliest channel for the
+reading (`snap_channel`: 12.5/6.25 kHz land mobile, 15/5 kHz on 2 m, 25 kHz air and marine, 10 kHz CB,
+the FRS/GMRS list). Then it hones: on analog FM, rtl_fm's discriminator carries a DC level proportional
+to the carrier's offset from the tuned frequency, measured over half a second of open squelch to ~100 Hz,
+and the listen retunes to the channel that offset points at (the DC is removed before the audio goes
+out). Later sweep readings of the same carrier refine it too. `--rtl-ppm` matters here: an uncorrected
+dongle's crystal error (often 20–50 ppm, 10–20 kHz at 450 MHz) looks like a channel offset.
+
+**Auto mode** starts `dsd-fme -fa`; the sync it reports on stderr ("Sync: +DMR", "+P25p1") names the
+protocol and the audio layout (TDMA is stereo). If the carrier is on (the sweep still sees it) and no
+digital sync appears within 3 s, it is analog: the listen restarts as narrow FM. Decided once per tune.
+The status line carries `"asked":"auto"` and `"detected":"DMR"` / `"FM"` alongside the effective mode.
+
+Digital modes run `rtl_tcp` on the dongle and `dsd-fme` (install once with `install-dsd.sh`, ~10 min
 on a Pi 4) as the demodulator/decoder, which sends 8 kHz PCM to the bridge over UDP on localhost; DMR
 and P25 phase 2 are TDMA, two slots as stereo, mixed to mono. Encrypted talkgroups decode to silence.
 Trunked systems (most 800 MHz public safety) hop channels under a control channel and are not followed;

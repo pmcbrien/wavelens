@@ -32,6 +32,7 @@ import bisect
 import json
 import math
 import os
+import re
 import shlex
 import socket
 import struct
@@ -63,8 +64,17 @@ def emit(obj: dict) -> None:
         out.put_nowait(line)
     except Exception:
         pass  # full: drop, the next packet will come
-    if LISTEN.get("follow") and obj.get("t") == "rf" and obj.get("src") in ("hackrf", "rtlpower"):
-        follow_hit(obj)
+    if obj.get("t") == "rf" and obj.get("src") in ("hackrf", "rtlpower"):
+        if LISTEN.get("req") is not None:
+            try:
+                r = float(str((obj.get("x") or {}).get("exact_mhz", "")).split()[0])
+                if abs(r - LISTEN["mhz"]) < 0.06:
+                    LISTEN["carrier_at"] = time.time()
+                    hone(r)
+            except (ValueError, IndexError):
+                pass
+        if LISTEN.get("follow"):
+            follow_hit(obj)
 
 
 CAPS = ["rf"]
@@ -952,19 +962,77 @@ LISTEN_MODES = {"fm": "-M fm -s 16k", "am": "-M am -s 16k", "wbfm": "-M wbfm"}
 # Digital voice: rtl_tcp serves the dongle, dsd-fme demodulates and decodes, and sends 8 kHz PCM to a UDP
 # port the bridge listens on. TDMA modes (DMR, P25 phase 2) come out stereo, one slot per channel: mixed.
 # Encrypted traffic decodes to nothing; that is the law and the maths, not a setting.
-DIGITAL_MODES = {"dmr": ("-fs", 2), "p25": ("-f1", 1), "nxdn": ("-fi", 1), "dstar": ("-fd", 1)}
+DIGITAL_MODES = {"dmr": ("-fs", 2), "p25": ("-f1", 1), "nxdn": ("-fi", 1), "dstar": ("-fd", 1),
+                 "auto": ("-fa", 1)}       # auto: dsd-fme's own detection (DMR, P25 phase 1 and 2); see AUTO_* below
+# Mode "auto": start in dsd-fme's auto-detect; it says on stderr what sync it finds ("Sync: +P25p1"), which
+# also tells us the audio layout (TDMA is stereo). If the carrier is on and no digital sync shows within
+# AUTO_WAIT_S, it's analog: restart as narrow FM. Decided once per tune; the app's renewals keep "auto".
+AUTO_WAIT_S = 3.0
+# Channel plans: a sweep places a carrier to within a quarter bin (±25 kHz on a HackRF, ±3 kHz on an
+# RTL-SDR), but radios sit on channel rasters. Snap to the likeliest channel within the tolerance:
+# (lo, hi, [(step_khz, offset_khz, preference)...]) — lower preference wins when several rasters fit.
+CHANNEL_PLANS = [
+    (26.96, 27.41, [(10, 5, 0)]),                              # CB: 26.965, 26.975, ... (x.xx5)
+    (29.6, 54.0, [(20, 0, 0), (5, 0, 1)]),                      # low band
+    (118.0, 137.0, [(25, 0, 0), (8.333, 0, 1)]),                # air band: 25 kHz (8.33 kHz in Europe)
+    (144.0, 148.0, [(15, 0, 0), (5, 0, 1)]),                    # 2 m: 15 kHz repeater raster, 5 kHz elsewhere
+    (156.0, 162.05, [(25, 0, 0), (12.5, 0, 1)]),                # marine: 25 kHz channels
+    (137.0, 174.0, [(12.5, 0, 0), (7.5, 0, 1), (2.5, 0, 2)]),   # VHF land mobile: 12.5 kHz, with 7.5 kHz offsets
+    (216.0, 225.0, [(12.5, 0, 0), (6.25, 0, 1)]),
+    (420.0, 450.0, [(25, 0, 0), (12.5, 0, 1), (5, 0, 2)]),      # 70 cm: 25 kHz repeaters, 5 kHz raster
+    (462.5375, 462.7375, [(12.5, 0, 0)]),                       # FRS/GMRS: 462.5500 … 462.7250 on 12.5 kHz
+    (467.5375, 467.7375, [(12.5, 0, 0)]),
+    (450.0, 470.0, [(12.5, 0, 0), (6.25, 0, 1), (2.5, 0, 2)]),  # UHF land mobile
+    (806.0, 824.0, [(12.5, 0, 0), (6.25, 0, 1)]),
+    (851.0, 869.0, [(12.5, 0, 0), (6.25, 0, 1)]),
+    (896.0, 902.0, [(12.5, 0, 0)]), (935.0, 941.0, [(12.5, 0, 0)]),
+]
+HONE_MIN_READINGS = 3        # sweep readings of the tuned carrier before re-snapping from their average
+HONE_RATE_S = 10.0           # at most one re-tune this often
+# AFC on analog FM: rtl_fm's discriminator output has a DC level proportional to how far the carrier is
+# from the tuned frequency (full scale 16384 = half the demod rate). Half a second of open squelch
+# measures that to ~100 Hz, which is how the listen lands on the exact channel after a sweep's ±25 kHz.
+AFC_RATE_IN = 16000.0
+AFC_FRAMES = 12              # 40 ms frames with signal before judging (about half a second)
+AFC_MIN_HZ = 1500            # smaller offsets are the dongle's crystal, not a wrong channel
+
+
+def snap_channel(mhz: float, tol_mhz: float) -> float:
+    """The likeliest channel for a carrier placed at mhz ± tol. Rasters of the band in preference order;
+    a raster point within the tolerance (plus a 20 % margin) wins, nearest first among equal preference.
+    Outside any plan, or nothing within tolerance, the reading itself at 2.5 kHz."""
+    best = None
+    for lo, hi, rasters in CHANNEL_PLANS:
+        if not lo <= mhz <= hi:
+            continue
+        for step_khz, off_khz, pref in rasters:
+            step = step_khz / 1000.0
+            g = round((mhz - off_khz / 1000.0) / step) * step + off_khz / 1000.0
+            d = abs(g - mhz)
+            if d <= tol_mhz * 1.2 + 0.004:   # + 10 ppm at 400 MHz: an uncorrected dongle's own error
+                cand = (pref, d, g)
+                if best is None or cand < best:
+                    best = cand
+        break
+    if best is not None:
+        return round(best[2], 4)
+    return round(round(mhz / 0.0025) * 0.0025, 4)
+AUTO_NO_CARRIER_WAIT_S = 8.0   # no sweep running to tell us the carrier is on: decide on time since tune alone
+TDMA_SYNCS = ("DMR", "P25p2", "X2")
 DSD_UDP_PORT = 23470
 RTL_TCP_PORT = 23471
-LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "mhz": 0.0, "mode": "", "sq": 0, "until": 0.0,
-          "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0,
+LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "mhz": 0.0, "mode": "", "asked": "", "sq": 0,
+          "raw_mhz": 0.0, "tol": 0.05, "readings": [], "honed_at": 0.0,   # the sweep's placing, and later readings
+          "until": 0.0, "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0,
+          "carrier_at": 0.0, "detected": "",   # auto: when the sweep last saw the tuned carrier; what dsd-fme found
           "recent": {}, "played": {}}      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
 LISTEN_CV = threading.Condition()
 
 # Follow: a scanner. Every fresh sweep hit in a band where voice is analog and legal to hear gets tuned
 # and played; the dongle stays while the squelch is open, hangs on FOLLOW_HANG_S after it closes, then
 # the next hit takes it. Not digital trunked bands (P25/DMR: rtl_fm would play buzzing), not broadcast.
-FOLLOW_BANDS = [(26.96, 27.41, "am"), (29.6, 54.0, "fm"), (118.0, 137.0, "am"), (137.0, 174.0, "fm"),
-                (216.0, 225.0, "fm"), (400.0, 470.0, "fm")]
+FOLLOW_BANDS = [(26.96, 27.41, "am"), (29.6, 54.0, "auto"), (118.0, 137.0, "am"), (137.0, 174.0, "auto"),
+                (216.0, 225.0, "auto"), (400.0, 470.0, "auto")]
 FOLLOW_HANG_S = 3.0
 FOLLOW_MIN_S = 4.0          # once tuned, give the squelch this long to open before another hit can take over
 FOLLOW_MAX_S = 30.0         # a channel gets at most this long, then the next waiting signal takes the dongle
@@ -1043,15 +1111,19 @@ def follow_hit(obj: dict) -> None:
     x = obj.get("x") or {}
     if "always_on" in x or "background" in x:
         return
+    tol = 0.05
     try:
-        mhz = float(str(x.get("exact_mhz", "")).split()[0])
+        parts = str(x.get("exact_mhz", "")).split()
+        mhz = float(parts[0])
+        if len(parts) >= 3:
+            tol = float(parts[2])
     except (ValueError, IndexError):
         mhz = float(obj.get("f") or 0)
     mode = follow_mode(mhz)
     if mode is None:
         return
     now = time.time()
-    LISTEN["recent"][follow_key(mhz)] = (now, mhz, mode)
+    LISTEN["recent"][follow_key(mhz)] = (now, mhz, mode, tol)
     if LISTEN["req"] is not None:
         if abs(LISTEN["mhz"] - mhz) < 0.02:
             LISTEN["until"] = now + LISTEN_MAX_S
@@ -1064,16 +1136,16 @@ def follow_hit(obj: dict) -> None:
 def follow_next(now: float) -> bool:
     """Tune the newest candidate that hasn't just been played. False when nothing is waiting."""
     recent, played = LISTEN["recent"], LISTEN["played"]
-    for k in [k for k, (seen, _, _) in recent.items() if now - seen > FOLLOW_RECENT_S]:
+    for k in [k for k, (seen, _, _, _) in recent.items() if now - seen > FOLLOW_RECENT_S]:
         del recent[k]
     for k in [k for k, left in played.items() if now - left > FOLLOW_COOLDOWN_S]:
         del played[k]
     cur = follow_key(LISTEN["mhz"]) if LISTEN["req"] is not None else None
-    cands = [(seen, k, mhz, mode) for k, (seen, mhz, mode) in recent.items() if k not in played and k != cur]
+    cands = [(seen, k, mhz, mode, tol) for k, (seen, mhz, mode, tol) in recent.items() if k not in played and k != cur]
     if not cands:
         return False
-    _, _, mhz, mode = max(cands)
-    listen_start(mhz, mode, LISTEN["sq"])
+    _, _, mhz, mode, tol = max(cands)
+    listen_start(mhz, mode, LISTEN["sq"], tol)
     return True
 
 
@@ -1114,8 +1186,9 @@ def listen_busy(dev: str) -> bool:
 def listen_status(msg: str) -> None:
     on = LISTEN["proc"] is not None
     emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"],
-          "listen": {"mhz": LISTEN["mhz"] if on else 0, "mode": LISTEN["mode"] if on else "", "sq": LISTEN["sq"],
-                     "follow": bool(LISTEN["follow"])} if (on or LISTEN["follow"]) else "off"})
+          "listen": {"mhz": LISTEN["mhz"] if on else 0, "mode": LISTEN["mode"] if on else "",
+                     "asked": LISTEN["asked"] if on else "", "detected": LISTEN["detected"] if on else "",
+                     "sq": LISTEN["sq"], "follow": bool(LISTEN["follow"])} if (on or LISTEN["follow"]) else "off"})
 
 
 def listen_stop(why: str = "stopped") -> None:
@@ -1128,19 +1201,64 @@ def listen_stop(why: str = "stopped") -> None:
         print(f"bridge: listen: {why}", file=sys.stderr)
 
 
-def listen_start(mhz: float, mode: str, sq: int) -> None:
+def listen_start(mhz: float, mode: str, sq: int, tol: float = 0.05) -> None:
     """Ask the listener thread for a frequency. One thread, one rtl_fm: a new request while one is
-    starting or playing replaces it (the generation changes and the old one winds down)."""
+    starting or playing replaces it (the generation changes and the old one winds down).
+    mhz is where the sweep placed the carrier, tol how far it may be off; the listen is on the likeliest
+    channel for that (snap_channel), and later sweep readings may move it (hone)."""
     mode = mode if mode in LISTEN_MODES or mode in DIGITAL_MODES else "fm"
+    raw = mhz
+    mhz = snap_channel(mhz, tol)
     with LISTEN_CV:
-        same = LISTEN["req"] is not None and abs(LISTEN["mhz"] - mhz) < 0.0005 and LISTEN["mode"] == mode and LISTEN["sq"] == sq
+        same = (LISTEN["req"] is not None and abs(LISTEN["raw_mhz"] - raw) < 0.0005 and LISTEN["asked"] == mode
+                and LISTEN["sq"] == sq)
         LISTEN["until"] = time.time() + LISTEN_MAX_S
         if same:
             return                           # a renewal: just push the deadline out
+        if LISTEN["req"] is not None and abs(LISTEN["mhz"] - mhz) < 0.0005 and LISTEN["asked"] == mode and LISTEN["sq"] == sq:
+            LISTEN["raw_mhz"] = raw          # another reading of the same channel: nothing to retune
+            return
         LISTEN["req"] = (mhz, mode, sq)
-        LISTEN["mhz"], LISTEN["mode"], LISTEN["sq"] = mhz, mode, sq
+        LISTEN["mhz"], LISTEN["mode"], LISTEN["asked"], LISTEN["sq"] = mhz, mode, mode, sq
+        LISTEN["raw_mhz"], LISTEN["tol"], LISTEN["readings"], LISTEN["honed_at"] = raw, tol, [raw], 0.0
+        LISTEN["carrier_at"], LISTEN["detected"] = 0.0, ""
         LISTEN["gen"] += 1
         LISTEN_CV.notify()
+    if abs(mhz - raw) >= 0.0005:
+        print(f"bridge: listen: {raw:.4f} read as channel {mhz:.4f}", file=sys.stderr)
+
+
+def listen_resolve(mode: str, why: str, mhz: "float | None" = None) -> None:
+    """Restart the current listen with a definite mode and/or a corrected frequency. The asked mode
+    stays what the app asked ("auto"), so its renewals don't undo the decision."""
+    with LISTEN_CV:
+        if LISTEN["req"] is None:
+            return
+        cur_mhz, cur_mode, sq = LISTEN["req"]
+        mhz = cur_mhz if mhz is None else mhz
+        LISTEN["req"] = (mhz, mode, sq)
+        LISTEN["mode"], LISTEN["mhz"] = mode, mhz
+        LISTEN["gen"] += 1
+        LISTEN_CV.notify()
+    print(f"bridge: listen: → {mhz:.4f} MHz {mode} ({why})", file=sys.stderr)
+
+
+def hone(reading: float) -> None:
+    """Each sweep reading of the tuned carrier refines its position; when the average lands on another
+    channel than the one tuned, retune there. A HackRF's ±25 kHz is more than a 12.5 kHz channel."""
+    rd = LISTEN["readings"]
+    rd.append(reading)
+    del rd[:-8]
+    now = time.time()
+    if len(rd) < HONE_MIN_READINGS or now - LISTEN["honed_at"] < HONE_RATE_S or LISTEN["proc"] is None:
+        return
+    mean = sum(rd) / len(rd)
+    target = snap_channel(mean, LISTEN["tol"] / len(rd) ** 0.5 + 0.003)
+    if abs(target - LISTEN["mhz"]) >= 0.002:
+        LISTEN["honed_at"] = now
+        del rd[:]
+        listen_resolve(LISTEN["req"][1], f"honed from {len(rd) or HONE_MIN_READINGS} readings averaging {mean:.4f}", mhz=target)
+        listen_status(f"retuned to {target:.4f} MHz: the carrier averages {mean:.4f}")
 
 
 def listen_worker() -> None:
@@ -1150,6 +1268,9 @@ def listen_worker() -> None:
                 LISTEN_CV.wait()
             req, gen = LISTEN["req"], LISTEN["gen"]
         serve_listen(req, gen)
+
+
+SYNC_RE = re.compile(r"Sync:\s*[+-]?\s*([A-Za-z0-9]+)")
 
 
 def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
@@ -1163,12 +1284,18 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
         except FileNotFoundError:
             return False
         p.err_tail = deque(maxlen=3)
+        p.sync, p.sync_at = "", 0.0
 
         def drain(proc=p):                   # dsd-fme chatters on stderr; an undrained pipe would stall it
             for ln in proc.stderr:
                 ln = ln.decode("utf-8", "replace").strip()
-                if ln:
-                    proc.err_tail.append(ln)
+                if not ln:
+                    continue
+                proc.err_tail.append(ln)
+                if kw.get("watch_sync"):
+                    m = SYNC_RE.search(ln)
+                    if m:
+                        proc.sync, proc.sync_at = m.group(1), time.time()
         threading.Thread(target=drain, daemon=True).start()
         time.sleep(0.5)
         if p.poll() is None:
@@ -1196,8 +1323,8 @@ def serve_listen(req: tuple, gen: int) -> None:
         sock.settimeout(0.5)
         time.sleep(0.8)                      # rtl_tcp needs a moment before it accepts a client
         # rtltcp:host:port:freq:gain:ppm:bw(kHz):squelch:volume — dsd-fme does its own FM demodulation
-        d = start_tool(f"dsd-fme {flag} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:0:12:{sq}:2 "
-                       f"-o udp:127.0.0.1:{DSD_UDP_PORT} -N", gen, attempts=4)
+        d = start_tool(f"dsd-fme {flag} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:12:{sq}:2 "
+                       f"-o udp:127.0.0.1:{DSD_UDP_PORT} -N", gen, attempts=4, watch_sync=True)
         if d is False or d is None:
             for q in procs:
                 q.terminate()
@@ -1212,7 +1339,9 @@ def serve_listen(req: tuple, gen: int) -> None:
         p = d
     else:
         chans = 1
-        cmd = f"rtl_fm -f {mhz:.4f}M {LISTEN_MODES[mode]} -r {LISTEN_RATE} -l {sq} -E dc -g 40{dev} -"
+        ppm = f" -p {LISTEN['ppm']}" if LISTEN["ppm"] else ""
+        dc = "" if mode == "fm" else " -E dc"    # FM keeps its DC: it is the AFC reading (removed below)
+        cmd = f"rtl_fm -f {mhz:.4f}M {LISTEN_MODES[mode]} -r {LISTEN_RATE} -l {sq}{dc} -g 40{ppm}{dev} -"
         p = start_tool(cmd, gen, stdout=subprocess.PIPE)
         if p is False:
             listen_stop("rtl_fm missing"); listen_status("rtl_fm not found on the Pi (apt install rtl-sdr)"); return
@@ -1230,12 +1359,28 @@ def serve_listen(req: tuple, gen: int) -> None:
     buf = b""
 
     def watch():                             # squelched, the tools send nothing, so the reads below can't notice
+        nonlocal chans
         while p.poll() is None:
             if LISTEN["gen"] != gen:
                 break                        # retuned or stopped
-            if time.time() > LISTEN["until"]:
+            now = time.time()
+            if now > LISTEN["until"]:
                 listen_stop("timed out (5 min); tap Listen again to continue")
                 break
+            if mode == "auto":
+                sync = getattr(p, "sync", "")
+                if sync and now - p.sync_at < 5.0:
+                    if LISTEN["detected"] != sync:
+                        LISTEN["detected"] = sync
+                        chans = 2 if sync.upper().startswith(TDMA_SYNCS) else 1
+                        listen_status(f"{sync} on {mhz:.4f} MHz")
+                elif not LISTEN["detected"]:
+                    carrier = LISTEN["carrier_at"]
+                    since_tune = now - LISTEN["tuned_at"]
+                    if (carrier and now - carrier < 2.0 and since_tune >= AUTO_WAIT_S) or since_tune >= AUTO_NO_CARRIER_WAIT_S:
+                        LISTEN["detected"] = "FM"
+                        listen_resolve("fm", "carrier with no digital sync")
+                        break
             time.sleep(0.5)
         for q in procs:
             try:
@@ -1260,6 +1405,30 @@ def serve_listen(req: tuple, gen: int) -> None:
         return b""
 
     ended_itself = True
+    afc = []                                 # offsets (Hz) from frames with signal, analog FM only
+
+    def afc_frame(pcm: bytes) -> bytes:
+        """Measure the carrier offset from this frame's DC level, then remove the DC so it plays clean.
+        Retune when enough frames agree the carrier sits on another channel."""
+        n = len(pcm) // 2
+        samples = struct.unpack(f"<{n}h", pcm)
+        mean = sum(samples) / n
+        if max(samples) - min(samples) > 600:            # audio present, not the squelch tail
+            afc.append(mean / 16384.0 * (AFC_RATE_IN / 2))
+            if len(afc) >= AFC_FRAMES:
+                srt = sorted(afc)
+                off_hz = srt[len(srt) // 2]
+                del afc[:]
+                now = time.time()
+                if abs(off_hz) >= AFC_MIN_HZ and now - LISTEN["honed_at"] >= HONE_RATE_S:
+                    target = snap_channel(mhz + off_hz / 1e6, 0.003)
+                    if abs(target - mhz) >= 0.002:
+                        LISTEN["honed_at"] = now
+                        listen_resolve(mode, f"carrier {off_hz:+.0f} Hz from the tuned frequency", mhz=target)
+                        listen_status(f"retuned to {target:.4f} MHz: the carrier was {off_hz / 1000:+.1f} kHz off")
+        m = int(mean)
+        return struct.pack(f"<{n}h", *[max(-32768, min(32767, v - m)) for v in samples])
+
     try:
         while True:
             chunk = read_chunk()
@@ -1269,6 +1438,8 @@ def serve_listen(req: tuple, gen: int) -> None:
             buf += chunk
             while len(buf) >= need:
                 pcm, buf = buf[:need], buf[need:]
+                if sock is None and mode == "fm":
+                    pcm = afc_frame(pcm)
                 LISTEN["last_audio"] = time.time()
                 LISTEN["seq"] = (LISTEN["seq"] + 1) & 0xFF
                 try:
@@ -1551,8 +1722,12 @@ def run_peripheral(name: str) -> None:
                     return
                 if 24.0 <= mhz <= 1766.0:
                     sq = cmd.get("sq")
+                    try:
+                        tol = max(0.0, min(0.5, float(cmd.get("tol", 0.05))))
+                    except (TypeError, ValueError):
+                        tol = 0.05
                     listen_start(mhz, str(cmd.get("mode") or "fm"),
-                                 max(0, min(1000, int(sq))) if sq is not None else LISTEN["sq"])
+                                 max(0, min(1000, int(sq))) if sq is not None else LISTEN["sq"], tol)
                 else:
                     emit({"t": "status", "msg": f"{mhz:g} MHz is outside the RTL-SDR's 24–1766 MHz; can't listen there",
                           "band": state["band"], "mode": state["mode"], "listen": "off"})
@@ -1699,7 +1874,7 @@ def main() -> None:
             threading.Thread(target=feed_rtl_power, args=(specs, dev, max(3, a.rtl_power_dwell), a.rtl_ppm, a.rtl_gain), daemon=True).start()
         if not a.listen_device:
             a.listen_device = next((d for d in groups if d), "")
-    LISTEN["sq"] = a.listen_squelch
+    LISTEN["sq"], LISTEN["ppm"] = a.listen_squelch, a.rtl_ppm
     if a.listen_device:
         LISTEN["dev"] = a.listen_device
         CAPS.append("listen")
