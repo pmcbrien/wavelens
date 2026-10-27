@@ -31,7 +31,9 @@ Wiring and antenna diagrams: [diagrams/](diagrams/) — overview, ESP32, Pi + SD
 ## HackRF: what the full sweep labels
 
 `--hackrf-sweep` sweeps 1 MHz–6 GHz by default (`--hackrf-range 1:6000`), about one full pass a
-second on a Pi 4 with 500 kHz bins. Every bin that rises 18 dB over its own rolling floor is
+second on a Pi 4 with 500 kHz bins. Every HackRF has a few spurs of its own (carriers it makes
+itself, some very strong); find them once with the antenna unscrewed — `find_spurs.py` prints a
+ready `--hackrf-mask 4770:4805,3215:3240` — and masked ranges feed the floor but are never reported. Every bin that rises 18 dB over its own rolling floor is
 labelled from the US frequency allocation table. **Energy only:** a sweep shows that something is
 on the air, never what it says, so every label is *Possible*, nothing is demodulated, and no radio
 IDs are decoded. With a [local FCC pack](#local-fcc-license-pack--who-owns-that-carrier) loaded, a

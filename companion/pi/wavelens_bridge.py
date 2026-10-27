@@ -404,8 +404,10 @@ class Sweep:
     Row format (both tools): date, time, hz_low, hz_high, hz_bin_width, samples, dB, dB, dB, ...
     """
 
-    def __init__(self, src: str, threshold_db: float = 18.0, rate_s: float = 2.0, bucket_mhz: float = 1.0):
+    def __init__(self, src: str, threshold_db: float = 18.0, rate_s: float = 2.0, bucket_mhz: float = 1.0,
+                 mask: "list[tuple[float, float]] | None" = None):
         self.src, self.th, self.rate, self.bucket = src, threshold_db, rate_s, bucket_mhz
+        self.mask = [(lo * 1e6, hi * 1e6) for lo, hi in (mask or [])]   # Hz ranges never reported (the unit's spurs)
         self.floor = {}       # bin start Hz → EMA of dB
         self.last = {}        # bucket → last report time
         self.gps_prev = {}    # GNSS row start (MHz) → last time that row looked jammed
@@ -455,6 +457,8 @@ class Sweep:
             tau = FLOOR_UP_GNSS_S if (w and db > f) else FLOOR_HOT_S if (hot and db > f) else FLOOR_S
             k = min(1.0, dt / tau)
             self.floor[hz] = f * (1 - k) + db * k
+            if any(lo <= hz < hi for lo, hi in self.mask):
+                continue                     # one of this unit's own spurs (--hackrf-mask): floor only, never reported
             if w:
                 if not w[2] <= hz <= w[3]:
                     continue                 # GNSS but outside the judged window: floor only, never reported
@@ -732,10 +736,23 @@ def feed_process(cmd: str, handler) -> None:
         time.sleep(2)
 
 
-def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20) -> None:
+def parse_mask(spec: str) -> "list[tuple[float, float]]":
+    """'4770:4805,3215:3240' (MHz) → [(4770.0, 4805.0), (3215.0, 3240.0)]"""
+    out = []
+    for part in (spec or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        lo, hi = part.split(":")
+        out.append((float(lo), float(hi)))
+    return out
+
+
+def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20, mask: str = "") -> None:
     """hackrf_sweep over range_mhz, or over the parked slice while the phone has asked to park.
     A park change stops the running sweep and starts the other one."""
-    sw = Sweep("hackrf")
+    sw = Sweep("hackrf", mask=parse_mask(mask))
+    if sw.mask:
+        print("bridge: hackrf: masking " + ", ".join(f"{lo/1e6:g}-{hi/1e6:g} MHz" for lo, hi in sw.mask), file=sys.stderr)
     while True:
         park = state.get("park", "off")
         rng = PARK_RANGES.get(park, range_mhz)
@@ -1118,6 +1135,8 @@ def main() -> None:
     ap.add_argument("--hackrf-bin", type=int, default=500000, help="bin width Hz (default 500000)")
     ap.add_argument("--hackrf-lna", type=int, default=32, help="HackRF LNA gain 0-40 dB in 8 dB steps (default 32); lower it if nearby transmitters overload the sweep")
     ap.add_argument("--hackrf-vga", type=int, default=20, help="HackRF baseband gain 0-62 dB in 2 dB steps (default 20)")
+    ap.add_argument("--hackrf-mask", metavar="LO:HI[,LO:HI...]", default="",
+                    help="MHz ranges never reported: this unit's own spurs, found with find_spurs.py (antenna off)")
     ap.add_argument("--hackrf-park-range", metavar="LO:HI", default="",
                     help="MHz slice the HackRF parks on when the phone asks (default 796:816, public-safety radios)")
     ap.add_argument("--rtl-power", metavar="SPEC", action="append", default=[],
@@ -1150,7 +1169,7 @@ def main() -> None:
         HACKRF_ON = True
         CAPS.append("sweep")
         CAPS.append("park")
-        threading.Thread(target=feed_hackrf, args=(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga), daemon=True).start()
+        threading.Thread(target=feed_hackrf, args=(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask), daemon=True).start()
     if a.rtl_power:
         CAPS.append("sweep")
         for dev, specs in group_sweeps(a.rtl_power, a.rtl_power_device).items():
