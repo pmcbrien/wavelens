@@ -134,6 +134,9 @@ The full step-by-step guide, with every command, is on the website:
 - **Antennas:** dongles sold for aircraft come with ~7 cm 1090/978 MHz antennas; use ~17 cm elements for 433 MHz.
 - **One program per dongle:** PiAware/dump1090 holds one. `sudo systemctl disable --now piaware dump1090-fa dump978-fa` frees them
   (serial 00000978 is usually dump978's; `usb_claim_interface error -6` means a dongle is held).
+- **HackRF + PortaPack (Mayhem):** `lsusb` showing `1d50:6018` / `ttyACM0` instead of `1d50:6089` means it's in
+  Mayhem's own mode; choose HackRF mode on the PortaPack screen. `Under-voltage detected!` in `dmesg` with three
+  radios plugged in: use the 3 A supply or a powered hub.
 - **FCC pack:** add `--fcc-pack` only once the file exists; a missing pack makes the service restart in a loop.
 - **Raspbian Buster (old PiAware cards):** comment out dead third-party apt sources
   (`sudo sed -i 's|^deb .*flightaware.*|#&|' /etc/apt/sources.list /etc/apt/sources.list.d/*.list`); drop

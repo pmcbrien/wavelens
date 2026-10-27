@@ -17,6 +17,10 @@ while [ $i -lt 30 ]; do
     i=$((i + 1)); sleep 1
 done
 
+# Clear any LE advertising a previous run left on the controller (killed before it could withdraw
+# it); otherwise BlueZ refuses the new advert. hciconfig is deprecated but present on Raspberry Pi OS.
+if command -v hciconfig >/dev/null 2>&1; then hciconfig hci0 noleadv >/dev/null 2>&1 || true; fi
+
 # shellcheck disable=SC2086  # word splitting of the argument strings is intended
 if [ -n "${WAVELENS_RTL433:-}" ]; then
     # The bridge is the main process and reads rtl_433 through process substitution, so if the

@@ -873,6 +873,24 @@ def run_peripheral(name: str) -> None:
 
     threading.Thread(target=pump, daemon=True).start()
     print(f"{FW}: advertising as {name!r} on {dongle.address}  (pair code {code})", file=sys.stderr)
+    # systemd stops the service with SIGTERM. bluezero only withdraws its advert on Ctrl+C, so a
+    # restart would leave BlueZ holding the old advert and the next start fails to register one.
+    # Withdraw it ourselves; GLib's own signal hook, because the GLib main loop owns the thread.
+    try:
+        import signal
+        from gi.repository import GLib
+
+        def on_term():
+            try:
+                mgr, adv = getattr(dev, "ad_manager", None), getattr(dev, "advert", None)
+                if mgr is not None and adv is not None:
+                    mgr.unregister_advertisement(adv)
+            except Exception as e:                      # already gone, or BlueZ restarting
+                print(f"bridge: advert not withdrawn ({e})", file=sys.stderr)
+            os._exit(0)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, on_term)
+    except Exception as e:
+        print(f"bridge: no SIGTERM hook ({e})", file=sys.stderr)
     dev.publish()
 
 
