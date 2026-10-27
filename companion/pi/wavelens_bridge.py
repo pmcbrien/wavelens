@@ -465,7 +465,7 @@ class Sweep:
         else:
             bucket = round(mhz / self.bucket)
             key, rate = (bucket, cat if b is not None and b["steady"] and cat == b["steady"][1] else ""), self.rate
-            if b is not None and "radar" in (b["name"] or "").lower():
+            if b is not None and b["key"] in RADAR_BANDS:
                 # a radar's pulses drift across several MHz: one entry per radar band, not one per MHz
                 key = ("band", b["key"])
                 ident = ident or f"{self.src}/band/{b['key']}"
@@ -519,6 +519,9 @@ class Sweep:
 # "flight-test telemetry" in a living room. Real signals rise one or two bands at a time. So sweep
 # reports are held for STORM_HOLD_S, and when STORM_BANDS or more unrelated bands rose within that
 # window, the whole batch is dropped and the phone gets one status line instead.
+# Bands that are only radar: a radar's pulses drift across several MHz, so these report as one entry
+# per band. Not 420–450 (70 cm amateur shares it) or 1030 MHz: there each carrier is its own transmitter.
+RADAR_BANDS = {"2700-2900", "2900-3100", "3100-3450"}
 STORM_HOLD_S = 2.5
 STORM_BANDS = 4
 STORM_NOTE_S = 60.0
