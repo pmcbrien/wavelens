@@ -360,6 +360,7 @@ BG_RATE_S = 60.0     # background bands: at most one report per band per minute
 FLOOR_S = 40.0       # rolling floor time constant (a carrier that stays this long becomes the floor)
 FLOOR_UP_GNSS_S = 1200.0   # ... rising in the GNSS bands, so a jammer riding with you stays visible
 FLOOR_HOT_S = 600.0        # ... rising under a bin that is already reported, so a held carrier keeps reporting
+FLOOR_WARM_S = 60.0        # a bin's floor follows at the normal rate for this long after first sight, whatever the level
 
 # Parked: the HackRF stops sweeping 1 MHz–6 GHz and stays on one 20 MHz slice, so a short transmission
 # there is caught on the pass it happens instead of within a second. "le" is the body-cam-and-radio
@@ -408,6 +409,7 @@ class Sweep:
         self.last = {}        # bucket → last report time
         self.gps_prev = {}    # GNSS row start (MHz) → last time that row looked jammed
         self.settle_until = 0.0
+        self.since = {}       # bin Hz → when it was first seen (the floor is "warm" after FLOOR_WARM_S)
         self.seen = {}        # bin Hz → time of the previous visit
         self.runs = {}        # bin Hz → [passes in a row over the floor, last dB, bin width]
 
@@ -431,6 +433,7 @@ class Sweep:
             f = self.floor.get(hz)
             if f is None:
                 self.floor[hz] = db
+                self.since[hz] = now
                 continue
             # slow floor: a carrier that stays for minutes becomes the floor, which is what we want for a drive.
             # Not in the GNSS bands: there the true floor is the empty band, and a jammer riding with you must
@@ -443,7 +446,10 @@ class Sweep:
             # on a drive. But a bin that is already well over the floor must not be absorbed at that
             # rate: a radio held keyed (Find it) or a video link would stop being reported after 40 s.
             # Hot bins rise with FLOOR_HOT_S instead; the floor still falls at the normal rate.
-            hot = db - f >= self.th
+            # ... but only once the floor has had FLOOR_WARM_S to settle: a sweep tool's first pass can
+            # come before its gain is applied, 30-40 dB low, and a floor that started there must be
+            # allowed to catch up fast, or the whole spectrum looks hot for ten minutes.
+            hot = db - f >= self.th and now - self.since.get(hz, now) >= FLOOR_WARM_S
             tau = FLOOR_UP_GNSS_S if (w and db > f) else FLOOR_HOT_S if (hot and db > f) else FLOOR_S
             k = min(1.0, dt / tau)
             self.floor[hz] = f * (1 - k) + db * k
@@ -706,6 +712,7 @@ def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20) -> No
         p = spawn(cmd)
         if p is None:
             return
+        sw.settle_until = time.time() + SETTLE_S + 3.0   # first passes come before the gains are applied
         print(f"bridge: hackrf_sweep {rng} MHz" + (f" (parked: {park})" if park in PARK_RANGES else ""), file=sys.stderr)
 
         p.last_line = time.time()
