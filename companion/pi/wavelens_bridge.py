@@ -949,6 +949,12 @@ LISTEN_MAX_S = 300.0
 LISTEN_RATE = 8000
 LISTEN_FRAME = 320          # samples per frame: 40 ms
 LISTEN_MODES = {"fm": "-M fm -s 16k", "am": "-M am -s 16k", "wbfm": "-M wbfm"}
+# Digital voice: rtl_tcp serves the dongle, dsd-fme demodulates and decodes, and sends 8 kHz PCM to a UDP
+# port the bridge listens on. TDMA modes (DMR, P25 phase 2) come out stereo, one slot per channel: mixed.
+# Encrypted traffic decodes to nothing; that is the law and the maths, not a setting.
+DIGITAL_MODES = {"dmr": ("-fs", 2), "p25": ("-f1", 1), "nxdn": ("-fi", 1), "dstar": ("-fd", 1)}
+DSD_UDP_PORT = 23470
+RTL_TCP_PORT = 23471
 LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "mhz": 0.0, "mode": "", "sq": 0, "until": 0.0,
           "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0,
           "recent": {}, "played": {}}      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
@@ -1125,7 +1131,7 @@ def listen_stop(why: str = "stopped") -> None:
 def listen_start(mhz: float, mode: str, sq: int) -> None:
     """Ask the listener thread for a frequency. One thread, one rtl_fm: a new request while one is
     starting or playing replaces it (the generation changes and the old one winds down)."""
-    mode = mode if mode in LISTEN_MODES else "fm"
+    mode = mode if mode in LISTEN_MODES or mode in DIGITAL_MODES else "fm"
     with LISTEN_CV:
         same = LISTEN["req"] is not None and abs(LISTEN["mhz"] - mhz) < 0.0005 and LISTEN["mode"] == mode and LISTEN["sq"] == sq
         LISTEN["until"] = time.time() + LISTEN_MAX_S
@@ -1146,29 +1152,75 @@ def listen_worker() -> None:
         serve_listen(req, gen)
 
 
+def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
+    """Start a radio tool, retrying while the dongle is still being released by the sweep.
+    Returns the process, None if it never came up, or False if the tool isn't installed."""
+    for attempt in range(attempts):
+        if LISTEN["gen"] != gen:
+            return None                      # superseded while we were getting the dongle
+        try:
+            p = subprocess.Popen(shlex.split(cmd), stdout=kw.get("stdout", subprocess.DEVNULL), stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            return False
+        p.err_tail = deque(maxlen=3)
+
+        def drain(proc=p):                   # dsd-fme chatters on stderr; an undrained pipe would stall it
+            for ln in proc.stderr:
+                ln = ln.decode("utf-8", "replace").strip()
+                if ln:
+                    proc.err_tail.append(ln)
+        threading.Thread(target=drain, daemon=True).start()
+        time.sleep(0.5)
+        if p.poll() is None:
+            return p
+    return None
+
+
 def serve_listen(req: tuple, gen: int) -> None:
     mhz, mode, sq = req
     dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
-    cmd = f"rtl_fm -f {mhz:.4f}M {LISTEN_MODES[mode]} -r {LISTEN_RATE} -l {sq} -E dc -g 40{dev} -"
-    p = None
-    for attempt in range(12):                # the sweep on that dongle is being told to stop; it takes a moment
-        if LISTEN["gen"] != gen:
-            return                           # superseded while we were getting the dongle
-        try:
-            p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except FileNotFoundError:
-            listen_stop("rtl_fm missing")
-            listen_status("rtl_fm not found on the Pi (apt install rtl-sdr)")
+    procs = []
+    sock = None
+    if mode in DIGITAL_MODES:
+        flag, chans = DIGITAL_MODES[mode]
+        p = start_tool(f"rtl_tcp -a 127.0.0.1 -p {RTL_TCP_PORT}{dev}", gen)
+        if p is False:
+            listen_stop("rtl_tcp missing"); listen_status("rtl_tcp not found on the Pi (apt install rtl-sdr)"); return
+        if p is None:
+            if LISTEN["gen"] == gen:
+                listen_stop("no dongle"); listen_status("could not open the RTL-SDR for listening (is it pinned with @SERIAL?)")
             return
-        time.sleep(0.5)
-        if p.poll() is None:
-            break
-        p = None
-    if p is None:
-        if LISTEN["gen"] == gen:
-            listen_stop("no dongle")
-            listen_status("could not open the RTL-SDR for listening (is it pinned with @SERIAL?)")
-        return
+        procs.append(p)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", DSD_UDP_PORT))
+        sock.settimeout(0.5)
+        time.sleep(0.8)                      # rtl_tcp needs a moment before it accepts a client
+        # rtltcp:host:port:freq:gain:ppm:bw(kHz):squelch:volume — dsd-fme does its own FM demodulation
+        d = start_tool(f"dsd-fme {flag} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:0:12:{sq}:2 "
+                       f"-o udp:127.0.0.1:{DSD_UDP_PORT} -N", gen, attempts=4)
+        if d is False or d is None:
+            for q in procs:
+                q.terminate()
+            sock.close()
+            if d is False:
+                listen_stop("dsd-fme missing")
+                listen_status("digital voice needs dsd-fme on the Pi: run companion/pi/install-dsd.sh (10 min build)")
+            elif LISTEN["gen"] == gen:
+                listen_stop("dsd-fme failed"); listen_status("dsd-fme could not start; see journalctl -u wavelens-bridge")
+            return
+        procs.append(d)
+        p = d
+    else:
+        chans = 1
+        cmd = f"rtl_fm -f {mhz:.4f}M {LISTEN_MODES[mode]} -r {LISTEN_RATE} -l {sq} -E dc -g 40{dev} -"
+        p = start_tool(cmd, gen, stdout=subprocess.PIPE)
+        if p is False:
+            listen_stop("rtl_fm missing"); listen_status("rtl_fm not found on the Pi (apt install rtl-sdr)"); return
+        if p is None:
+            if LISTEN["gen"] == gen:
+                listen_stop("no dongle"); listen_status("could not open the RTL-SDR for listening (is it pinned with @SERIAL?)")
+            return
+        procs.append(p)
     LISTEN["proc"] = p
     LISTEN["tuned_at"] = LISTEN["last_audio"] = time.time()
     print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})", file=sys.stderr)
@@ -1177,7 +1229,7 @@ def serve_listen(req: tuple, gen: int) -> None:
     need = LISTEN_FRAME * 2
     buf = b""
 
-    def watch():                             # squelched, rtl_fm sends nothing, so the read below can't notice
+    def watch():                             # squelched, the tools send nothing, so the reads below can't notice
         while p.poll() is None:
             if LISTEN["gen"] != gen:
                 break                        # retuned or stopped
@@ -1185,43 +1237,61 @@ def serve_listen(req: tuple, gen: int) -> None:
                 listen_stop("timed out (5 min); tap Listen again to continue")
                 break
             time.sleep(0.5)
-        try:
-            p.terminate()
-        except Exception:
-            pass
+        for q in procs:
+            try:
+                q.terminate()
+            except Exception:
+                pass
     threading.Thread(target=watch, daemon=True).start()
+
+    def read_chunk():
+        if sock is None:
+            return p.stdout.read(need - len(buf))
+        while p.poll() is None and LISTEN["gen"] == gen:
+            try:
+                data = sock.recv(8192)
+            except socket.timeout:
+                continue
+            if chans == 2:                   # two TDMA slots, L and R: mix to mono
+                n = len(data) // 4
+                lr = struct.unpack(f"<{2 * n}h", data[:4 * n])
+                data = struct.pack(f"<{n}h", *[max(-32768, min(32767, (lr[2 * i] + lr[2 * i + 1]) // 2)) for i in range(n)])
+            return data
+        return b""
+
     ended_itself = True
     try:
         while True:
-            chunk = p.stdout.read(need - len(buf))
+            chunk = read_chunk()
             if not chunk:
                 ended_itself = LISTEN["gen"] == gen
                 break
             buf += chunk
-            if len(buf) < need:
-                continue
-            pcm, buf = buf[:need], buf[need:]
-            # rtl_fm's squelch stops its output between transmissions; what does come through is sent.
-            LISTEN["last_audio"] = time.time()
-            LISTEN["seq"] = (LISTEN["seq"] + 1) & 0xFF
-            try:
-                aout.put_nowait(enc.frame(LISTEN["seq"], pcm))
-            except Exception:
-                pass                         # the link is behind: drop this frame, keep the latest
+            while len(buf) >= need:
+                pcm, buf = buf[:need], buf[need:]
+                LISTEN["last_audio"] = time.time()
+                LISTEN["seq"] = (LISTEN["seq"] + 1) & 0xFF
+                try:
+                    aout.put_nowait(enc.frame(LISTEN["seq"], pcm))
+                except Exception:
+                    pass                     # the link is behind: drop this frame, keep the latest
     finally:
         LISTEN["proc"] = None
-        try:
-            p.terminate()
-        except Exception:
-            pass
+        for q in procs:
+            try:
+                q.terminate()
+            except Exception:
+                pass
+        if sock is not None:
+            sock.close()
         if ended_itself and LISTEN["req"] is not None and LISTEN["gen"] == gen:
-            # rtl_fm quit on its own (unplugged, error) or the deadline passed
             if time.time() > LISTEN["until"]:
                 listen_status("listening timed out after 5 min; tap Listen again to continue")
             else:
-                err = (p.stderr.read() or b"").decode("utf-8", "replace").strip().splitlines()[-2:]
-                listen_stop("rtl_fm exited")
-                listen_status("listening ended: " + (" | ".join(err) or "rtl_fm exited"))
+                time.sleep(0.2)
+                err = list(getattr(p, "err_tail", []))[-2:]
+                listen_stop(f"{procs[-1].args[0]} exited")
+                listen_status("listening ended: " + (" | ".join(err) or "the decoder exited"))
         elif LISTEN["req"] is None:
             listen_status("listening stopped; sweep resumes")
 

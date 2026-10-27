@@ -382,7 +382,8 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // a HackRF bridge parks on 796–816 MHz. "off" = sweep everything again
 {"c":"pos","lat":27.9,"lon":-82.8}   // opt-in only: the phone's fix, every 10 s, so the companion can rank
                                      // licensed sites by distance. lat null = sharing turned off; forget it.
-{"c":"listen","mhz":446.075,"mode":"fm"}   // SDR bridge: demodulate this and stream audio (fm | am | wbfm);
+{"c":"listen","mhz":446.075,"mode":"fm"}   // SDR bridge: demodulate this and stream audio (fm | am | wbfm, or
+                                     // dmr | p25 | nxdn | dstar with dsd-fme installed — see install-dsd.sh);
 {"c":"listen","v":"follow"}          // scanner: tune every fresh voice-band hit (air AM, VHF/UHF FM, CB), play it
 {"c":"listen","v":"off"}             // until the squelch closes + 3 s or 30 s is up, then the newest waiting one;
                                      // a channel just played waits 60 s before it's returned to. "sq": rtl_fm
@@ -395,7 +396,11 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 frames — `seq` (u8), predictor (i16 LE), step index (u8), then 320 samples as 4-bit codes, high nibble
 first — one frame per 40 ms, about 4 kB/s. Each frame carries its own start state, so a dropped frame
 costs 40 ms and nothing after. `rtl_fm`'s squelch (`--listen-squelch`, default 30) keeps the link quiet
-between transmissions. A `status` line carries `"listen": {"mhz","mode","sq","follow"}` while on (`mhz` 0 while
+between transmissions. Digital modes run `rtl_tcp` on the dongle and `dsd-fme` (install once with `install-dsd.sh`, ~10 min
+on a Pi 4) as the demodulator/decoder, which sends 8 kHz PCM to the bridge over UDP on localhost; DMR
+and P25 phase 2 are TDMA, two slots as stereo, mixed to mono. Encrypted talkgroups decode to silence.
+Trunked systems (most 800 MHz public safety) hop channels under a control channel and are not followed;
+that is OP25/trunk-recorder territory. A `status` line carries `"listen": {"mhz","mode","sq","follow"}` while on (`mhz` 0 while
 following with nothing tuned) and `"listen": "off"` when it ends. Follow skips always-on and background
 hits, digital trunked bands (806–870: P25/DMR would be buzzing) and broadcast. Receive only.
 
