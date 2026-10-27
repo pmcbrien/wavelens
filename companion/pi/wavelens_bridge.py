@@ -355,6 +355,7 @@ PERSIST = {"DRONE"}  # these categories must be over the floor on two passes in 
 STEADY_N = 3         # passes in a row over the floor before a carrier counts as steady
 VIDEO_N = 6          # kind "video": passes in a row before a carrier shared with Wi-Fi is reported
 CHAIN_S = 30.0       # a bin's run of hot passes breaks if it isn't revisited within this long
+ALWAYS_N = 120       # hot passes in a row (a few minutes) before a bin counts as always on: background
 BG_RATE_S = 60.0     # background bands: at most one report per band per minute
 FLOOR_S = 40.0       # rolling floor time constant (a carrier that stays this long becomes the floor)
 FLOOR_UP_GNSS_S = 1200.0   # ... rising in the GNSS bands, so a jammer riding with you stays visible
@@ -455,7 +456,7 @@ class Sweep:
                 if db - f >= self.th:
                     g[1].append((hz, db, db - f))
                 continue
-            mhz = hz / 1e6
+            mhz = (hz + step / 2) / 1e6          # the bin's centre: hz is its lower edge
             if db - f < self.th:
                 run = self.runs.pop(hz, None)       # quiet on this pass: the run of hot passes is over
                 if run and run[0] < STEADY_N:
@@ -471,6 +472,10 @@ class Sweep:
             elif not run or prev_visit is None or now - prev_visit > CHAIN_S:
                 run = self.runs[hz] = [1, db, step]
             n = run[0]
+            # Hot for ALWAYS_N passes straight: a fixed transmitter, or one of the receiver's own spurs
+            # (a HackRF shows a few, some near full scale). Background from here on: once a minute,
+            # and never part of the overload judgement, where a strong spur would otherwise be "the cause".
+            self.always = n >= ALWAYS_N
             x = {"over_floor_db": f"{db - f:.0f}", "bin_hz": f"{step:.0f}"}
             lic = FCC.label(mhz, tol_khz=max(step / 1000.0, 12.5)) if FCC else None
             if lic:
@@ -507,11 +512,17 @@ class Sweep:
             x = {"over_floor_db": f"{over:.0f}", "bin_hz": f"{step:.0f}"}
         # f goes out rounded to whole MHz (and sweep ids are 1 MHz buckets); the bin centre is the
         # best the sweep actually knows, to within half a bin plus the radio's own ppm error.
-        x.setdefault("exact_mhz", f"{mhz:.4f}".rstrip("0").rstrip("."))
+        x.setdefault("exact_mhz", f"{mhz:.4f}".rstrip("0").rstrip(".") + f" ± {step / 2e6:g}")
         if b is not None and b["kind"] == "bg":
             key, rate = "bg/" + b["key"], BG_RATE_S
             ident = ident or f"{self.src}/bg/{b['key']}"
             x["background"] = "broadcast, tower or beacon: everywhere, shown for completeness"
+        elif getattr(self, "always", False):
+            bucket = round(mhz / self.bucket)
+            key, rate = ("always", bucket), BG_RATE_S
+            ident = ident or f"{self.src}/{bucket * self.bucket:.0f}"
+            x["always_on"] = ("on the air continuously for minutes: a fixed transmitter, or a spur the receiver "
+                              "makes itself (a HackRF shows a few, some very strong). Shown once a minute.")
         else:
             bucket = round(mhz / self.bucket)
             key, rate = (bucket, cat if b is not None and b["steady"] and cat == b["steady"][1] else ""), self.rate
@@ -527,8 +538,8 @@ class Sweep:
             x.setdefault("band", f"{b['lo']:g}–{b['hi']:g} MHz")
         line = {"t": "rf", "id": ident, "n": name, "f": int(round(mhz)), "r": int(round(db)),
                 "cat": cat, "conf": conf, "src": self.src, "x": x}
-        if b is not None and b["kind"] == "bg":
-            emit(line)
+        if (b is not None and b["kind"] == "bg") or getattr(self, "always", False):
+            emit(line)                       # background and always-on bins bypass the overload gate
         else:
             storm_gate(self.src).push(now, b["key"] if b is not None else str(ident), line)
 
@@ -576,6 +587,7 @@ STORM_HOLD_S = 2.5
 STORM_BANDS = 4
 STORM_NOTE_S = 60.0
 STORM_KEEP_DB = 5.0
+STORM_KEEP_OVER_DB = 30.0   # a hit this far over its floor is a real strong signal nearby: never dropped as overload
 
 
 class StormGate:
@@ -604,7 +616,9 @@ class StormGate:
                 # beam sweeping past, the phone keying up beside the antenna). Keep what's within
                 # STORM_KEEP_DB of the strongest; the weaker rest is the receiver's own false carriers.
                 top = max(line["r"] for _, _, line in batch)
-                keep = [line for _, _, line in batch if line["r"] >= top - STORM_KEEP_DB]
+                keep = [line for _, _, line in batch
+                        if line["r"] >= top - STORM_KEEP_DB
+                        or float(line.get("x", {}).get("over_floor_db", 0)) >= STORM_KEEP_OVER_DB]
                 for line in keep:
                     line.setdefault("x", {})["burst"] = f"strongest of {len(bands)} bands that rose together"
                     emit(line)
