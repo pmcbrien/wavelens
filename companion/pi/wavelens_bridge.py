@@ -171,6 +171,7 @@ def B(lo, hi, name, cat="UNKNOWN", conf="POSSIBLE", kind="", steady=None):
             "key": f"{lo:g}-{hi:g}"}
 
 
+# The website and README list these; after changing BANDS run: python3 companion/tools/band_table.py
 BANDS = [
     # ---- skipped outright
     B(2400, 2500, None),                              # 2.4 GHz Wi-Fi / BLE / microwave ovens
