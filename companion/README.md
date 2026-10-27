@@ -78,6 +78,8 @@ licensed frequency gets the licensee's name instead.
 | 1215–1240 MHz | GPS L2 + long-range air-traffic radar bursts |  | Not reported |
 | 1300–1390 MHz | long-range air-traffic and military radar |  | Not reported |
 | 1400–1427 MHz | radio astronomy: protected, nothing should transmit |  | Not reported |
+| 1–26.96 MHz | AM broadcast and HF: worldwide propagation, nothing nearby |  | Not reported |
+| 27.41–30 MHz | HF (CB at 26.96–27.41 stays: a transmitter nearby) |  | Not reported |
 | **Narrow, specific** | | | |
 | 121.4–121.6 MHz | Aviation emergency frequency 121.5 MHz (ELT beacon or guard call) | Unclassified | Each burst over the noise floor |
 | 242.9–243.1 MHz | Military aviation emergency frequency 243.0 MHz (beacon or guard call) | Unclassified | Each burst over the noise floor |
@@ -160,8 +162,6 @@ licensed frequency gets the licensee's name instead.
 | 2900–3100 MHz | Ship radar (S-band) | Unclassified | Each burst over the noise floor |
 | 3100–3450 MHz | Military radar (S-band) | Unclassified | Each burst over the noise floor |
 | **Background** | | | |
-| 1–1.7 MHz | AM broadcast | Unclassified | Background: once a minute per band, never an alert |
-| 1.7–30 MHz | HF: shortwave, amateur, maritime, aviation | Unclassified | Background: once a minute per band, never an alert |
 | 54–88 MHz | TV broadcast (VHF low) | Unclassified | Background: once a minute per band, never an alert |
 | 88–108 MHz | FM broadcast | Unclassified | Background: once a minute per band, never an alert |
 | 137–138 MHz | Weather / low-orbit satellite downlink | Unclassified | Background: once a minute per band, never an alert |
@@ -375,7 +375,18 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // a HackRF bridge parks on 796–816 MHz. "off" = sweep everything again
 {"c":"pos","lat":27.9,"lon":-82.8}   // opt-in only: the phone's fix, every 10 s, so the companion can rank
                                      // licensed sites by distance. lat null = sharing turned off; forget it.
+{"c":"listen","mhz":446.075,"mode":"fm"}   // SDR bridge: demodulate this and stream audio (fm | am | wbfm);
+{"c":"listen","v":"off"}             // optional "sq": rtl_fm squelch. Renew within 5 min or it stops itself.
 ```
+
+**Listening (SDR bridge, capability `listen`).** The bridge borrows an RTL-SDR — by default the first
+`--rtl-power` dongle pinned with `@SERIAL`, or `--listen-device SERIAL` — pauses that sweep, runs
+`rtl_fm` and sends audio on a third characteristic, `…0004` (notify): 8 kHz mono IMA ADPCM in 164-byte
+frames — `seq` (u8), predictor (i16 LE), step index (u8), then 320 samples as 4-bit codes, high nibble
+first — one frame per 40 ms, about 4 kB/s. Each frame carries its own start state, so a dropped frame
+costs 40 ms and nothing after. `rtl_fm`'s squelch (`--listen-squelch`, default 30) keeps the link quiet
+between transmissions. A `status` line carries `"listen": {"mhz","mode"}` while on and `"listen": "off"`
+when it ends. Receive only.
 
 Unknown commands are ignored. Every command may be answered with a `status` line.
 

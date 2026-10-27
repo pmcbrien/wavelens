@@ -34,6 +34,7 @@ import math
 import os
 import shlex
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -43,9 +44,11 @@ from queue import Queue, Empty
 SVC = "57617665-6c65-6e73-0100-000000000001"
 TX = "57617665-6c65-6e73-0100-000000000002"
 RX = "57617665-6c65-6e73-0100-000000000003"
+AU = "57617665-6c65-6e73-0100-000000000004"      # device → phone, notify: audio frames while listening
 FW = "wavelens-bridge 0.1"
 
 out: "Queue[str]" = Queue(maxsize=256)
+aout: "Queue[bytes]" = Queue(maxsize=50)        # two seconds of audio; if the link can't keep up, frames drop
 state = {"linked": False, "band": "all", "mode": "rf", "ch": "hop", "park": "off", "lat": None, "lon": None, "pos_at": 0.0}
 
 
@@ -218,6 +221,8 @@ BANDS = [
     B(1215, 1240, None),                              # GPS L2 + long-range air-traffic radar bursts
     B(1300, 1390, None),                              # long-range air-traffic and military radar
     B(1400, 1427, None),                              # radio astronomy: protected, nothing should transmit
+    B(1, 26.96, None),                                # AM broadcast and HF: worldwide propagation, nothing nearby
+    B(27.41, 30, None),                               # HF (CB at 26.96–27.41 stays: a transmitter nearby)
 
     # ---- narrow, specific
     B(121.4, 121.6, "Aviation emergency frequency 121.5 MHz (ELT beacon or guard call)"),
@@ -313,8 +318,6 @@ BANDS = [
     B(3100, 3450, "Military radar (S-band)"),
 
     # ---- background: broadcast, towers, satellites — everywhere, reported once a minute per band
-    B(1, 1.7, "AM broadcast", kind="bg"),
-    B(1.7, 30, "HF: shortwave, amateur, maritime, aviation", kind="bg"),
     B(54, 88, "TV broadcast (VHF low)", kind="bg"),
     B(88, 108, "FM broadcast", kind="bg"),
     B(137, 138, "Weather / low-orbit satellite downlink", kind="bg"),
@@ -739,14 +742,23 @@ def reap(p, cmd: str, planned: bool = False) -> None:
               file=sys.stderr)
 
 
-def run_once(cmd: str, handler, planned: bool = False) -> bool:
-    """Run a tool until it exits, handing it each stdout line. False if it isn't installed."""
+def run_once(cmd: str, handler, planned: bool = False, stop_when=None) -> bool:
+    """Run a tool until it exits, handing it each stdout line. False if it isn't installed.
+    stop_when: polled five times a second; when it turns true the tool is stopped (the dongle is wanted)."""
     p = spawn(cmd)
     if p is None:
         return False
+    if stop_when is not None:
+        def watch():
+            while p.poll() is None:
+                if stop_when():
+                    p.terminate()
+                    return
+                time.sleep(0.2)
+        threading.Thread(target=watch, daemon=True).start()
     for line in p.stdout:
         handler(line)
-    reap(p, cmd, planned)
+    reap(p, cmd, planned or (stop_when is not None and stop_when()))
     return True
 
 
@@ -834,19 +846,26 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm:
     device is an index or serial (rtl_power -d matches either). Each dongle gets its own thread."""
     sw = Sweep("rtlpower")          # one floor map keyed by Hz, so the ranges don't disturb each other
     dev = f" -d {shlex.quote(device)}" if device else ""
+    busy = lambda: listen_busy(device)      # the phone is listening on this dongle: stop, and wait
+
+    def wait_free():
+        while busy():
+            time.sleep(0.3)
     if len(specs) == 1:
         cmd = f"rtl_power -f {specs[0]}{dev} -i {sweep_interval_s(specs[0])} -g 30{(' -p ' + str(ppm)) if ppm else ''} -"
         while True:
+            wait_free()
             sw.settle_until = time.time() + SETTLE_S + sweep_interval_s(specs[0])
-            if not run_once(cmd, sw.row):
+            if not run_once(cmd, sw.row, stop_when=busy):
                 return
             time.sleep(2)
         return
     while True:
         for spec in specs:
+            wait_free()
             i = sweep_interval_s(spec)
             sw.settle_until = time.time() + SETTLE_S + i      # first integration after a retune is discarded
-            if not run_once(f"rtl_power -f {spec}{dev} -i {i} -g 30{(' -p ' + str(ppm)) if ppm else ''} -e {max(dwell_s, 2 * i)}s -", sw.row, planned=True):
+            if not run_once(f"rtl_power -f {spec}{dev} -i {i} -g 30{(' -p ' + str(ppm)) if ppm else ''} -e {max(dwell_s, 2 * i)}s -", sw.row, planned=True, stop_when=busy):
                 return
             time.sleep(0.5)         # let the dongle close before the next range opens it
 
@@ -858,6 +877,172 @@ def group_sweeps(specs: "list[str]", default_device: str) -> "dict[str, list[str
         spec, _, dev = s.partition("@")
         groups.setdefault(dev or default_device, []).append(spec)
     return groups
+
+
+# ---------------------------------------------------------------- listen: demodulate one frequency and stream the audio
+
+# The phone asks to hear a hit. The bridge borrows an RTL-SDR (the one rtl_power sweeps with, by default;
+# that sweep pauses), runs rtl_fm on the frequency and sends 8 kHz mono audio over BLE as IMA ADPCM:
+# 4 bits a sample, 40 ms frames of 164 bytes, about 4 kB/s. rtl_fm's squelch keeps the link quiet
+# between transmissions. A listen ends by itself after LISTEN_MAX_S unless the phone renews it.
+# Receive only: rtl_fm demodulates, it never transmits.
+LISTEN_MAX_S = 300.0
+LISTEN_RATE = 8000
+LISTEN_FRAME = 320          # samples per frame: 40 ms
+LISTEN_MODES = {"fm": "-M fm -s 16k", "am": "-M am -s 16k", "wbfm": "-M wbfm"}
+LISTEN = {"proc": None, "dev": "", "mhz": 0.0, "mode": "", "sq": 0, "until": 0.0, "seq": 0}
+LISTEN_LOCK = threading.Lock()
+
+IMA_INDEX = [-1, -1, -1, -1, 2, 4, 6, 8]
+IMA_STEP = [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88,
+            97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658,
+            724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660,
+            4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818,
+            18500, 20350, 22385, 24623, 27086, 29794, 32767]
+
+
+class Ima:
+    """IMA ADPCM encoder (the DVI/IMA tables every decoder knows). Each frame carries the predictor
+    and step index it starts from, so a lost frame costs 40 ms of audio and nothing after it."""
+
+    def __init__(self):
+        self.pred, self.idx = 0, 0
+
+    def frame(self, seq: int, pcm: bytes) -> bytes:
+        n = len(pcm) // 2
+        head = struct.pack("<BhB", seq & 0xFF, self.pred, self.idx)
+        out = bytearray(head)
+        pred, idx = self.pred, self.idx
+        byte, high = 0, True
+        for s in struct.unpack(f"<{n}h", pcm[:n * 2]):
+            step = IMA_STEP[idx]
+            diff = s - pred
+            code = 0
+            if diff < 0:
+                code, diff = 8, -diff
+            d = step >> 3
+            if diff >= step:
+                code |= 4
+                diff -= step
+                d += step
+            step >>= 1
+            if diff >= step:
+                code |= 2
+                diff -= step
+                d += step
+            step >>= 1
+            if diff >= step:
+                code |= 1
+                d += step
+            pred = pred - d if code & 8 else pred + d
+            pred = -32768 if pred < -32768 else 32767 if pred > 32767 else pred
+            idx += IMA_INDEX[code & 7]
+            idx = 0 if idx < 0 else 88 if idx > 88 else idx
+            if high:
+                byte = code << 4
+            else:
+                out.append(byte | code)
+            high = not high
+        if not high:
+            out.append(byte)
+        self.pred, self.idx = pred, idx
+        return bytes(out)
+
+
+def listen_busy(dev: str) -> bool:
+    return LISTEN["proc"] is not None and LISTEN["dev"] == dev
+
+
+def listen_status(msg: str) -> None:
+    on = LISTEN["proc"] is not None
+    emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"],
+          "listen": {"mhz": LISTEN["mhz"], "mode": LISTEN["mode"]} if on else "off"})
+
+
+def listen_stop(why: str = "stopped") -> None:
+    with LISTEN_LOCK:
+        p = LISTEN["proc"]
+        LISTEN["proc"] = None
+    if p is not None:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+        print(f"bridge: listen: {why}", file=sys.stderr)
+        listen_status(f"listening {why}; sweep resumes")
+
+
+def listen_start(mhz: float, mode: str, sq: int) -> None:
+    mode = mode if mode in LISTEN_MODES else "fm"
+    with LISTEN_LOCK:
+        same = LISTEN["proc"] is not None and abs(LISTEN["mhz"] - mhz) < 0.0005 and LISTEN["mode"] == mode
+        LISTEN["until"] = time.time() + LISTEN_MAX_S
+        if same:
+            return                           # a renewal: just push the deadline out
+    listen_stop("retuning")
+    LISTEN.update({"mhz": mhz, "mode": mode, "sq": sq})
+    threading.Thread(target=run_listen, args=(mhz, mode, sq), daemon=True).start()
+
+
+def run_listen(mhz: float, mode: str, sq: int) -> None:
+    dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
+    cmd = f"rtl_fm -f {mhz:.4f}M {LISTEN_MODES[mode]} -r {LISTEN_RATE} -l {sq} -E dc -g 40{dev} -"
+    p = None
+    for attempt in range(12):                # the sweep on that dongle is being told to stop; it takes a moment
+        try:
+            p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            listen_status("rtl_fm not found on the Pi (apt install rtl-sdr)")
+            return
+        time.sleep(0.5)
+        if p.poll() is None:
+            break
+        p = None
+    if p is None:
+        listen_status("could not open the RTL-SDR for listening (is it pinned with @SERIAL?)")
+        return
+    with LISTEN_LOCK:
+        LISTEN["proc"] = p
+    print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})", file=sys.stderr)
+    listen_status(f"listening on {mhz:.4f} MHz ({mode.upper()}); the RTL-SDR sweep is paused")
+    enc = Ima()
+    need = LISTEN_FRAME * 2
+    buf = b""
+
+    def deadline():                          # squelched, rtl_fm sends nothing, so the read below can't notice the time
+        while LISTEN["proc"] is p:
+            if time.time() > LISTEN["until"]:
+                listen_stop("timed out (5 min); tap Listen again to continue")
+                return
+            time.sleep(1)
+    threading.Thread(target=deadline, daemon=True).start()
+    try:
+        while LISTEN["proc"] is p:
+            chunk = p.stdout.read(need - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+            if len(buf) < need:
+                continue
+            pcm, buf = buf[:need], buf[need:]
+            # rtl_fm's squelch stops its output between transmissions; what does come through is sent.
+            LISTEN["seq"] = (LISTEN["seq"] + 1) & 0xFF
+            try:
+                aout.put_nowait(enc.frame(LISTEN["seq"], pcm))
+            except Exception:
+                pass                         # the link is behind: drop this frame, keep the latest
+    finally:
+        if LISTEN["proc"] is p:
+            with LISTEN_LOCK:
+                LISTEN["proc"] = None
+            try:
+                p.terminate()
+            except Exception:
+                pass
+            if p.poll() is None:
+                time.sleep(0.2)
+            err = (p.stderr.read() or b"").decode("utf-8", "replace").strip().splitlines()[-2:]
+            listen_status("listening ended: " + (" | ".join(err) or "rtl_fm exited"))
 
 
 # ---------------------------------------------------------------- ADS-B (dump1090 / readsb, SBS BaseStation port 30003)
@@ -1092,6 +1277,23 @@ def run_peripheral(name: str) -> None:
             else:
                 msg = "sweeping the full range"
             emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"], "park": state["park"]})
+        elif c == "listen":
+            if "listen" not in CAPS:
+                emit({"t": "status", "msg": "no RTL-SDR to listen with (add --rtl-power …@SERIAL or --listen-device)",
+                      "band": state["band"], "mode": state["mode"], "listen": "off"})
+            elif str(cmd.get("v") or "") == "off":
+                listen_stop("stopped")
+            else:
+                try:
+                    mhz = float(cmd.get("mhz"))
+                except (TypeError, ValueError):
+                    return
+                if 24.0 <= mhz <= 1766.0:
+                    sq = cmd.get("sq")
+                    listen_start(mhz, str(cmd.get("mode") or "fm"), int(sq) if sq is not None else LISTEN["sq"])
+                else:
+                    emit({"t": "status", "msg": f"{mhz:g} MHz is outside the RTL-SDR's 24–1766 MHz; can't listen there",
+                          "band": state["band"], "mode": state["mode"], "listen": "off"})
         elif c in ("band", "mode", "ch"):
             state[c] = cmd.get("v")
             # An SDR bridge has nothing to park; say so once rather than pretend.
@@ -1110,10 +1312,32 @@ def run_peripheral(name: str) -> None:
     dev.add_characteristic(srv_id=1, chr_id=2, uuid=RX, value=[], notifying=False,
                            flags=["write", "write-without-response"], write_callback=on_rx)
 
+    def au_notify_cb(notifying, characteristic):
+        chars["au"] = characteristic if notifying else None
+        if not notifying and LISTEN["proc"] is not None:
+            listen_stop("stopped (phone unsubscribed)")
+
+    dev.add_characteristic(srv_id=1, chr_id=3, uuid=AU, value=[], notifying=False,
+                           flags=["notify"], notify_callback=au_notify_cb)
+
     def pump():
         while True:
+            au = chars.get("au")
+            frame = None
+            if au is not None:
+                try:
+                    frame = aout.get_nowait()
+                except Empty:
+                    frame = None
+            if frame is not None:
+                try:
+                    au.set_value(list(frame))     # one 164-byte frame per notification, under a 247-byte MTU
+                except Exception:
+                    pass
+                time.sleep(0.004)
+                continue
             try:
-                line = out.get(timeout=0.5)
+                line = out.get(timeout=0.02 if au is not None else 0.5)
             except Empty:
                 continue
             tx = chars.get("tx")
@@ -1170,6 +1394,10 @@ def main() -> None:
                          "add @SERIAL to put a range on a specific dongle (one sweep per dongle runs in parallel)")
     ap.add_argument("--rtl-power-device", metavar="N|SERIAL", default="",
                     help="which RTL-SDR rtl_power uses: index or serial (see rtl_test); default the first free one")
+    ap.add_argument("--listen-device", metavar="SERIAL", default="",
+                    help="RTL-SDR the phone can listen with (rtl_fm); default: the first --rtl-power dongle pinned with @SERIAL")
+    ap.add_argument("--listen-squelch", type=int, default=30,
+                    help="rtl_fm squelch while listening (default 30; 0 = never mute, static between transmissions)")
     ap.add_argument("--rtl-ppm", type=int, default=0,
                     help="RTL-SDR crystal correction passed to rtl_power -p (rtl_test -p measures it; 0 for TCXO dongles)")
     ap.add_argument("--rtl-power-dwell", metavar="SECONDS", type=int, default=15,
@@ -1200,8 +1428,15 @@ def main() -> None:
         threading.Thread(target=feed_hackrf, args=(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask, a.hackrf_ppm), daemon=True).start()
     if a.rtl_power:
         CAPS.append("sweep")
-        for dev, specs in group_sweeps(a.rtl_power, a.rtl_power_device).items():
+        groups = group_sweeps(a.rtl_power, a.rtl_power_device)
+        for dev, specs in groups.items():
             threading.Thread(target=feed_rtl_power, args=(specs, dev, max(3, a.rtl_power_dwell), a.rtl_ppm), daemon=True).start()
+        if not a.listen_device:
+            a.listen_device = next((d for d in groups if d), "")
+    LISTEN["sq"] = a.listen_squelch
+    if a.listen_device:
+        LISTEN["dev"] = a.listen_device
+        CAPS.append("listen")
     if a.dump1090:
         CAPS.append("adsb")
         threading.Thread(target=feed_dump1090, args=(a.dump1090,), daemon=True).start()
