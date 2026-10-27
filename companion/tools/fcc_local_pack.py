@@ -86,18 +86,52 @@ SERVICES = {
     "TI": ("TV intercity relay", "NETWORK"),
     "CD": ("paging / radiotelephone", "NETWORK"),
     "CP": ("paging", "NETWORK"),
-    "RS": ("radio location", "TRAFFIC_SENSOR"),
-    "LN": ("900 MHz business location / monitoring", "TRAFFIC_SENSOR"),
+    "RS": ("radio location", "UNKNOWN"),
+    "LN": ("900 MHz business location / monitoring", "UNKNOWN"),
 }
 
-# Licensee name patterns that sharpen the category. First match wins.
+# Agency type, from the licensee's name: (pattern, label shown in the app, category hint). First match
+# wins, so the specific ones come first ("County Fire Rescue" is fire, not local government). When no
+# name matches, agency_for() falls back to the radio service: public-safety pool → "Public safety".
+AGENCY = [
+    (r"\b(ems|ambulance|emergency medical|paramedics?|medic unit|ambulette)\b", "EMS / ambulance", "UNKNOWN"),
+    (r"\b(fire|rescue|fire district|fire control|fire department)\b", "Fire / rescue", "UNKNOWN"),
+    (r"\b(hospital|medical center|health system|healthcare|health care|clinic)\b", "Hospital / medical", "UNKNOWN"),
+    (r"\b(911|e-?911|emergency management|emergency communications?|communications district|dispatch)\b", "911 / emergency management", "UNKNOWN"),
+    (r"\b(police|sheriff|constable|highway patrol|state patrol|marshal|corrections|department of law enforcement)\b", "Law enforcement", "UNKNOWN"),
+    (r"\b(school|schools|school board|school district|college|university)\b", "School / campus", "UNKNOWN"),
+    (r"\b(airport|aviation authority)\b", "Airport", "UNKNOWN"),
+    (r"\b(port authority|seaport|marina|harbor|harbour)\b", "Port / marine", "UNKNOWN"),
+    (r"\b(department of transportation|dept of transportation|dot|turnpike|expressway|toll|transit|transportation authority|bus)\b", "Transit / roads", "UNKNOWN"),
+    (r"\b(electric|power|energy|water|sewer|wastewater|gas|utility|utilities|cooperative)\b", "Utility", "IOT"),
+    (r"\b(security|alarm|protective|guard)\b", "Security company", "UNKNOWN"),
+    (r"\b(towing|wrecker|roadside)\b", "Towing / roadside", "VEHICLE"),
+    (r"\b(taxi|cab|limo|limousine|shuttle)\b", "Taxi / shuttle", "VEHICLE"),
+    (r"\b(delivery|trucking|logistics|freight|courier)\b", "Delivery / trucking", "VEHICLE"),
+    (r"\b(united states|u\.?s\.? department|federal|national park)\b", "Federal", "UNKNOWN"),
+    (r"\b(city of|county of|town of|village of|county|public works|municipal)\b", "Local government", "UNKNOWN"),
+]
+AGENCY = [(re.compile(rx, re.I), label, cat) for rx, label, cat in AGENCY]
+
+PUBLIC_SAFETY_SERVICES = {"PW", "YW", "GW", "GP", "SP", "SY", "YE", "GE"}
+
+
+def agency_for(name: str, service: str):
+    """(agency label, category hint) for a licensee, or (None, None) when there's nothing to say."""
+    for rx, label, cat in AGENCY:
+        if rx.search(name or ""):
+            return label, cat
+    if service in PUBLIC_SAFETY_SERVICES:
+        return "Public safety", None
+    if service in ("IG", "YG", "GB", "YB", "GI", "IK"):
+        return "Business", None
+    return None, None
+
+
+# Licensee name patterns that sharpen the category. First match wins. Only low-threat hints
+# (vehicle, IoT) that colour the list: a licence never asserts a device type the app alerts on.
 NAME_HINTS = [
-    (re.compile(r"\b(police|sheriff|constable|highway patrol|state patrol|marshal|corrections|department of law enforcement|public safety)\b", re.I), "LE_GEAR"),
-    (re.compile(r"\b(department of transportation|dept of transportation|\bDOT\b|turnpike|expressway|toll|transit|transportation authority)\b", re.I), "TRAFFIC_SENSOR"),
-    (re.compile(r"\b(fire|rescue|ems|ambulance|emergency)\b", re.I), "UNKNOWN"),
-    (re.compile(r"\b(school|college|university|hospital|medical|church)\b", re.I), "UNKNOWN"),
     (re.compile(r"\b(electric|power|energy|water|gas|utility|utilities|cooperative)\b", re.I), "IOT"),
-    (re.compile(r"\b(security|surveillance|alarm|protective|patrol)\b", re.I), "CAMERA"),
     (re.compile(r"\b(towing|wrecker|taxi|cab|limo|delivery|trucking|logistics)\b", re.I), "VEHICLE"),
 ]
 
@@ -226,6 +260,9 @@ def build(zips, state=None, counties=(), center=None, radius_km=None, include_mo
             if rx.search(name):
                 cat = hint
                 break
+        agency, acat = agency_for(name, svc)
+        if acat:
+            cat = acat
         bw = max(emis[c]) if emis.get(c) else 12.5
         sites = [(la, lo) for la, lo, *_ in locs.get(c, []) if la is not None and lo is not None]
         place = next((f"{ci}, {co} Co." for _, _, ci, co, _ in locs.get(c, []) if ci or co), "")
@@ -245,6 +282,7 @@ def build(zips, state=None, counties=(), center=None, radius_km=None, include_mo
                 "service_label": svc_label,
                 "class": cls,
                 "cat": cat,
+                "agency": agency or svc_label,
                 "place": place,
                 "sites": [[round(la, 5), round(lo, 5)] for la, lo in sites[:8]],
             })
@@ -291,10 +329,22 @@ def selftest() -> int:
     assert calls == ["WQZZ001", "WQZZ002"], calls                       # expired WQZZ003 and TX WQZZ004 dropped
     sheriff = [e for e in by_county if e["call"] == "WQZZ001"]
     assert {e["mhz"] for e in sheriff} == {453.2125, 458.2125}
-    assert sheriff[0]["cat"] == "LE_GEAR" and sheriff[0]["bw_khz"] == 11.2 and sheriff[0]["sites"]
+    assert sheriff[0]["cat"] == "UNKNOWN" and sheriff[0]["bw_khz"] == 11.2 and sheriff[0]["sites"]   # never a device type
     tow = [e for e in by_county if e["call"] == "WQZZ002"][0]
     assert tow["cat"] == "VEHICLE" and tow["bw_khz"] == 20.0 and tow["sites"] == []   # 0/0 coords dropped
     assert sorted({e["call"] for e in by_radius}) == ["WQZZ001"]      # the mobile-only licence has no site
+    assert sheriff[0]["agency"] == "Law enforcement" and tow["agency"] == "Towing / roadside"
+    for nm, svc, want in [("Example County Fire Rescue", "PW", "Fire / rescue"),
+                          ("Example County EMS", "PW", "EMS / ambulance"),
+                          ("Example Regional Medical Center", "IG", "Hospital / medical"),
+                          ("Example County Emergency Management", "PW", "911 / emergency management"),
+                          ("Example County School Board", "IG", "School / campus"),
+                          ("Example Electric Cooperative", "IG", "Utility"),
+                          ("Example City Public Works", "PW", "Local government"),
+                          ("Example Holdings LLC", "PW", "Public safety"),
+                          ("Example Holdings LLC", "IG", "Business")]:
+        got = agency_for(nm, svc)[0]
+        assert got == want, (nm, got, want)
     print(f"selftest ok: {len(by_county)} entries by county, {len(by_radius)} by radius")
     return 0
 

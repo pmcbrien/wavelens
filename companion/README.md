@@ -93,17 +93,17 @@ licensed frequency gets the licensee's name instead.
 | 299–319 MHz | Key fob or garage remote (300–318 MHz) | Vehicle | Each burst over the noise floor |
 | 389.5–390.5 MHz | Garage remote (390 MHz) | Vehicle | Each burst over the noise floor |
 | 433.05–434.79 MHz | 433 MHz ISM burst (remotes, sensors, TPMS) | IoT / sensor | Each burst over the noise floor |
-| 902–928 MHz | 900 MHz ISM burst (LoRa, telemetry, meters) | IoT / sensor | Bursts as shown; a carrier still there after 3 passes becomes “Steady 900 MHz carrier: toll gantry or RFID / gate reader” |
+| 902–928 MHz | 900 MHz ISM burst (LoRa, telemetry, meters) | IoT / sensor | Bursts as shown; a carrier still there after 3 passes becomes “Steady 900 MHz carrier: meter collector, LoRa gateway, cordless phone — or a toll / RFID reader on the road” |
 | 863–870 MHz | 868 MHz ISM burst (EU LoRa, sensors) | IoT / sensor | Each burst over the noise floor |
 | 49.8–49.9 MHz | 49 MHz baby monitor, toy or old cordless phone | IoT / sensor | Each burst over the noise floor |
-| 72–76 MHz | 72 MHz radio-control model (RC aircraft) | Drone / video link | Only when it's on two passes in a row |
+| 72–76 MHz | 72 MHz steady carrier: radio-control model (RC aircraft), or hearing-assist / paging | Drone / video link | Only when it's on two passes in a row |
 | **Video and drone links** | | | |
 | 5645–5849 MHz | 5.8 GHz steady carrier: FPV video, or a busy Wi-Fi access point | Drone / video link | Only when it's on 6 passes in a row (Wi-Fi comes and goes; analog video doesn't) |
-| 5850–5925 MHz | 5.9 GHz burst: connected-vehicle radio (C-V2X roadside unit or vehicle) | Vehicle | Bursts as shown; a carrier still there after 3 passes becomes “5.9 GHz steady carrier: FPV video on a high channel” |
+| 5850–5925 MHz | 5.9 GHz burst: connected-vehicle radio (C-V2X roadside unit or vehicle) | Vehicle | Bursts as shown; a carrier still there after 3 passes becomes “5.9 GHz steady carrier: FPV video on a high channel, or Wi-Fi ch 169–177” |
 | 5030–5091 MHz | Drone command-link band (5030–5091 MHz, aviation UAS control) | Drone / video link | Only when it's on two passes in a row |
 | 5091–5150 MHz | Airport surface network (AeroMACS) | Network | Each burst over the noise floor |
 | 1240–1300 MHz | 1.2 GHz carrier: video or telemetry link (also ham 23 cm) | Drone / video link | Only when it's on two passes in a row |
-| 2025–2110 MHz | News / broadcast video link (2 GHz: ENG trucks, news helicopters) | Camera | Only when it's on two passes in a row |
+| 2025–2110 MHz | News / broadcast video link (2 GHz: ENG trucks, news helicopters) | Camera | Only when it's on 6 passes in a row (Wi-Fi comes and goes; analog video doesn't) |
 | 4940–4990 MHz | 4.9 GHz public-safety link (camera / video backhaul, mesh) | Network | Only when it's on two passes in a row |
 | **Aircraft** | | | |
 | 4200–4400 MHz | Radio altimeter: aircraft flying low overhead (helicopter, plane on approach, large drone) | Unclassified | Each burst over the noise floor |
@@ -382,7 +382,21 @@ hit at 453.21 MHz comes through as
 Licensed: <County> Sheriff's Office · WQAB123 · public safety     (LE_GEAR · Likely)
 ```
 
-with the licensee, call sign, service and place in the detail view, instead of "UHF carrier".
+with the licensee, call sign, service and place in the detail view, instead of "UHF carrier". Each
+licensee also gets an **agency type** from its name and radio service — Fire / rescue, EMS / ambulance,
+Hospital / medical, 911 / emergency management, Law enforcement, School / campus, Airport, Port / marine,
+Transit / roads, Utility, Security company, Towing, Taxi, Delivery, Federal, Local government, else
+Public safety or Business — and every licensed hit leads with it: `Fire / rescue: <County> Fire Rescue ·
+WQAB123`, or `EMS / ambulance radio nearby · <licensee> · WQAB124` on a repeater input. Rebuild an older
+pack to get agency types.
+
+What a licence hit claims is kept to what the record supports, so it never raises a false alarm:
+a repeater **input** (station class MO) is *Likely* a radio nearby; a base / repeater **output** is
+heard for miles, so *Possible* and labelled "(regional)"; a **wide sweep bin** (HackRF, 500 kHz) with
+several licensees in it names none — "Licensed radio nearby · N licensees in this 500 kHz (agency
+types)", *Possible* — only the RTL-SDR's 12.5 kHz sweep names one; and a licence **never asserts a
+device type** the app alerts on (body cam, camera, traffic sensor, drone, tool), even from an older
+pack that stored one. Low-threat hints (vehicle, IoT) are kept for list colouring.
 The category hint comes from the licensee's name and radio service (police / sheriff →
 LE gear; DOT / transit → traffic sensor; towing / taxi → vehicle; utilities → IoT; everything
 else unclassified but named). Decoded `rtl_433` hits with no known model get the same

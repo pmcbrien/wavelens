@@ -111,27 +111,65 @@ class FccPack:
         return [(e, None) for e in hits]
 
     def label(self, mhz: float, tol_khz: float = 12.5):
-        """(name, cat, conf, extras) for a carrier, or None when nothing is licensed there."""
+        """(name, cat, conf, extras) for a carrier, or None when nothing is licensed there.
+
+        What a licence record can and can't say, so that nothing here raises a false alarm:
+        - The category is never a device type the app alerts on. A licence says whose radio is on
+          that frequency, not that it is a body cam, a camera or a traffic sensor; those categories
+          are mapped away even when an older pack carries them. Low-threat hints (vehicle, IoT)
+          are kept for the list colouring.
+        - A repeater input (station class MO: mobiles and handhelds transmit there) is LIKELY to be
+          a radio nearby. A base or repeater output is heard from miles away: POSSIBLE, and said so.
+        - A wide sweep bin (the HackRF's 500 kHz) can hold dozens of 12.5 kHz land-mobile channels.
+          With several licensees in the bin no single one is named: the hit says how many, and which
+          agency types, at POSSIBLE. Only a narrow bin (rtl_power at 12.5 kHz) or a lone match names
+          the licensee.
+        """
         hits = self.lookup(mhz, tol_khz)
         if not hits:
             return None
+        agencies = sorted({agency_of(h) for h, _ in hits})
+        if len(hits) > 1 and tol_khz > 25:
+            kinds = ", ".join(agencies[:4]) + (" …" if len(agencies) > 4 else "")
+            name = f"Licensed radio nearby · {len(hits)} licensees in this {tol_khz:.0f} kHz ({kinds})"
+            x = {"agency": kinds, "licensees": "; ".join(f"{h['name'] or h['call']} ({h['call']})" for h, _ in hits[:6]),
+                 "ambiguous": (f"a {tol_khz:.0f} kHz sweep bin spans many {12.5:g} kHz channels; an RTL-SDR sweep "
+                               "at 12.5 kHz names the licensee")}
+            return name, "UNKNOWN", "POSSIBLE", x
         # A mobile/handheld (station class MO…) frequency is a repeater input: radios transmit there
         # toward the tower, and a low-power handheld is only audible from close by. Prefer that reading.
         inputs = [(h, dd) for h, dd in hits if is_input(h)]
         e, d = (inputs or hits)[0]
         who = e['name'] or e['call']
+        agency = agency_of(e)
         if is_input(e):
-            name = f"Radio transmitting nearby · {who} repeater input · {e['call']}"
+            name, conf = f"{agency} radio nearby · {who} · {e['call']}", "LIKELY"
         else:
-            name = f"Licensed: {who} · {e['call']} · {e['service_label']}"
-        x = {"licensee": e["name"], "call_sign": e["call"], "service": e["service_label"], "place": e.get("place", "")}
+            name, conf = f"{agency} base / repeater (regional): {who} · {e['call']}", "POSSIBLE"
+        x = {"agency": agency, "licensee": e["name"], "call_sign": e["call"], "service": e["service_label"],
+             "place": e.get("place", "")}
         if is_input(e):
             x["repeater_input"] = "a mobile or handheld transmitting up to its repeater — heard only from close by"
+        else:
+            x["base_output"] = "a base station or repeater output: heard for miles, not a sign of anything nearby"
         if d is not None and d < 1e8:
             x["site_km"] = f"{d:.1f}"
         if len(hits) > 1:
             x["other_licensees"] = "; ".join(f"{h['name'] or h['call']} ({h['call']})" for h, _ in hits[1:4])
-        return name, e.get("cat") or "UNKNOWN", "LIKELY", x
+        cat = e.get("cat") or "UNKNOWN"
+        if cat in FCC_NO_DEVICE_CATS:
+            cat = "UNKNOWN"
+        return name, cat, conf, x
+
+
+# Categories a licence record must never assert: the app alerts on them and names a device
+# ("Body cam", "Traffic sensor", "Camera") that a licence says nothing about.
+FCC_NO_DEVICE_CATS = {"LE_GEAR", "ALPR", "CAMERA", "TRAFFIC_SENSOR", "DRONE", "TOOL", "ACOUSTIC", "TRACKER"}
+
+
+def agency_of(e: dict) -> str:
+    """Agency type stored by fcc_local_pack.py, or the radio-service label on an older pack."""
+    return e.get("agency") or e.get("service_label") or "Licensed"
 
 
 def is_input(e: dict) -> bool:
@@ -200,21 +238,21 @@ BANDS = [
     B(389.5, 390.5, "Garage remote (390 MHz)", "VEHICLE"),
     B(433.05, 434.79, "433 MHz ISM burst (remotes, sensors, TPMS)", "IOT"),
     B(902, 928, "900 MHz ISM burst (LoRa, telemetry, meters)", "IOT",
-      steady=("Steady 900 MHz carrier: toll gantry or RFID / gate reader", "TRAFFIC_SENSOR", "POSSIBLE")),
+      steady=("Steady 900 MHz carrier: meter collector, LoRa gateway, cordless phone — or a toll / RFID reader on the road", "IOT", "POSSIBLE")),
     B(863, 870, "868 MHz ISM burst (EU LoRa, sensors)", "IOT"),
     B(49.8, 49.9, "49 MHz baby monitor, toy or old cordless phone", "IOT"),
-    B(72, 76, "72 MHz radio-control model (RC aircraft)", "DRONE"),
+    B(72, 76, "72 MHz steady carrier: radio-control model (RC aircraft), or hearing-assist / paging", "DRONE", kind="persist"),
 
     # ---- video and drone links
     # 5645–5849 is shared with 5 GHz Wi-Fi (ch 132–165). Analog FPV video transmits continuously; Wi-Fi
     # comes and goes with traffic. kind "video": reported only after VIDEO_N passes in a row.
     B(5645, 5849, "5.8 GHz steady carrier: FPV video, or a busy Wi-Fi access point", "DRONE", kind="video"),
     B(5850, 5925, "5.9 GHz burst: connected-vehicle radio (C-V2X roadside unit or vehicle)", "VEHICLE",
-      steady=("5.9 GHz steady carrier: FPV video on a high channel", "DRONE", "POSSIBLE")),
+      steady=("5.9 GHz steady carrier: FPV video on a high channel, or Wi-Fi ch 169–177", "DRONE", "POSSIBLE")),
     B(5030, 5091, "Drone command-link band (5030–5091 MHz, aviation UAS control)", "DRONE", kind="persist"),
     B(5091, 5150, "Airport surface network (AeroMACS)", "NETWORK"),
     B(1240, 1300, "1.2 GHz carrier: video or telemetry link (also ham 23 cm)", "DRONE", kind="persist"),
-    B(2025, 2110, "News / broadcast video link (2 GHz: ENG trucks, news helicopters)", "CAMERA", kind="persist"),
+    B(2025, 2110, "News / broadcast video link (2 GHz: ENG trucks, news helicopters)", "CAMERA", kind="video"),
     B(4940, 4990, "4.9 GHz public-safety link (camera / video backhaul, mesh)", "NETWORK", kind="persist"),
 
     # ---- aircraft
@@ -433,7 +471,9 @@ class Sweep:
                 x.update(lx)
                 if cat in PERSIST and n < 2:
                     continue
-                self.report(mhz, db, step, db - f, name, cat, conf, None, f"fcc/{lx['call_sign']}/{mhz:.3f}", now, x)
+                # a named licensee keeps its own id; an ambiguous wide-bin hit falls back to the 1 MHz bucket id
+                ident = f"fcc/{lx['call_sign']}/{mhz:.3f}" if lx.get("call_sign") else None
+                self.report(mhz, db, step, db - f, name, cat, conf, None, ident, now, x)
                 continue
             b = band_of(mhz)
             if b["name"] is None:
