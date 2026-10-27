@@ -498,6 +498,9 @@ class Sweep:
     def report(self, mhz, db, step, over, name, cat, conf, b, ident, now, x) -> None:
         if not x:
             x = {"over_floor_db": f"{over:.0f}", "bin_hz": f"{step:.0f}"}
+        # f goes out rounded to whole MHz (and sweep ids are 1 MHz buckets); the bin centre is the
+        # best the sweep actually knows, to within half a bin plus the radio's own ppm error.
+        x.setdefault("exact_mhz", f"{mhz:.4f}".rstrip("0").rstrip("."))
         if b is not None and b["kind"] == "bg":
             key, rate = "bg/" + b["key"], BG_RATE_S
             ident = ident or f"{self.src}/bg/{b['key']}"
