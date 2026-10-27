@@ -358,6 +358,7 @@ CHAIN_S = 30.0       # a bin's run of hot passes breaks if it isn't revisited wi
 BG_RATE_S = 60.0     # background bands: at most one report per band per minute
 FLOOR_S = 40.0       # rolling floor time constant (a carrier that stays this long becomes the floor)
 FLOOR_UP_GNSS_S = 1200.0   # ... rising in the GNSS bands, so a jammer riding with you stays visible
+FLOOR_HOT_S = 600.0        # ... rising under a bin that is already reported, so a held carrier keeps reporting
 
 # Parked: the HackRF stops sweeping 1 MHz–6 GHz and stays on one 20 MHz slice, so a short transmission
 # there is caught on the pass it happens instead of within a second. "le" is the body-cam-and-radio
@@ -437,7 +438,13 @@ class Sweep:
             # or a few milliseconds (parked): about 40 s to follow a change, ~20 min upward in GNSS.
             w = gnss_window(hz)
             dt = min(max((now - prev_visit) if prev_visit is not None else 1.2, 0.001), 30.0)
-            k = min(1.0, dt / (FLOOR_UP_GNSS_S if (w and db > f) else FLOOR_S))
+            # The floor follows the band with a 40 s time constant, so a tower fades into the background
+            # on a drive. But a bin that is already well over the floor must not be absorbed at that
+            # rate: a radio held keyed (Find it) or a video link would stop being reported after 40 s.
+            # Hot bins rise with FLOOR_HOT_S instead; the floor still falls at the normal rate.
+            hot = db - f >= self.th
+            tau = FLOOR_UP_GNSS_S if (w and db > f) else FLOOR_HOT_S if (hot and db > f) else FLOOR_S
+            k = min(1.0, dt / tau)
             self.floor[hz] = f * (1 - k) + db * k
             if w:
                 if not w[2] <= hz <= w[3]:
