@@ -195,6 +195,10 @@ SiriusXM) and airport / weather radar. **Skipped:** 2.4 GHz and 5 GHz Wi-Fi and 
 GPS L2 and long-range air-traffic radar (1215–1240, 1300–1390 MHz), and the radio-astronomy band
 (1400–1427 MHz). Anything else is reported as "*NNN.N* MHz carrier".
 
+**The first minute.** After a start (or a park change) the HackRF reports nothing for 60 s (8 s parked)
+while the floor settles: its gains arrive late, so the first pass reads 30–40 dB low and everything,
+GPS windows included, would look hot for minutes.
+
 **Broadband bursts.** When four or more unrelated bands rise within 2.5 s, the HackRF is overloading:
 a strong transmitter beside it (the phone, the Pi's own Wi-Fi) or a radar's main beam sweeping past. The
 bridge keeps hits within 5 dB of the strongest (the likely cause) and anything 30 dB over its floor, drops

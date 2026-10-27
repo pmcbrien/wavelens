@@ -412,6 +412,7 @@ class Sweep:
         self.last = {}        # bucket → last report time
         self.gps_prev = {}    # GNSS row start (MHz) → last time that row looked jammed
         self.settle_until = 0.0
+        self.quiet_until = 0.0    # floors learn but nothing is reported until then (a sweep's first FLOOR_WARM_S)
         self.since = {}       # bin Hz → when it was first seen (the floor is "warm" after FLOOR_WARM_S)
         self.seen = {}        # bin Hz → time of the previous visit
         self.runs = {}        # bin Hz → [passes in a row over the floor, last dB, bin width]
@@ -453,12 +454,15 @@ class Sweep:
             # ... but only once the floor has had FLOOR_WARM_S to settle: a sweep tool's first pass can
             # come before its gain is applied, 30-40 dB low, and a floor that started there must be
             # allowed to catch up fast, or the whole spectrum looks hot for ten minutes.
-            hot = db - f >= self.th and now - self.since.get(hz, now) >= FLOOR_WARM_S
-            tau = FLOOR_UP_GNSS_S if (w and db > f) else FLOOR_HOT_S if (hot and db > f) else FLOOR_S
+            warm = now - self.since.get(hz, now) >= FLOOR_WARM_S
+            hot = db - f >= self.th and warm
+            tau = FLOOR_UP_GNSS_S if (w and db > f and warm) else FLOOR_HOT_S if (hot and db > f) else FLOOR_S
             k = min(1.0, dt / tau)
             self.floor[hz] = f * (1 - k) + db * k
             if any(lo <= hz < hi for lo, hi in self.mask):
                 continue                     # one of this unit's own spurs (--hackrf-mask): floor only, never reported
+            if now < self.quiet_until:
+                continue                     # the floor isn't trusted yet (see FLOOR_WARM_S): learn it, report nothing
             if w:
                 if not w[2] <= hz <= w[3]:
                     continue                 # GNSS but outside the judged window: floor only, never reported
@@ -761,6 +765,9 @@ def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20, mask:
         if p is None:
             return
         sw.settle_until = time.time() + SETTLE_S + 3.0   # first passes come before the gains are applied
+        # A full sweep's floor is untrustworthy for its first minute (the gains arrive late, the floor starts
+        # 30-40 dB low): learn it quietly. A parked slice sweeps thousands of times a minute and settles fast.
+        sw.quiet_until = time.time() + (FLOOR_WARM_S if rng == range_mhz else 8.0)
         print(f"bridge: hackrf_sweep {rng} MHz" + (f" (parked: {park})" if park in PARK_RANGES else ""), file=sys.stderr)
 
         p.last_line = time.time()
