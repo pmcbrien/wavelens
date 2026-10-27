@@ -376,7 +376,9 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 {"c":"pos","lat":27.9,"lon":-82.8}   // opt-in only: the phone's fix, every 10 s, so the companion can rank
                                      // licensed sites by distance. lat null = sharing turned off; forget it.
 {"c":"listen","mhz":446.075,"mode":"fm"}   // SDR bridge: demodulate this and stream audio (fm | am | wbfm);
-{"c":"listen","v":"off"}             // optional "sq": rtl_fm squelch. Renew within 5 min or it stops itself.
+{"c":"listen","v":"follow"}          // scanner: tune every fresh voice-band hit (air AM, VHF/UHF FM, CB), play it
+{"c":"listen","v":"off"}             // until the squelch closes + 3 s, then the next. "sq": rtl_fm squelch,
+                                     // changeable any time. Renew within 5 min or it stops itself.
 ```
 
 **Listening (SDR bridge, capability `listen`).** The bridge borrows an RTL-SDR — by default the first
@@ -385,8 +387,9 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 frames — `seq` (u8), predictor (i16 LE), step index (u8), then 320 samples as 4-bit codes, high nibble
 first — one frame per 40 ms, about 4 kB/s. Each frame carries its own start state, so a dropped frame
 costs 40 ms and nothing after. `rtl_fm`'s squelch (`--listen-squelch`, default 30) keeps the link quiet
-between transmissions. A `status` line carries `"listen": {"mhz","mode"}` while on and `"listen": "off"`
-when it ends. Receive only.
+between transmissions. A `status` line carries `"listen": {"mhz","mode","sq","follow"}` while on (`mhz` 0 while
+following with nothing tuned) and `"listen": "off"` when it ends. Follow skips always-on and background
+hits, digital trunked bands (806–870: P25/DMR would be buzzing) and broadcast. Receive only.
 
 Unknown commands are ignored. Every command may be answered with a `status` line.
 

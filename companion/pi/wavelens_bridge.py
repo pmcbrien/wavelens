@@ -63,6 +63,8 @@ def emit(obj: dict) -> None:
         out.put_nowait(line)
     except Exception:
         pass  # full: drop, the next packet will come
+    if LISTEN.get("follow") and obj.get("t") == "rf" and obj.get("src") in ("hackrf", "rtlpower"):
+        follow_hit(obj)
 
 
 CAPS = ["rf"]
@@ -890,8 +892,45 @@ LISTEN_MAX_S = 300.0
 LISTEN_RATE = 8000
 LISTEN_FRAME = 320          # samples per frame: 40 ms
 LISTEN_MODES = {"fm": "-M fm -s 16k", "am": "-M am -s 16k", "wbfm": "-M wbfm"}
-LISTEN = {"proc": None, "dev": "", "mhz": 0.0, "mode": "", "sq": 0, "until": 0.0, "seq": 0}
+LISTEN = {"proc": None, "dev": "", "mhz": 0.0, "mode": "", "sq": 0, "until": 0.0, "seq": 0,
+          "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0}
 LISTEN_LOCK = threading.Lock()
+
+# Follow: a scanner. Every fresh sweep hit in a band where voice is analog and legal to hear gets tuned
+# and played; the dongle stays while the squelch is open, hangs on FOLLOW_HANG_S after it closes, then
+# the next hit takes it. Not digital trunked bands (P25/DMR: rtl_fm would play buzzing), not broadcast.
+FOLLOW_BANDS = [(26.96, 27.41, "am"), (29.6, 54.0, "fm"), (118.0, 137.0, "am"), (137.0, 174.0, "fm"),
+                (216.0, 225.0, "fm"), (400.0, 470.0, "fm")]
+FOLLOW_HANG_S = 3.0
+FOLLOW_MIN_S = 4.0          # once tuned, give the squelch this long to open before another hit can take over
+
+
+def follow_mode(mhz: float):
+    for lo, hi, mode in FOLLOW_BANDS:
+        if lo <= mhz <= hi:
+            return mode
+    return None
+
+
+def follow_hit(obj: dict) -> None:
+    x = obj.get("x") or {}
+    if "always_on" in x or "background" in x:
+        return
+    try:
+        mhz = float(str(x.get("exact_mhz", "")).split()[0])
+    except (ValueError, IndexError):
+        mhz = float(obj.get("f") or 0)
+    mode = follow_mode(mhz)
+    if mode is None:
+        return
+    now = time.time()
+    if LISTEN["proc"] is not None:
+        if abs(LISTEN["mhz"] - mhz) < 0.02:
+            LISTEN["until"] = now + LISTEN_MAX_S
+            return                           # already on it
+        if now - LISTEN["tuned_at"] < FOLLOW_MIN_S or now - LISTEN["last_audio"] < FOLLOW_HANG_S:
+            return                           # busy with a live one
+    listen_start(mhz, mode, LISTEN["sq"])
 
 IMA_INDEX = [-1, -1, -1, -1, 2, 4, 6, 8]
 IMA_STEP = [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88,
@@ -949,6 +988,15 @@ class Ima:
         return bytes(out)
 
 
+def follow_watch() -> None:
+    while True:
+        time.sleep(5)
+        if LISTEN["follow"] and time.time() > LISTEN["follow_until"]:
+            LISTEN["follow"] = False
+            listen_stop("follow timed out (5 min without the app renewing it)")
+            listen_status("follow ended")
+
+
 def listen_busy(dev: str) -> bool:
     return LISTEN["proc"] is not None and LISTEN["dev"] == dev
 
@@ -956,7 +1004,8 @@ def listen_busy(dev: str) -> bool:
 def listen_status(msg: str) -> None:
     on = LISTEN["proc"] is not None
     emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"],
-          "listen": {"mhz": LISTEN["mhz"], "mode": LISTEN["mode"]} if on else "off"})
+          "listen": {"mhz": LISTEN["mhz"] if on else 0, "mode": LISTEN["mode"] if on else "", "sq": LISTEN["sq"],
+                     "follow": bool(LISTEN["follow"])} if (on or LISTEN["follow"]) else "off"})
 
 
 def listen_stop(why: str = "stopped") -> None:
@@ -975,7 +1024,8 @@ def listen_stop(why: str = "stopped") -> None:
 def listen_start(mhz: float, mode: str, sq: int) -> None:
     mode = mode if mode in LISTEN_MODES else "fm"
     with LISTEN_LOCK:
-        same = LISTEN["proc"] is not None and abs(LISTEN["mhz"] - mhz) < 0.0005 and LISTEN["mode"] == mode
+        same = (LISTEN["proc"] is not None and abs(LISTEN["mhz"] - mhz) < 0.0005 and LISTEN["mode"] == mode
+                and LISTEN["sq"] == sq)
         LISTEN["until"] = time.time() + LISTEN_MAX_S
         if same:
             return                           # a renewal: just push the deadline out
@@ -1003,6 +1053,7 @@ def run_listen(mhz: float, mode: str, sq: int) -> None:
         return
     with LISTEN_LOCK:
         LISTEN["proc"] = p
+        LISTEN["tuned_at"] = LISTEN["last_audio"] = time.time()
     print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})", file=sys.stderr)
     listen_status(f"listening on {mhz:.4f} MHz ({mode.upper()}); the RTL-SDR sweep is paused")
     enc = Ima()
@@ -1026,6 +1077,7 @@ def run_listen(mhz: float, mode: str, sq: int) -> None:
                 continue
             pcm, buf = buf[:need], buf[need:]
             # rtl_fm's squelch stops its output between transmissions; what does come through is sent.
+            LISTEN["last_audio"] = time.time()
             LISTEN["seq"] = (LISTEN["seq"] + 1) & 0xFF
             try:
                 aout.put_nowait(enc.frame(LISTEN["seq"], pcm))
@@ -1282,7 +1334,17 @@ def run_peripheral(name: str) -> None:
                 emit({"t": "status", "msg": "no RTL-SDR to listen with (add --rtl-power …@SERIAL or --listen-device)",
                       "band": state["band"], "mode": state["mode"], "listen": "off"})
             elif str(cmd.get("v") or "") == "off":
+                LISTEN["follow"] = False
                 listen_stop("stopped")
+                listen_status("listening stopped")
+            elif str(cmd.get("v") or "") == "follow":
+                sq = cmd.get("sq")
+                if sq is not None:
+                    LISTEN["sq"] = max(0, min(1000, int(sq)))
+                fresh = not LISTEN["follow"]
+                LISTEN["follow"], LISTEN["follow_until"] = True, time.time() + LISTEN_MAX_S
+                if fresh:
+                    listen_status("following hits: each new carrier in a voice band is tuned and played")
             else:
                 try:
                     mhz = float(cmd.get("mhz"))
@@ -1290,7 +1352,8 @@ def run_peripheral(name: str) -> None:
                     return
                 if 24.0 <= mhz <= 1766.0:
                     sq = cmd.get("sq")
-                    listen_start(mhz, str(cmd.get("mode") or "fm"), int(sq) if sq is not None else LISTEN["sq"])
+                    listen_start(mhz, str(cmd.get("mode") or "fm"),
+                                 max(0, min(1000, int(sq))) if sq is not None else LISTEN["sq"])
                 else:
                     emit({"t": "status", "msg": f"{mhz:g} MHz is outside the RTL-SDR's 24–1766 MHz; can't listen there",
                           "band": state["band"], "mode": state["mode"], "listen": "off"})
@@ -1437,6 +1500,7 @@ def main() -> None:
     if a.listen_device:
         LISTEN["dev"] = a.listen_device
         CAPS.append("listen")
+        threading.Thread(target=follow_watch, daemon=True).start()
     if a.dump1090:
         CAPS.append("adsb")
         threading.Thread(target=feed_dump1090, args=(a.dump1090,), daemon=True).start()
