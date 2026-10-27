@@ -465,6 +465,10 @@ class Sweep:
         else:
             bucket = round(mhz / self.bucket)
             key, rate = (bucket, cat if b is not None and b["steady"] and cat == b["steady"][1] else ""), self.rate
+            if b is not None and "radar" in (b["name"] or "").lower():
+                # a radar's pulses drift across several MHz: one entry per radar band, not one per MHz
+                key = ("band", b["key"])
+                ident = ident or f"{self.src}/band/{b['key']}"
             ident = ident or f"{self.src}/{bucket * self.bucket:.0f}"
         if now - self.last.get(key, 0) < rate:
             return
@@ -516,8 +520,9 @@ class Sweep:
 # reports are held for STORM_HOLD_S, and when STORM_BANDS or more unrelated bands rose within that
 # window, the whole batch is dropped and the phone gets one status line instead.
 STORM_HOLD_S = 2.5
-STORM_BANDS = 6
+STORM_BANDS = 4
 STORM_NOTE_S = 60.0
+STORM_KEEP_DB = 5.0
 
 
 class StormGate:
@@ -542,11 +547,20 @@ class StormGate:
                     batch.append(self.q.popleft())
             bands = {band for _, band, _ in batch}
             if len(bands) >= STORM_BANDS:
+                # Overload has a cause, and the cause is the strongest thing in the burst (a radar's main
+                # beam sweeping past, the phone keying up beside the antenna). Keep what's within
+                # STORM_KEEP_DB of the strongest; the weaker rest is the receiver's own false carriers.
+                top = max(line["r"] for _, _, line in batch)
+                keep = [line for _, _, line in batch if line["r"] >= top - STORM_KEEP_DB]
+                for line in keep:
+                    line.setdefault("x", {})["burst"] = f"strongest of {len(bands)} bands that rose together"
+                    emit(line)
                 if now - self.noted > STORM_NOTE_S:
                     self.noted = now
-                    msg = (f"{self.src}: ignored a broadband burst ({len(bands)} unrelated bands rose together). "
-                           "That's the receiver overloading, usually a phone or Wi-Fi transmitter right next "
-                           "to the antenna. Move it away or lower the gain.")
+                    cause = ", ".join(sorted({l["n"] for l in keep}))[:120]
+                    msg = (f"{self.src}: {len(bands)} bands rose together; kept the strongest ({cause}) and "
+                           "ignored the rest as receiver overload. A strong transmitter close by, or a radar beam "
+                           "sweeping past, does this; lower the gain if it happens often.")
                     print("bridge: " + msg, file=sys.stderr)
                     emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
                 continue
