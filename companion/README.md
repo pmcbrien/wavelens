@@ -205,6 +205,13 @@ RTL-SDR's, for `--rtl-ppm`.
 while the floor settles: its gains arrive late, so the first pass reads 30–40 dB low and everything,
 GPS windows included, would look hot for minutes.
 
+**Overload has a cause.** When bands rise together and one of them is a band where a transmitter
+beside the receiver is the normal explanation (two-way radio, phone, key fob, ISM), that hit is kept
+and the "4.7 GHz microwave link" and "S-band radar" that appeared with it are dropped as the
+receiver's own products — even when they read stronger, which an overloaded HackRF will do. Several
+fresh carriers in one band in one window (a 435–441 comb from one handheld) collapse to the
+strongest, marked `smear`; a kept hit at 2×/3×/4× a stronger kept hit is dropped as its harmonic.
+
 **Broadband bursts.** When four or more unrelated bands rise within 2.5 s, the HackRF is overloading:
 a strong transmitter beside it (the phone, the Pi's own Wi-Fi) or a radar's main beam sweeping past. The
 bridge keeps hits within 5 dB of the strongest (the likely cause) and anything 30 dB over its floor, drops

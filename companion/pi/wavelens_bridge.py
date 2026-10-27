@@ -439,6 +439,8 @@ class Sweep:
             return
         gnss_rows = {}      # GNSS window → [bins judged, hot bins]
         for i, db in enumerate(vals):
+            if db != db or db in (float("inf"), float("-inf")):
+                continue                     # rtl_power prints nan for bins it cropped; never a hit
             hz = lo + i * step
             prev_visit = self.seen.get(hz)
             self.seen[hz] = now
@@ -673,32 +675,87 @@ class StormGate:
     def _judge(self, batch: list) -> None:
             now = time.time()
             rose = [(band, line) for _, band, line, fresh in batch if fresh]
+            # Smear: a strong carrier beside an unfiltered receiver spreads over several MHz of its own
+            # band (a comb of 435-441 from one handheld). Several fresh buckets in one band in one window
+            # are one signal: keep the strongest, say so on it.
+            by_band = {}
+            for band, line in rose:
+                by_band.setdefault(band, []).append(line)
+            smeared = []
+            for band, lines in by_band.items():
+                if len(lines) >= SMEAR_N:
+                    lines.sort(key=lambda l: l["r"], reverse=True)
+                    lines[0].setdefault("x", {})["smear"] = (f"{len(lines)} carriers in this band at once: one strong "
+                                                            "signal spread by the receiver; the strongest is shown")
+                    smeared += lines[1:]
+            rose = [(band, line) for band, line in rose if line not in smeared]
             bands = {band for band, _ in rose}
             if len(bands) >= STORM_BANDS:
-                # Overload has a cause, and the cause is the strongest thing in the burst (a radar's main
-                # beam sweeping past, the phone keying up beside the antenna). Keep what's within
-                # STORM_KEEP_DB of the strongest; the weaker rest is the receiver's own false carriers.
+                # Overload has a cause: the strongest thing in the burst, and preferably something that can
+                # actually be beside the receiver (a radio, a phone, a key fob), not a "4.7 GHz microwave link"
+                # that is really the receiver's own product of it. Keep the cause and what's within
+                # STORM_KEEP_DB of it; drop the rest. When nothing in the burst looks like a nearby
+                # transmitter, keep the strongest and anything STORM_KEEP_OVER_DB over its floor (radar).
                 # Established hits (not fresh) were there before the burst and go through untouched.
-                top = max(line["r"] for _, line in rose)
-                keep = [line for _, line in rose
-                        if line["r"] >= top - STORM_KEEP_DB
-                        or float(line.get("x", {}).get("over_floor_db", 0)) >= STORM_KEEP_OVER_DB]
+                cause = [line for _, line in rose if near_cause(line)]
+                if cause:
+                    top = max(line["r"] for line in cause)
+                    keep = [line for line in cause
+                            if line["r"] >= top - STORM_KEEP_DB
+                            or float(line.get("x", {}).get("over_floor_db", 0)) >= STORM_KEEP_OVER_DB]
+                    keep = drop_harmonics(keep)
+                    why = "the transmitter that caused it"
+                else:
+                    top = max(line["r"] for _, line in rose)
+                    keep = [line for _, line in rose
+                            if line["r"] >= top - STORM_KEEP_DB
+                            or float(line.get("x", {}).get("over_floor_db", 0)) >= STORM_KEEP_OVER_DB]
+                    why = "the strongest"
                 for line in keep:
-                    line.setdefault("x", {})["burst"] = f"strongest of {len(bands)} bands that rose together"
+                    line.setdefault("x", {})["burst"] = f"{why} of {len(bands)} bands that rose together"
                 for _, _, line, fresh in batch:
                     if not fresh or line in keep:
                         emit(line)
                 if now - self.noted > STORM_NOTE_S:
                     self.noted = now
-                    cause = ", ".join(sorted({l["n"] for l in keep}))[:120]
-                    msg = (f"{self.src}: {len(bands)} bands rose together; kept the strongest ({cause}) and "
+                    names = ", ".join(sorted({l["n"] for l in keep}))[:120]
+                    msg = (f"{self.src}: {len(bands)} bands rose together; kept {why} ({names}) and "
                            "ignored the rest as receiver overload. A strong transmitter close by, or a radar beam "
                            "sweeping past, does this; lower the gain if it happens often.")
                     print("bridge: " + msg, file=sys.stderr)
                     emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
                 return
             for _, _, line, _ in batch:
-                emit(line)
+                if line not in smeared:
+                    emit(line)
+
+
+SMEAR_N = 3
+
+
+def near_cause(line: dict) -> bool:
+    """A hit in a band where a transmitter beside the receiver is the normal explanation: two-way
+    radios, phones, key fobs, ISM devices. Not radar, not microwave links, not altimeters."""
+    n = (line.get("n") or "").lower()
+    if "altimeter" in n or "radar (" in n and "radio" not in n:
+        return False
+    return (line.get("cat") in ("PHONE", "VEHICLE", "IOT")
+            or "radio" in n or "nearby" in n or "walkie" in n or "keying" in n or "two-way" in n)
+
+
+def drop_harmonics(keep: list) -> list:
+    """A kept hit at 2x, 3x or 4x a stronger kept hit (to 0.3 %) is the receiver's harmonic of it."""
+    keep = sorted(keep, key=lambda l: l["r"], reverse=True)
+    out = []
+    for line in keep:
+        f = float(str(line.get("x", {}).get("exact_mhz", line["f"])).split()[0])
+        for strong in out:
+            fs = float(str(strong.get("x", {}).get("exact_mhz", strong["f"])).split()[0])
+            if any(abs(f - k * fs) <= 0.003 * f for k in (2, 3, 4)):
+                break
+        else:
+            out.append(line)
+    return out
 
 
 _storm_gates: "dict[str, StormGate]" = {}
