@@ -212,7 +212,7 @@ rolling floor absorbs one that stays. Out of reach entirely: radar guns (10.5 / 
 Starlink (above 10 GHz), and anything that would need decoding to tell apart — a sweep cannot tell
 a fake cell tower from a real one, so the bridge never claims to.
 
-**Parked for body cams & radios.** *More → Tools → Companion radio → Park for body cams & radios*
+**Parked for body cams & radios.** *More → Companion radio → Park for body cams & radios*
 trades breadth for speed. An ESP32 keeps BLE on and parks Wi-Fi on channels 1 · 6 · 11 (each
 revisited every 0.75 s instead of every 3.25 s), which is where body-cam and in-car-video hotspots
 and the BLE advertisements of body cams and radio accessories are caught. A HackRF bridge stops the
@@ -396,7 +396,9 @@ heard for miles, so *Possible* and labelled "(regional)"; a **wide sweep bin** (
 several licensees in it names none — "Licensed radio nearby · N licensees in this 500 kHz (agency
 types)", *Possible* — only the RTL-SDR's 12.5 kHz sweep names one; and a licence **never asserts a
 device type** the app alerts on (body cam, camera, traffic sensor, drone, tool), even from an older
-pack that stored one. Low-threat hints (vehicle, IoT) are kept for list colouring.
+pack that stored one. Low-threat hints (vehicle, IoT) are kept for list colouring. Alerts are opt-in by
+agency type (app: Companion radio → *Alert when one of these keys up nearby*), and only for repeater
+inputs.
 The category hint comes from the licensee's name and radio service (police / sheriff →
 LE gear; DOT / transit → traffic sensor; towing / taxi → vehicle; utilities → IoT; everything
 else unclassified but named). Decoded `rtl_433` hits with no known model get the same
