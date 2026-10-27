@@ -16,6 +16,8 @@ sudo apt-get install -y libpulse-dev libsndfile1-dev libfftw3-dev liblapack-dev 
     libncurses5 libncurses5-dev libncursesw5-dev rtl-sdr librtlsdr-dev cmake git wget make build-essential \
     libcodec2-dev 2>/dev/null || sudo apt-get install -y libpulse-dev libsndfile1-dev libfftw3-dev liblapack-dev \
     socat libusb-1.0-0-dev libncurses-dev rtl-sdr librtlsdr-dev cmake git wget make build-essential libcodec2-dev
+# Pager data (POCSAG / FLEX) on analog channels: the bridge uses multimon-ng when it is present.
+sudo apt-get install -y multimon-ng || true
 
 work=$(mktemp -d)
 cd "$work"

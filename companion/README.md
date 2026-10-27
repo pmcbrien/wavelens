@@ -418,6 +418,14 @@ and the listen retunes to the channel that offset points at (the DC is removed b
 out). Later sweep readings of the same carrier refine it too. `--rtl-ppm` matters here: an uncorrected
 dongle's crystal error (often 20–50 ppm, 10–20 kHz at 450 MHz) looks like a channel offset.
 
+**Pager data.** With `multimon-ng` installed, every analog FM listen also feeds the audio (22.05 kHz,
+DC removed) to a POCSAG512/1200/2400 + FLEX decoder. The first page decoded sets `detected` to
+`POCSAG`/`FLEX`, mutes the audio frames, and pages go to the phone as
+`{"t":"page","f":460.6,"proto":"POCSAG1200","addr":"1234567","msg":"…"}`. Lab only; nothing is stored.
+Public-safety dispatch paging on an agency's own system is lawful to receive in the US
+(18 U.S.C. § 2511(2)(g)); commercial paging-carrier traffic is not — the decoder runs only on the
+frequency that was tuned.
+
 **Auto mode** starts `dsd-fme -fa`; the sync it reports on stderr ("Sync: +DMR", "+P25p1") names the
 protocol and the audio layout (TDMA is stereo). If the carrier is on (the sweep still sees it) and no
 digital sync appears within 3 s, it is analog: the listen restarts as narrow FM. Decided once per tune.

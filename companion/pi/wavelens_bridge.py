@@ -34,6 +34,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import socket
 import struct
 import subprocess
@@ -993,6 +994,15 @@ HONE_RATE_S = 10.0           # at most one re-tune this often
 # from the tuned frequency (full scale 16384 = half the demod rate). Half a second of open squelch
 # measures that to ~100 Hz, which is how the listen lands on the exact channel after a sweep's ±25 kHz.
 AFC_RATE_IN = 16000.0
+# Pager data (POCSAG, FLEX) on an analog FM channel: multimon-ng decodes it from rtl_fm's audio when
+# it is installed (apt install multimon-ng). It runs beside every analog listen; the first page
+# decoded marks the channel as pager data, mutes the audio (it's tone bursts and squeal) and the
+# pages go to the phone as lines instead. Wavelens Lab only; the store app never listens.
+PAGER_RATE = 22050           # multimon-ng wants 22050 Hz s16 mono
+PAGER_CMD = "multimon-ng -t raw -a POCSAG512 -a POCSAG1200 -a POCSAG2400 -a FLEX -e -u -"
+PAGE_RE = re.compile(r"^(POCSAG\d+|FLEX)[:|]\s*(.*)$")
+PAGE_ADDR_RE = re.compile(r"Address:\s*(\d+)|\[(\d+)\]")
+PAGE_MSG_RE = re.compile(r"(?:Alpha|Numeric|ALN|NUM|TON|BIN):\s*(.*)$|(?:ALN|NUM)\s+(.*)$")
 AFC_FRAMES = 12              # 40 ms frames with signal before judging (about half a second)
 AFC_MIN_HZ = 1500            # smaller offsets are the dongle's crystal, not a wrong channel
 
@@ -1337,11 +1347,41 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
     return None
 
 
+def start_pager(gen: int, mhz: float):
+    """multimon-ng on the analog audio; its decoded pages go to the phone as {"t":"page"} lines."""
+    try:
+        pm = subprocess.Popen(shlex.split(PAGER_CMD), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return None
+
+    def reader():
+        for raw in pm.stdout:
+            ln = raw.decode("utf-8", "replace").strip()
+            m = PAGE_RE.match(ln)
+            if not m or LISTEN["gen"] != gen:
+                continue
+            proto, rest = m.group(1), m.group(2)
+            am = PAGE_ADDR_RE.search(rest)
+            mm = PAGE_MSG_RE.search(rest)
+            msg = ((mm.group(1) or mm.group(2)) if mm else rest).strip()
+            if not msg:
+                continue
+            kind = "FLEX" if proto == "FLEX" else "POCSAG"
+            if LISTEN["detected"] != kind:
+                LISTEN["detected"] = kind
+                listen_status(f"{kind} pager data on {mhz:.4f} MHz: pages shown, audio muted")
+            emit({"t": "page", "f": round(mhz, 4), "proto": proto, "addr": (am.group(1) or am.group(2)) if am else "",
+                  "msg": msg[:300], "src": "rtlfm"})
+    threading.Thread(target=reader, daemon=True).start()
+    return pm
+
+
 def serve_listen(req: tuple, gen: int) -> None:
     mhz, mode, sq = req
     dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
     procs = []
     sock = None
+    pager, out_rate, demod_rate = False, LISTEN_RATE, float(AFC_RATE_IN)
     if mode in DIGITAL_MODES:
         flag, chans = DIGITAL_MODES[mode]
         kill_strays()
@@ -1376,7 +1416,14 @@ def serve_listen(req: tuple, gen: int) -> None:
         chans = 1
         ppm = f" -p {LISTEN['ppm']}" if LISTEN["ppm"] else ""
         dc = "" if mode == "fm" else " -E dc"    # FM keeps its DC: it is the AFC reading (removed below)
-        cmd = f"rtl_fm -f {mhz:.4f}M {LISTEN_MODES[mode]} -r {LISTEN_RATE} -l {sq}{dc} -g 40{ppm}{dev} -"
+        # With a pager decoder available, narrow FM is demodulated at its rate and fed to both the
+        # decoder and (resampled) the phone; without it, 16 kHz in and 8 kHz out as before.
+        pager = mode == "fm" and shutil.which("multimon-ng") is not None
+        rate_in = PAGER_RATE if pager else int(AFC_RATE_IN)
+        demod_rate = float(rate_in)
+        demod = f"-M fm -s {rate_in}" if mode == "fm" else LISTEN_MODES[mode]
+        out_rate = rate_in if pager else LISTEN_RATE
+        cmd = f"rtl_fm -f {mhz:.4f}M {demod} -r {out_rate} -l {sq}{dc} -g 40{ppm}{dev} -"
         p = start_tool(cmd, gen, stdout=subprocess.PIPE)
         if p is False:
             listen_stop("rtl_fm missing"); listen_status("rtl_fm not found on the Pi (apt install rtl-sdr)"); return
@@ -1385,12 +1432,19 @@ def serve_listen(req: tuple, gen: int) -> None:
                 listen_stop("no dongle"); listen_status("could not open the RTL-SDR for listening (is it pinned with @SERIAL?)")
             return
         procs.append(p)
+        if pager:
+            pm = start_pager(gen, mhz)
+            if pm is not None:
+                procs.append(pm)
+            else:
+                pager = False
     LISTEN["proc"] = p
     LISTEN["tuned_at"] = LISTEN["last_audio"] = time.time()
     print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})", file=sys.stderr)
     listen_status(f"listening on {mhz:.4f} MHz ({mode.upper()}); the RTL-SDR sweep is paused")
     enc = Ima()
-    need = LISTEN_FRAME * 2
+    in_rate = out_rate if sock is None else LISTEN_RATE
+    need = int(in_rate * LISTEN_FRAME / LISTEN_RATE) * 2      # one 40 ms frame at the input rate
     buf = b""
 
     def watch():                             # squelched, the tools send nothing, so the reads below can't notice
@@ -1445,7 +1499,7 @@ def serve_listen(req: tuple, gen: int) -> None:
         samples = struct.unpack(f"<{n}h", pcm)
         mean = sum(samples) / n
         if max(samples) - min(samples) > 600:            # audio present, not the squelch tail
-            afc.append(mean / 16384.0 * (AFC_RATE_IN / 2))
+            afc.append(mean / 16384.0 * (demod_rate / 2))
             if len(afc) >= AFC_FRAMES:
                 srt = sorted(afc)
                 off_hz = srt[len(srt) // 2]
@@ -1458,6 +1512,22 @@ def serve_listen(req: tuple, gen: int) -> None:
                         listen_resolve(mode, f"carrier {off_hz:+.0f} Hz from the tuned frequency", mhz=target)
                         listen_status(f"retuned to {target:.4f} MHz: the carrier was {off_hz / 1000:+.1f} kHz off")
         m = int(mean)
+        if pager:
+            try:                                         # the decoder gets the full-rate audio, DC removed
+                procs[-1].stdin.write(struct.pack(f"<{n}h", *[max(-32768, min(32767, v - m)) for v in samples]))
+                procs[-1].stdin.flush()
+            except Exception:
+                pass
+        if n != LISTEN_FRAME:                            # 22050 → 8000 for the phone: linear interpolation
+            step = n / LISTEN_FRAME
+            out = []
+            for i in range(LISTEN_FRAME):
+                x = i * step
+                j = int(x)
+                j2 = min(j + 1, n - 1)
+                v = samples[j] + (samples[j2] - samples[j]) * (x - j) - m
+                out.append(max(-32768, min(32767, int(v))))
+            return struct.pack(f"<{LISTEN_FRAME}h", *out)
         return struct.pack(f"<{n}h", *[max(-32768, min(32767, v - m)) for v in samples])
 
     try:
@@ -1472,6 +1542,8 @@ def serve_listen(req: tuple, gen: int) -> None:
                 if sock is None and mode == "fm":
                     pcm = afc_frame(pcm)
                 LISTEN["last_audio"] = time.time()
+                if LISTEN["detected"] in ("POCSAG", "FLEX"):
+                    continue                 # pager data: nothing to hear; the pages go as lines
                 LISTEN["seq"] = (LISTEN["seq"] + 1) & 0xFF
                 try:
                     aout.put_nowait(enc.frame(LISTEN["seq"], pcm))
