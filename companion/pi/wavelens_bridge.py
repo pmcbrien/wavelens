@@ -1025,7 +1025,13 @@ LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "mhz": 0.0, 
           "raw_mhz": 0.0, "tol": 0.05, "readings": [], "honed_at": 0.0,   # the sweep's placing, and later readings
           "until": 0.0, "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0,
           "carrier_at": 0.0, "detected": "",   # auto: when the sweep last saw the tuned carrier; what dsd-fme found
-          "recent": {}, "played": {}}      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
+          "recent": {}, "played": {},      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
+          "lockout": []}                   # MHz the phone told us never to follow (a pager, a busy repeater)
+LOCKOUT_TOL = 0.02                         # a hit within this of a locked-out frequency is the same channel
+
+
+def locked_out(mhz: float) -> bool:
+    return any(abs(mhz - f) <= LOCKOUT_TOL for f in LISTEN["lockout"])
 LISTEN_CV = threading.Condition()
 
 # Follow: a scanner. Every fresh sweep hit in a band where voice is analog and legal to hear gets tuned
@@ -1120,7 +1126,7 @@ def follow_hit(obj: dict) -> None:
     except (ValueError, IndexError):
         mhz = float(obj.get("f") or 0)
     mode = follow_mode(mhz)
-    if mode is None:
+    if mode is None or locked_out(mhz):
         return
     now = time.time()
     LISTEN["recent"][follow_key(mhz)] = (now, mhz, mode, tol)
@@ -1188,7 +1194,8 @@ def listen_status(msg: str) -> None:
     emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"],
           "listen": {"mhz": LISTEN["mhz"] if on else 0, "mode": LISTEN["mode"] if on else "",
                      "asked": LISTEN["asked"] if on else "", "detected": LISTEN["detected"] if on else "",
-                     "sq": LISTEN["sq"], "follow": bool(LISTEN["follow"])} if (on or LISTEN["follow"]) else "off"})
+                     "sq": LISTEN["sq"], "follow": bool(LISTEN["follow"]),
+                     "lockout": LISTEN["lockout"]} if (on or LISTEN["follow"]) else "off"})
 
 
 def listen_stop(why: str = "stopped") -> None:
@@ -1727,6 +1734,19 @@ def run_peripheral(name: str) -> None:
                 LISTEN["follow"] = False
                 listen_stop("stopped")
                 listen_status("listening stopped")
+            elif str(cmd.get("v") or "") == "lockout":
+                # The phone's list of frequencies Follow must never tune (it resends it on every connect).
+                try:
+                    lst = sorted({round(float(f), 4) for f in (cmd.get("mhz") or [])})[:200]
+                except (TypeError, ValueError):
+                    lst = []
+                LISTEN["lockout"] = lst
+                for k in [k for k, (_, m, _, _) in LISTEN["recent"].items() if locked_out(m)]:
+                    del LISTEN["recent"][k]
+                if LISTEN["follow"] and LISTEN["req"] is not None and locked_out(LISTEN["mhz"]):
+                    follow_leave(time.time(), f"{LISTEN['mhz']:.4f} MHz locked out")
+                emit({"t": "status", "msg": f"lockout: {len(lst)} frequencies Follow will skip", "band": state["band"],
+                      "mode": state["mode"], "lockout": lst})
             elif str(cmd.get("v") or "") == "follow":
                 sq = cmd.get("sq")
                 if sq is not None:

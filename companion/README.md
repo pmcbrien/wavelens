@@ -303,6 +303,14 @@ The full step-by-step guide, with every command, is on the website:
   (`git stash` clears it). `unrecognized arguments` in the log means the installed bridge is older than your settings:
   update, then rerun `install-service.sh`.
 
+## A desktop client
+
+`companion/desktop/wavelens_desktop.py` is the same protocol from a Windows, Mac or Linux computer:
+`pip install bleak sounddevice`, run it, and it finds the nearest companion, prints hits, takes
+`listen` / `follow` / `lockout` / `park` / `sq` at a prompt and plays Listen audio through the
+computer's speakers (the IMA ADPCM decoder in it is the reference for the frame format above).
+One central at a time: disconnect the phone first.
+
 ## Pairing
 
 1. Power the companion near the phone. It blinks twice, then advertises the Wavelens
@@ -387,12 +395,15 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // (digital needs dsd-fme — install-dsd.sh). tol: how far the sweep's placing
                                      // may be off (MHz); the bridge snaps to the likeliest channel within it;
 {"c":"listen","v":"follow"}          // scanner: tune every fresh voice-band hit (air AM, VHF/UHF FM, CB), play it
+{"c":"listen","v":"lockout","mhz":[460.6,462.5625]}   // the whole list of MHz Follow never tunes (±20 kHz);
 {"c":"listen","v":"off"}             // until the squelch closes + 3 s or 30 s is up, then the newest waiting one;
                                      // a channel just played waits 60 s before it's returned to. "sq": rtl_fm
                                      // squelch, changeable any time. Renew within 5 min or it stops itself.
 ```
 
-**Listening (SDR bridge, capability `listen`).** The bridge borrows an RTL-SDR — by default the first
+**Listening (SDR bridge, capability `listen`) — Wavelens Lab only.** The Play Store app never sends a
+`listen` command and never subscribes to the audio characteristic; Listen, Follow and digital voice
+exist only in the author's private experimental build (`lab` product flavor, package `.lab`). The bridge borrows an RTL-SDR — by default the first
 `--rtl-power` dongle pinned with `@SERIAL`, or `--listen-device SERIAL` — pauses that sweep, runs
 `rtl_fm` and sends audio on a third characteristic, `…0004` (notify): 8 kHz mono IMA ADPCM in 164-byte
 frames — `seq` (u8), predictor (i16 LE), step index (u8), then 320 samples as 4-bit codes, high nibble
