@@ -1350,9 +1350,10 @@ def serve_listen(req: tuple, gen: int) -> None:
         sock.bind(("127.0.0.1", DSD_UDP_PORT))
         sock.settimeout(0.5)
         time.sleep(0.8)                      # rtl_tcp needs a moment before it accepts a client
-        # rtltcp:host:port:freq:gain:ppm:bw(kHz):squelch:volume — dsd-fme does its own FM demodulation
+        # rtltcp:host:port:freq:gain:ppm:bw(kHz):squelch:volume — dsd-fme does its own FM demodulation.
+        # No -N: that turns the ncurses screen ON, and under systemd there is no terminal to open.
         d = start_tool(f"dsd-fme {flag} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:12:{sq}:2 "
-                       f"-o udp:127.0.0.1:{DSD_UDP_PORT} -N", gen, attempts=4, watch_sync=True)
+                       f"-o udp:127.0.0.1:{DSD_UDP_PORT}", gen, attempts=4, watch_sync=True)
         if d is False or d is None:
             stop_tools(procs)
             sock.close()
