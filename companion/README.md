@@ -193,6 +193,10 @@ SiriusXM) and airport / weather radar. **Skipped:** 2.4 GHz and 5 GHz Wi-Fi and 
 GPS L2 and long-range air-traffic radar (1215–1240, 1300–1390 MHz), and the radio-astronomy band
 (1400–1427 MHz). Anything else is reported as "*NNN.N* MHz carrier".
 
+**Broadband bursts.** When six or more unrelated bands rise within 2.5 s (the HackRF overloading
+because a phone or the Pi's own Wi-Fi is transmitting right beside it), the whole burst is dropped and
+the phone gets one status line, at most once a minute. Reports are held 2.5 s to judge this.
+
 **Steady vs burst.** In 902–928 and 5850–5925 MHz the same band means two things, so the bridge
 waits: a carrier still over the floor on three passes in a row gets the steady label (toll reader,
 FPV video); one that comes and goes gets the burst label (LoRa, V2X), reported when it drops.

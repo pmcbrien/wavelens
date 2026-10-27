@@ -471,8 +471,12 @@ class Sweep:
         self.last[key] = now
         if b is not None:
             x.setdefault("band", f"{b['lo']:g}–{b['hi']:g} MHz")
-        emit({"t": "rf", "id": ident, "n": name, "f": int(round(mhz)), "r": int(round(db)),
-              "cat": cat, "conf": conf, "src": self.src, "x": x})
+        line = {"t": "rf", "id": ident, "n": name, "f": int(round(mhz)), "r": int(round(db)),
+                "cat": cat, "conf": conf, "src": self.src, "x": x}
+        if b is not None and b["kind"] == "bg":
+            emit(line)
+        else:
+            storm_gate(self.src).push(now, b["key"] if b is not None else str(ident), line)
 
     def gps_row(self, lo: float, step: float, n: int, hot: list, now: float, label: str = "GPS band (L1)") -> None:
         """Possible GPS jammer only when a wide part of this row is raised (at least a quarter of its
@@ -501,6 +505,63 @@ class Sweep:
                   "gps": ("satellites are far below the noise floor, so a wide signal this strong is local — "
                           "usually a jammer, sometimes a GPS repeater. Check whether the phone's location "
                           "is drifting or dropping out.")}})
+
+
+# ---------------------------------------------------------------- broadband bursts
+#
+# An SDR with no front-end filter (the HackRF especially) overloads when a strong transmitter is
+# right beside it, usually the phone or the Pi's own Wi-Fi. For that moment, false carriers appear
+# across the whole spectrum at once, at about the same level: "military radar", "satellite C-band",
+# "flight-test telemetry" in a living room. Real signals rise one or two bands at a time. So sweep
+# reports are held for STORM_HOLD_S, and when STORM_BANDS or more unrelated bands rose within that
+# window, the whole batch is dropped and the phone gets one status line instead.
+STORM_HOLD_S = 2.5
+STORM_BANDS = 6
+STORM_NOTE_S = 60.0
+
+
+class StormGate:
+    def __init__(self, src: str):
+        self.src, self.q, self.lock, self.noted = src, deque(), threading.Lock(), 0.0
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def push(self, now: float, band: str, line: dict) -> None:
+        with self.lock:
+            self.q.append((now, band, line))
+
+    def _loop(self) -> None:
+        while True:
+            time.sleep(0.25)
+            now = time.time()
+            with self.lock:
+                if not self.q or now - self.q[0][0] < STORM_HOLD_S:
+                    continue
+                t0 = self.q[0][0]
+                batch = []
+                while self.q and self.q[0][0] <= t0 + STORM_HOLD_S:
+                    batch.append(self.q.popleft())
+            bands = {band for _, band, _ in batch}
+            if len(bands) >= STORM_BANDS:
+                if now - self.noted > STORM_NOTE_S:
+                    self.noted = now
+                    msg = (f"{self.src}: ignored a broadband burst ({len(bands)} unrelated bands rose together). "
+                           "That's the receiver overloading, usually a phone or Wi-Fi transmitter right next "
+                           "to the antenna. Move it away or lower the gain.")
+                    print("bridge: " + msg, file=sys.stderr)
+                    emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
+                continue
+            for _, _, line in batch:
+                emit(line)
+
+
+_storm_gates: "dict[str, StormGate]" = {}
+
+
+def storm_gate(src: str) -> StormGate:
+    g = _storm_gates.get(src)
+    if g is None:
+        g = _storm_gates[src] = StormGate(src)
+    return g
 
 
 def spawn(cmd: str):
@@ -553,14 +614,14 @@ def feed_process(cmd: str, handler) -> None:
         time.sleep(2)
 
 
-def feed_hackrf(range_mhz: str, bin_hz: int) -> None:
+def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20) -> None:
     """hackrf_sweep over range_mhz, or over the parked slice while the phone has asked to park.
     A park change stops the running sweep and starts the other one."""
     sw = Sweep("hackrf")
     while True:
         park = state.get("park", "off")
         rng = PARK_RANGES.get(park, range_mhz)
-        cmd = f"hackrf_sweep -f {rng} -w {bin_hz} -l 32 -g 20"
+        cmd = f"hackrf_sweep -f {rng} -w {bin_hz} -l {lna} -g {vga}"
         p = spawn(cmd)
         if p is None:
             return
@@ -921,6 +982,8 @@ def main() -> None:
     ap.add_argument("--hackrf-sweep", action="store_true", help="run hackrf_sweep and report carriers by band")
     ap.add_argument("--hackrf-range", default="1:6000", help="MHz range for hackrf_sweep (default 1:6000, the whole range)")
     ap.add_argument("--hackrf-bin", type=int, default=500000, help="bin width Hz (default 500000)")
+    ap.add_argument("--hackrf-lna", type=int, default=32, help="HackRF LNA gain 0-40 dB in 8 dB steps (default 32); lower it if nearby transmitters overload the sweep")
+    ap.add_argument("--hackrf-vga", type=int, default=20, help="HackRF baseband gain 0-62 dB in 2 dB steps (default 20)")
     ap.add_argument("--hackrf-park-range", metavar="LO:HI", default="",
                     help="MHz slice the HackRF parks on when the phone asks (default 796:816, public-safety radios)")
     ap.add_argument("--rtl-power", metavar="SPEC", action="append", default=[],
@@ -953,7 +1016,7 @@ def main() -> None:
         HACKRF_ON = True
         CAPS.append("sweep")
         CAPS.append("park")
-        threading.Thread(target=feed_hackrf, args=(a.hackrf_range, a.hackrf_bin), daemon=True).start()
+        threading.Thread(target=feed_hackrf, args=(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga), daemon=True).start()
     if a.rtl_power:
         CAPS.append("sweep")
         for dev, specs in group_sweeps(a.rtl_power, a.rtl_power_device).items():
