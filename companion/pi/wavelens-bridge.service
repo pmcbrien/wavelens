@@ -1,4 +1,7 @@
 [Unit]
+# Never give up: a dongle that dropped off USB comes back when it's replugged, and the bridge
+# must be retrying (every 5 s) when it does. Without this systemd stops after 5 fast failures.
+StartLimitIntervalSec=0
 Description=Wavelens companion bridge (receive-only radios -> Wavelens app over BLE)
 # Wants, not Requires: run-bridge.sh restarts bluetooth itself after a failed advert, and with
 # Requires that restart would stop this service too.

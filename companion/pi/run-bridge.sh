@@ -37,7 +37,10 @@ if [ -n "${WAVELENS_RTL433:-}" ]; then
     # The bridge is the main process and reads rtl_433 through process substitution, so if the
     # bridge exits the service exits (systemd then stops rtl_433 too), and if rtl_433 exits the
     # bridge sees end-of-input and exits. Either way systemd restarts both together.
-    exec python3 -u $BRIDGE --rtl433 ${WAVELENS_ARGS:-} < <(exec rtl_433 -F json $WAVELENS_RTL433)
+    # -F log: without it rtl_433 hides its errors ("can't open device", "usb_claim_interface"), so a
+    # dongle that has dropped off the bus looked like "stopped sending" with no reason in the journal.
+    # Log lines go to stderr (the journal); JSON stays on stdout for the bridge.
+    exec python3 -u $BRIDGE --rtl433 ${WAVELENS_ARGS:-} < <(exec rtl_433 -F log -F json $WAVELENS_RTL433)
 else
     exec python3 -u $BRIDGE ${WAVELENS_ARGS:-}
 fi
