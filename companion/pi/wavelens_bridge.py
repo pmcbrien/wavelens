@@ -1161,8 +1161,14 @@ DIGITAL_MODES = {"dmr": ("-fs", 2), "p25": ("-f1", 1), "nxdn": ("-fi", 1), "dsta
                  # its trunking preset (P25p1 + p2 + DMR, C4FM); "trunkq" adds -mq for QPSK/LSM simulcast sites.
                  # Encrypted calls are never tuned (dsd-fme's default). Lab only; the app sends it from the
                  # Companion screen's "Trunked systems" section.
-                 "trunk": ("-ft -T", 2), "trunkq": ("-ft -T -mq", 2)}
-TRUNK_MODES = ("trunk", "trunkq")
+                 "trunk": ("-ft -T", 2), "trunkq": ("-ft -T -mq", 2),
+                 # EDACS (analog voice on a 9600-baud control channel) and DMR Cap+/Con+/Tier III need a channel map:
+                 # built from the RadioReference site's frequencies, LCN/LSN in ascending-frequency order (the usual
+                 # convention; dsd-fme shows in its log whether calls follow). Motorola Type II / SmartNet and LTR
+                 # are not decodable by dsd-fme at all.
+                 "trunke": ("-fE -T", 1), "trunkd": ("-fs -T", 2)}
+TRUNK_MODES = ("trunk", "trunkq", "trunke", "trunkd")
+ENC_RE = re.compile(r"\b(ENC|Encrypted|ALG(?:ID)?\s*[:=]?\s*(?:0x)?[0-9A-Fa-f]+)\b", re.I)
 CALL_RE = re.compile(r"\bTG[:= ]\s*(\d+)")
 SRC_RE = re.compile(r"\bSRC[:= ]\s*(\d+)")
 # Mode "auto": start in dsd-fme's auto-detect; it says on stderr what sync it finds ("Sync: +P25p1"), which
@@ -1340,7 +1346,7 @@ def follow_key(mhz: float) -> int:
 # stops transmitting; the sweep sees it on every pass while voice channels come and go. Every hit on a
 # RadioReference "TRS" row is counted here per site; asked to follow a system, the bridge tries the
 # site's most constant frequency first and the next if dsd-fme finds no control-channel sync.
-TRUNK = {"auto": False, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc_at": 0.0}
+TRUNK = {"auto": False, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc_at": 0.0, "map": ""}
 TRUNK_SEEN_S = 180.0        # a site frequency counts as a candidate for this long after its last hit
 TRUNK_CC_WAIT_S = 12.0      # dsd-fme must show a sync on a candidate within this, else the next is tried
 TRUNK_IDLE_S = 240.0        # Follow leaves a trunked system after this long without a call
@@ -1374,7 +1380,7 @@ def trunk_note(obj: dict) -> None:
 def trunk_candidates(site=None):
     """Site frequencies seen lately, most constant (then strongest) first; site=None → the busiest site."""
     now = time.time()
-    seen = {m: v for m, v in TRUNK["seen"].items() if now - v[1] <= TRUNK_SEEN_S and v[3][2] in ("project 25", "dmr", "nxdn")}
+    seen = {m: v for m, v in TRUNK["seen"].items() if now - v[1] <= TRUNK_SEEN_S and v[3][2] in ("project 25", "dmr", "nxdn", "edacs")}
     if not seen:
         return None, []
     if site is None:
@@ -1392,11 +1398,38 @@ def trunk_start(site=None, qpsk=None) -> bool:
     if not cands:
         return False
     qpsk = TRUNK["qpsk"] if qpsk is None else qpsk
-    mode = "trunkq" if (qpsk or site[2] == "project 25") else "trunk"   # P25 county systems are simulcast: QPSK
+    kind = site[2]
+    if kind == "edacs":
+        mode = "trunke"
+    elif kind == "dmr":
+        mode = "trunkd"
+    else:
+        mode = "trunkq" if (qpsk or kind == "project 25") else "trunk"   # P25 county systems are simulcast: QPSK
+    TRUNK["map"] = write_trunk_map(site) if mode in ("trunke", "trunkd") else ""
     TRUNK["site"], TRUNK["tries"], TRUNK["cc_at"] = site, cands[1:5], time.time()
     listen_status(f"trunked: trying {cands[0]:.4f} MHz as the control channel of {site[0]} ({site[1]})")
     listen_start(cands[0], mode, LISTEN["sq"], 0.0)
     return True
+
+
+def write_trunk_map(site) -> str:
+    """dsd-fme channel map for a site: 'lcn,hz' per line, LCN/LSN by ascending frequency (the common
+    convention; not guaranteed). All of the site's frequencies the overlay lists, not just those heard."""
+    if not RR:
+        return ""
+    freqs = sorted({f for f, side, r in RR.rows if side == "output" and (r.get("Tag") or "").upper() == "TRS"
+                    and (r.get("Agency/Category") or "?") == site[0] and (r.get("Description") or "?") == site[1]})
+    if not freqs:
+        return ""
+    path = "/tmp/wavelens-trunk-map.csv"
+    try:
+        with open(path, "w") as f:
+            for i, mhz in enumerate(freqs, 1):
+                f.write(f"{i},{int(round(mhz * 1e6))}\n")
+    except OSError:
+        return ""
+    print(f"bridge: trunk map for {site[0]} ({site[1]}): {len(freqs)} channels, LCN by ascending frequency", file=sys.stderr)
+    return path
 
 
 def trunk_next(why: str) -> None:
@@ -1661,7 +1694,11 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                     m = CALL_RE.search(ln)
                     if m:
                         src = SRC_RE.search(ln)
-                        proc.call = f"TG {m.group(1)}" + (f" from {src.group(1)}" if src else "")
+                        enc = ENC_RE.search(ln)
+                        tok = enc.group(1).strip() if enc else ""
+                        clear = bool(re.search(r"(?i)alg(?:id)?\s*[:=]?\s*(?:0x80|0x0|0|128)$", tok))   # P25 ALGID 0x80 = clear
+                        proc.call = (f"TG {m.group(1)}" + (f" from {src.group(1)}" if src else "")
+                                     + (f" · encrypted ({tok})" if tok and not clear else ""))
                         proc.call_at = time.time()
         threading.Thread(target=drain, daemon=True).start()
         time.sleep(0.5)
@@ -1731,7 +1768,8 @@ def _serve_listen(req: tuple, gen: int) -> None:
         # rtltcp:host:port:freq:gain:ppm:bw(kHz):squelch:volume — dsd-fme does its own FM demodulation.
         # No -N: that turns the ncurses screen ON, and under systemd there is no terminal to open.
         bw = 24 if mode in TRUNK_MODES else 12
-        d = start_tool(f"dsd-fme {flag} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:{bw}:{sq}:2 "
+        cmap = f" -C {shlex.quote(TRUNK['map'])}" if mode in ("trunke", "trunkd") and TRUNK.get("map") else ""
+        d = start_tool(f"dsd-fme {flag}{cmap} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:{bw}:{sq}:2 "
                        f"-o udp:127.0.0.1:{DSD_UDP_PORT}", gen, attempts=4, watch_sync=True)
         if d is False or d is None:
             stop_tools(procs)

@@ -442,7 +442,10 @@ the RadioReference overlay knows: the bridge counts every sweep hit on a system'
 tries the one that never stops (an always-on carrier) as the control channel, then the next if dsd-fme
 shows no sync within 12 s. `"mhz"` names a control channel instead. `{"c":"listen","v":"trunkauto",
 "on":true}` lets Follow take trunked systems on its own when the sweep hears one (it stays until four
-minutes pass without a call). With a control channel, the command treats `mhz` as one: `dsd-fme -ft -T` decodes the grants and retunes
+minutes pass without a call). EDACS and DMR Cap+/Con+/Tier III sites get a channel map written from the
+overlay's site frequencies (LCN by ascending frequency — the usual convention, not a guarantee). Encrypted
+calls are never tuned, but their grants are reported: `call` reads "TG 1234 from 5678 · encrypted (ALGID 0xAA)".
+Motorola Type II / SmartNet and LTR cannot be decoded by dsd-fme. With a control channel, the command treats `mhz` as one: `dsd-fme -ft -T` decodes the grants and retunes
 the dongle (through rtl_tcp) to each voice channel and back — P25 phase 1/2, DMR Tier III / Cap+ /
 Con+. No snapping or honing; status carries `call` ("TG 1234 from 5678") while a call is followed.
 Encrypted calls are never tuned (dsd-fme's default). Unencrypted public-safety trunked traffic is
