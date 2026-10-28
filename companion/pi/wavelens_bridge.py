@@ -970,6 +970,8 @@ def reap(p, cmd: str, planned: bool = False) -> None:
     p.wait()
     if planned and p.returncode == 0:
         return
+    if p.returncode == -15:
+        return                                  # we stopped it (a listen took the dongle): not a failure
     if time.time() - p.started_at < 10:
         time.sleep(0.2)                         # let the drain thread catch the last lines
         why = " | ".join(p.err_tail) or "no message"
@@ -1323,6 +1325,9 @@ def follow_hit(obj: dict) -> None:
     mode = follow_mode(mhz)
     if mode is None or locked_out(mhz):
         return
+    known = str(x.get("listen") or "")      # the RadioReference overlay's mode for this channel
+    if known in ("fm", "am", "dmr", "p25", "nxdn"):
+        mode = known                         # no 8 s probe: tune it as what it is
     now = time.time()
     LISTEN["recent"][follow_key(mhz)] = (now, mhz, mode, tol)
     if LISTEN["req"] is not None:
@@ -1375,7 +1380,11 @@ def follow_watch() -> None:
         if now - LISTEN["chan_at"] >= FOLLOW_MAX_S:
             follow_leave(now, f"{FOLLOW_MAX_S:.0f} s on {LISTEN['mhz']:.4f} MHz is enough")
         elif not follow_busy(now):
-            follow_next(now)                 # it went quiet: take the newest waiting signal, if any
+            # It went quiet: take the newest waiting signal, if any. The channel just left gets the same
+            # cooldown as one that used its 30 s, or two dead carriers would be tuned turn and turn about.
+            if LISTEN["req"] is not None and LISTEN["recent"] and any(k != follow_key(LISTEN["mhz"]) and k not in LISTEN["played"] for k in LISTEN["recent"]):
+                LISTEN["played"][follow_key(LISTEN["mhz"])] = now
+            follow_next(now)
 
 
 def listen_busy(dev: str) -> bool:
@@ -1528,7 +1537,7 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                 proc.err_tail.append(ln)
                 if kw.get("watch_sync"):
                     m = SYNC_RE.search(ln)
-                    if m:
+                    if m and m.group(1).lower() not in ("no", "none", "lost"):
                         proc.sync, proc.sync_at = m.group(1), time.time()
                     m = CALL_RE.search(ln)
                     if m:
