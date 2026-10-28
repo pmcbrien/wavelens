@@ -66,6 +66,7 @@ def emit(obj: dict) -> None:
     except Exception:
         pass  # full: drop, the next packet will come
     if obj.get("t") == "rf" and obj.get("src") in ("hackrf", "rtlpower"):
+        trunk_note(obj)
         if LISTEN.get("req") is not None:
             try:
                 r = float(str((obj.get("x") or {}).get("exact_mhz", "")).split()[0])
@@ -1235,7 +1236,7 @@ LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "mhz": 0.0, 
           "until": 0.0, "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0,
           "chan_at": 0.0,                   # when this channel was first asked for (tuned_at restarts on AUTO → FM)
           "carrier_at": 0.0, "detected": "",   # auto: when the sweep last saw the tuned carrier; what dsd-fme found
-          "call": "",                       # trunk: the talkgroup dsd-fme is following right now
+          "call": "", "call_at": 0.0,       # trunk: the talkgroup dsd-fme is following right now, and when it started
           "starting": False,                # the worker is bringing the tools up (dongle spoken for, proc not yet set)
           "recent": {}, "played": {},      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
           "lockout": []}                   # MHz the phone told us never to follow (a pager, a busy repeater)
@@ -1335,8 +1336,91 @@ def follow_key(mhz: float) -> int:
     return int(round(mhz / 0.0125))         # one channel = one 12.5 kHz slot
 
 
+# Automatic trunk following (Lab). A trunked system's control channel is the site frequency that never
+# stops transmitting; the sweep sees it on every pass while voice channels come and go. Every hit on a
+# RadioReference "TRS" row is counted here per site; asked to follow a system, the bridge tries the
+# site's most constant frequency first and the next if dsd-fme finds no control-channel sync.
+TRUNK = {"auto": False, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc_at": 0.0}
+TRUNK_SEEN_S = 180.0        # a site frequency counts as a candidate for this long after its last hit
+TRUNK_CC_WAIT_S = 12.0      # dsd-fme must show a sync on a candidate within this, else the next is tried
+TRUNK_IDLE_S = 240.0        # Follow leaves a trunked system after this long without a call
+
+
+def trunk_note(obj: dict) -> None:
+    x = obj.get("x") or {}
+    if "trunked_site" not in x:
+        return
+    try:
+        mhz = round(float(str(x.get("exact_mhz", "")).split()[0]), 4)
+    except (ValueError, IndexError):
+        return
+    try:
+        lic = float(x.get("lic_mhz") or 0)
+    except ValueError:
+        lic = 0.0
+    if lic:
+        mhz = round(lic, 5)
+    site = (x.get("rr_agency") or "?", x.get("rr_description") or "?", (x.get("rr_mode") or "").lower())
+    n, _, _, _ = TRUNK["seen"].get(mhz, (0, 0.0, -200, site))
+    try:
+        lvl = int(obj.get("r") or -200)
+    except (TypeError, ValueError):
+        lvl = -200
+    # An always-on carrier (the sweep reports those once a minute) is the control channel's signature:
+    # it outweighs the once-per-pass reports of voice channels that come and go.
+    TRUNK["seen"][mhz] = (n + (12 if "always_on" in x else 1), time.time(), lvl, site)
+
+
+def trunk_candidates(site=None):
+    """Site frequencies seen lately, most constant (then strongest) first; site=None → the busiest site."""
+    now = time.time()
+    seen = {m: v for m, v in TRUNK["seen"].items() if now - v[1] <= TRUNK_SEEN_S and v[3][2] in ("project 25", "dmr", "nxdn")}
+    if not seen:
+        return None, []
+    if site is None:
+        by_site = {}
+        for m, (n, _, _, st) in seen.items():
+            by_site[st] = by_site.get(st, 0) + n
+        site = max(by_site, key=by_site.get)
+    cands = sorted((m for m, v in seen.items() if v[3] == site), key=lambda m: (-seen[m][0], -seen[m][2]))
+    return site, cands
+
+
+def trunk_start(site=None, qpsk=None) -> bool:
+    """Follow a trunked system from its control channel, found from the sweep. False when nothing is known."""
+    site, cands = trunk_candidates(site)
+    if not cands:
+        return False
+    qpsk = TRUNK["qpsk"] if qpsk is None else qpsk
+    mode = "trunkq" if (qpsk or site[2] == "project 25") else "trunk"   # P25 county systems are simulcast: QPSK
+    TRUNK["site"], TRUNK["tries"], TRUNK["cc_at"] = site, cands[1:5], time.time()
+    listen_status(f"trunked: trying {cands[0]:.4f} MHz as the control channel of {site[0]} ({site[1]})")
+    listen_start(cands[0], mode, LISTEN["sq"], 0.0)
+    return True
+
+
+def trunk_next(why: str) -> None:
+    """The candidate showed no control channel: the next one, or give up."""
+    if TRUNK["tries"]:
+        nxt = TRUNK["tries"].pop(0)
+        TRUNK["cc_at"] = time.time()
+        site = TRUNK["site"] or ("?", "?", "")
+        listen_status(f"trunked: {why}; trying {nxt:.4f} MHz for {site[0]}")
+        listen_start(nxt, LISTEN["mode"], LISTEN["sq"], 0.0)
+    else:
+        listen_stop("no control channel found")
+        listen_status("trunked: no control channel found among the site frequencies seen; type one on the Companion screen")
+
+
 def follow_hit(obj: dict) -> None:
     x = obj.get("x") or {}
+    if "trunked_site" in x:
+        # A trunked site's channel is not voice to play; with automatic trunking on, the system is followed instead.
+        if TRUNK["auto"] and (LISTEN["req"] is None or LISTEN["mode"] not in TRUNK_MODES):
+            site = (x.get("rr_agency") or "?", x.get("rr_description") or "?", (x.get("rr_mode") or "").lower())
+            if LISTEN["req"] is None or not follow_busy(time.time()):
+                trunk_start(site)
+        return
     if "always_on" in x or "background" in x:
         return
     tol = 0.05
@@ -1407,6 +1491,10 @@ def follow_watch() -> None:
             listen_status("follow ended")
             continue
         if LISTEN["proc"] is None:
+            continue
+        if LISTEN["mode"] in TRUNK_MODES:
+            if now - max(LISTEN["chan_at"], LISTEN.get("call_at", 0.0)) >= TRUNK_IDLE_S:
+                follow_leave(now, f"no call on the trunked system for {TRUNK_IDLE_S / 60:.0f} min")
             continue
         if now - LISTEN["chan_at"] >= FOLLOW_MAX_S:
             follow_leave(now, f"{FOLLOW_MAX_S:.0f} s on {LISTEN['mhz']:.4f} MHz is enough")
@@ -1706,7 +1794,12 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 if call and now - p.call_at < 8.0:
                     if LISTEN["call"] != call:
                         LISTEN["call"] = call
+                        LISTEN["call_at"] = now
                         listen_status(f"trunked call: {call}")
+                if not LISTEN["detected"] and not call and now - LISTEN["tuned_at"] >= TRUNK_CC_WAIT_S and TRUNK["cc_at"]:
+                    TRUNK["cc_at"] = 0.0         # once per candidate
+                    trunk_next(f"no control channel on {mhz:.4f} MHz")
+                    break
                 elif LISTEN["call"]:
                     LISTEN["call"] = ""
                     listen_status(f"on the control channel {mhz:.4f} MHz, waiting for a call")
@@ -2098,6 +2191,21 @@ def run_peripheral(name: str) -> None:
                     follow_leave(time.time(), f"{LISTEN['mhz']:.4f} MHz locked out")
                 emit({"t": "status", "msg": f"lockout: {len(lst)} frequencies Follow will skip", "band": state["band"],
                       "mode": state["mode"], "lockout": lst})
+            elif str(cmd.get("v") or "") == "trunkauto":
+                TRUNK["auto"] = bool(cmd.get("on", True))
+                TRUNK["qpsk"] = bool(cmd.get("qpsk", TRUNK["qpsk"]))
+                listen_status("trunked systems: Follow takes them automatically" if TRUNK["auto"] else "trunked systems: manual only")
+            elif str(cmd.get("v") or "") == "trunk":
+                TRUNK["qpsk"] = bool(cmd.get("qpsk", TRUNK["qpsk"]))
+                try:
+                    mhz = float(cmd.get("mhz") or 0)
+                except (TypeError, ValueError):
+                    mhz = 0.0
+                if mhz and 24.0 <= mhz <= 1766.0:
+                    TRUNK["tries"], TRUNK["cc_at"] = [], 0.0
+                    listen_start(mhz, "trunkq" if TRUNK["qpsk"] else "trunk", LISTEN["sq"], 0.0)
+                elif not trunk_start(None):
+                    listen_status("trunked: no trunked-system site seen by the sweep yet (needs the RadioReference overlay); type a control channel")
             elif str(cmd.get("v") or "") == "follow":
                 sq = cmd.get("sq")
                 if sq is not None:

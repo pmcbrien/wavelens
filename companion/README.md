@@ -437,8 +437,12 @@ from the Tag column so the agency-type alerts work from it; `listen` says how to
 DMR, P25, NXDN) and the app's Listen uses it; trunked-site rows say so. Preferred over the FCC pack
 where it has the frequency. Several exports layer: give them most local first (county, statewide, nationwide); a statewide export's County column ranks the `--rr-county` counties and "Statewide" rows ahead of other counties'. The exports are the user's own files on the Pi; nothing from them is shipped.
 
-**Trunked systems (Lab).** `{"c":"listen","mhz":857.0375,"mode":"trunk"}` (or `"trunkq"` for QPSK/LSM
-simulcast sites) treats `mhz` as a control channel: `dsd-fme -ft -T` decodes the grants and retunes
+**Trunked systems (Lab).** `{"c":"listen","v":"trunk","qpsk":true}` follows the nearest trunked system
+the RadioReference overlay knows: the bridge counts every sweep hit on a system's site frequencies and
+tries the one that never stops (an always-on carrier) as the control channel, then the next if dsd-fme
+shows no sync within 12 s. `"mhz"` names a control channel instead. `{"c":"listen","v":"trunkauto",
+"on":true}` lets Follow take trunked systems on its own when the sweep hears one (it stays until four
+minutes pass without a call). With a control channel, the command treats `mhz` as one: `dsd-fme -ft -T` decodes the grants and retunes
 the dongle (through rtl_tcp) to each voice channel and back — P25 phase 1/2, DMR Tier III / Cap+ /
 Con+. No snapping or honing; status carries `call` ("TG 1234 from 5678") while a call is followed.
 Encrypted calls are never tuned (dsd-fme's default). Unencrypted public-safety trunked traffic is
