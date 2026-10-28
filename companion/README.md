@@ -396,8 +396,9 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // may be off (MHz); the bridge snaps to the likeliest channel within it;
 {"c":"listen","v":"follow"}          // scanner: tune every fresh voice-band hit (air AM, VHF/UHF FM, CB), play it
 {"c":"listen","v":"lockout","mhz":[460.6,462.5625]}   // the whole list of MHz Follow never tunes (±20 kHz);
-{"c":"listen","v":"off"}             // until the squelch closes + 3 s or 30 s is up, then the newest waiting one;
-                                     // a channel just played waits 60 s before it's returned to. "sq": rtl_fm
+{"c":"listen","v":"off"}             // until the squelch closes + 3 s or 30 s is up, then the newest waiting one
+                                     // (an AUTO probe gets its 8 s undisturbed); a channel just played waits 60 s
+                                     // before it's returned to. "sq": rtl_fm
                                      // squelch, changeable any time. Renew within 5 min or it stops itself.
 ```
 

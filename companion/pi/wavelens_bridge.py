@@ -983,7 +983,7 @@ CHANNEL_PLANS = [
     (420.0, 450.0, [(25, 0, 0), (12.5, 0, 1), (5, 0, 2)]),      # 70 cm: 25 kHz repeaters, 5 kHz raster
     (462.5375, 462.7375, [(12.5, 0, 0)]),                       # FRS/GMRS: 462.5500 … 462.7250 on 12.5 kHz
     (467.5375, 467.7375, [(12.5, 0, 0)]),
-    (450.0, 470.0, [(12.5, 0, 0), (6.25, 0, 1), (2.5, 0, 2)]),  # UHF land mobile
+    (450.0, 470.0, [(25, 0, 0), (12.5, 0, 1), (6.25, 0, 2), (2.5, 0, 3)]),  # UHF land mobile: 25 kHz primaries, then interstitials
     (806.0, 824.0, [(12.5, 0, 0), (6.25, 0, 1)]),
     (851.0, 869.0, [(12.5, 0, 0), (6.25, 0, 1)]),
     (896.0, 902.0, [(12.5, 0, 0)]), (935.0, 941.0, [(12.5, 0, 0)]),
@@ -1034,6 +1034,7 @@ RTL_TCP_PORT = 23471
 LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "mhz": 0.0, "mode": "", "asked": "", "sq": 0,
           "raw_mhz": 0.0, "tol": 0.05, "readings": [], "honed_at": 0.0,   # the sweep's placing, and later readings
           "until": 0.0, "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0,
+          "chan_at": 0.0,                   # when this channel was first asked for (tuned_at restarts on AUTO → FM)
           "carrier_at": 0.0, "detected": "",   # auto: when the sweep last saw the tuned carrier; what dsd-fme found
           "recent": {}, "played": {},      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
           "lockout": []}                   # MHz the phone told us never to follow (a pager, a busy repeater)
@@ -1052,8 +1053,17 @@ FOLLOW_BANDS = [(26.96, 27.41, "am"), (29.6, 54.0, "auto"), (118.0, 137.0, "am")
 FOLLOW_HANG_S = 3.0
 FOLLOW_MIN_S = 4.0          # once tuned, give the squelch this long to open before another hit can take over
 FOLLOW_MAX_S = 30.0         # a channel gets at most this long, then the next waiting signal takes the dongle
+FOLLOW_PROBE_S = AUTO_NO_CARRIER_WAIT_S + 3.0   # AUTO still deciding (no audio flows while dsd-fme probes): not "quiet"
 FOLLOW_COOLDOWN_S = 60.0    # a channel just played isn't returned to for this long (a busy repeater would hog it)
 FOLLOW_RECENT_S = 60.0      # a hit older than this is no longer a candidate
+
+
+def follow_busy(now: float) -> bool:
+    """The current channel keeps the dongle: still tuning, still being probed for a digital sync, just
+    tuned, or audio in the last few seconds."""
+    if LISTEN["proc"] is None or now - LISTEN["tuned_at"] < FOLLOW_MIN_S or now - LISTEN["last_audio"] < FOLLOW_HANG_S:
+        return True
+    return LISTEN["mode"] == "auto" and now - LISTEN["chan_at"] < FOLLOW_PROBE_S
 
 
 def follow_mode(mhz: float):
@@ -1144,8 +1154,8 @@ def follow_hit(obj: dict) -> None:
         if abs(LISTEN["mhz"] - mhz) < 0.02:
             LISTEN["until"] = now + LISTEN_MAX_S
             return                           # already on it
-        if LISTEN["proc"] is None or now - LISTEN["tuned_at"] < FOLLOW_MIN_S or now - LISTEN["last_audio"] < FOLLOW_HANG_S:
-            return                           # still tuning, or busy with a live one: it's queued in "recent"
+        if follow_busy(now):
+            return                           # still tuning or probing, or busy with a live one: it's queued in "recent"
     follow_next(now)
 
 
@@ -1187,9 +1197,9 @@ def follow_watch() -> None:
             continue
         if LISTEN["proc"] is None:
             continue
-        if now - LISTEN["tuned_at"] >= FOLLOW_MAX_S:
+        if now - LISTEN["chan_at"] >= FOLLOW_MAX_S:
             follow_leave(now, f"{FOLLOW_MAX_S:.0f} s on {LISTEN['mhz']:.4f} MHz is enough")
-        elif now - LISTEN["tuned_at"] >= FOLLOW_MIN_S and now - LISTEN["last_audio"] >= FOLLOW_HANG_S:
+        elif not follow_busy(now):
             follow_next(now)                 # it went quiet: take the newest waiting signal, if any
 
 
@@ -1239,6 +1249,7 @@ def listen_start(mhz: float, mode: str, sq: int, tol: float = 0.05) -> None:
         LISTEN["mhz"], LISTEN["mode"], LISTEN["asked"], LISTEN["sq"] = mhz, mode, mode, sq
         LISTEN["raw_mhz"], LISTEN["tol"], LISTEN["readings"], LISTEN["honed_at"] = raw, tol, [raw], 0.0
         LISTEN["carrier_at"], LISTEN["detected"] = 0.0, ""
+        LISTEN["chan_at"] = time.time()
         LISTEN["gen"] += 1
         LISTEN_CV.notify()
     if abs(mhz - raw) >= 0.0005:
