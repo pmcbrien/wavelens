@@ -1770,7 +1770,9 @@ def _serve_listen(req: tuple, gen: int) -> None:
         # No -N: that turns the ncurses screen ON, and under systemd there is no terminal to open.
         bw = 24 if mode in TRUNK_MODES else 12
         cmap = f" -C {shlex.quote(TRUNK['map'])}" if mode in ("trunke", "trunkd") and TRUNK.get("map") else ""
-        d = start_tool(f"dsd-fme {flag}{cmap} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:{bw}:{sq}:2 "
+        # Squelch 0 for dsd-fme: its "sq" is an RMS threshold in its own scale, not rtl_fm's, and a digital
+        # decode gates itself on frame sync anyway — a high value here silences voice that is decoding fine.
+        d = start_tool(f"dsd-fme {flag}{cmap} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:{bw}:0:2 "
                        f"-o udp:127.0.0.1:{DSD_UDP_PORT}", gen, attempts=4, watch_sync=True)
         if d is False or d is None:
             stop_tools(procs)
