@@ -88,6 +88,32 @@ def hello() -> None:
 
 # ---------------------------------------------------------------- RadioReference overlay (Lab)
 
+# Agency names as the people who use them say them: "Hillsborough County Sheriff's Office" → HCSO,
+# "Largo Police Department" → LPD, "Clearwater Fire Rescue" → CFR. Initials of the place words
+# plus the office's usual suffix; applied to headline names only, the full text stays in the extras.
+_PLACE = r"\b([A-Za-z][\w.&'-]*(?: [A-Za-z][\w.&'-]*){0,3}?)"
+_ABBR = [   # FCC licensee names are often ALL CAPS, so these ignore case
+    (re.compile(_PLACE + r" County Sheriff'?s? (?:Office|Department)\b", re.I), "CSO"),
+    (re.compile(_PLACE + r" Sheriff'?s? (?:Office|Department)\b", re.I), "SO"),
+    (re.compile(_PLACE + r" Police Department\b", re.I), "PD"),
+    (re.compile(_PLACE + r" Fire Rescue\b", re.I), "FR"),
+    (re.compile(_PLACE + r" Fire Department\b", re.I), "FD"),
+    (re.compile(_PLACE + r" Emergency Medical Services\b", re.I), "EMS"),
+    (re.compile(_PLACE + r" County Public Schools\b", re.I), "CPS"),
+    (re.compile(_PLACE + r" Public Schools\b", re.I), "PS"),
+]
+_SKIP_WORDS = {"of", "the", "and", "de", "la", "at", "city", "town", "village"}
+
+
+def abbrev(text: str) -> str:
+    def initials(place: str) -> str:
+        return "".join(w[0] for w in place.split() if w.lower() not in _SKIP_WORDS).upper()
+    out = text
+    for rx, suffix in _ABBR:
+        out = rx.sub(lambda m: initials(m.group(1)) + suffix, out)
+    return out
+
+
 # Tag column of a RadioReference export → the agency-type labels the FCC pack uses (so the
 # "keys up nearby" agency chips and the law-enforcement switch work from this table too).
 RR_TAG_AGENCY = [
@@ -174,7 +200,18 @@ class RrPack:
         trs = tag.upper() == "TRS"
         if ag == "Amateur radio":
             agency = f"Amateur {agency}"
+        agency, desc = abbrev(agency), abbrev(desc)
+        # RadioReference splits "Pinellas County" / "Sheriff - MDT": fold that into PCSO · MDT, and a city's
+        # "Police …" into <initials>PD …
+        m = re.match(r"(?i)^sheriff'?s?(?: office)?\s*[-–:·]?\s*(.*)$", desc)
+        if m and agency.lower().endswith(" county"):
+            agency, desc = abbrev(agency + " Sheriff's Office"), m.group(1).strip()
+        m = re.match(r"(?i)^police(?: department)?\s*[-–:·]?\s*(.*)$", desc)
+        if m and not trs and " " not in agency.strip() or (m and agency.lower().startswith(("city of", "town of"))):
+            agency, desc = abbrev(agency + " Police Department"), m.group(1).strip()
         who = agency if trs or not desc else f"{agency} · {desc}"
+        if alpha and alpha.strip().lower() not in who.lower() and who.lower().replace(" · ", " ") not in alpha.lower():
+            who += f" ({alpha.strip()})"     # the alpha tag is the channel's everyday name: in the headline
         # The name is who: agency and channel description (alpha tag, mode, tone go in the extras, which the
         # app shows on the card's second line). The input side of a pair says so: a radio keying up nearby.
         if trs:
@@ -273,7 +310,7 @@ class FccPack:
         # toward the tower, and a low-power handheld is only audible from close by. Prefer that reading.
         inputs = [(h, dd) for h, dd in hits if is_input(h)]
         e, d = (inputs or hits)[0]
-        who = e['name'] or e['call']
+        who = abbrev(e['name']) if e['name'] else e['call']
         agency = agency_of(e)
         # The registrant leads the name: "Example County Sheriff · law enforcement radio nearby · WQZZ001".
         if is_input(e):
