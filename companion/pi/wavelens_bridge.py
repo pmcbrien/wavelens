@@ -385,7 +385,13 @@ FCC: "FccPack | None" = None
 
 def licensed_label(mhz: float, tol_khz: float):
     """What is known to be on a frequency: the RadioReference overlay first (curated, with mode and
-    tone), then the FCC pack. Either returns (name, cat, conf, extras) or None."""
+    tone), then the FCC pack. Either returns (name, cat, conf, extras) or None.
+    Not in the bands the sweep skips (2.4 / 5 GHz Wi-Fi and Bluetooth): a 2.4 GHz licence does exist
+    for many agencies, but what the sweep hears there is Wi-Fi, and a morning of "11 law-enforcement
+    licensees in this bin" for the neighbour's router is worse than no label."""
+    b = band_of(mhz)
+    if b is not None and b.get("name") is None:
+        return None
     if RR:
         lic = RR.label(mhz, tol_khz=tol_khz)
         if lic:
