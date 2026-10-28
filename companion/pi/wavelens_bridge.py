@@ -171,6 +171,11 @@ class RrPack:
         self.rows.sort(key=lambda t: t[0])
         self.keys = [t[0] for t in self.rows]
 
+    @staticmethod
+    def _freq(hit) -> float:
+        _, side, r = hit
+        return float(r.get("Frequency Input") if side == "input" else r.get("Frequency Output"))
+
     def lookup(self, mhz: float, tol_khz: float):
         half = max(tol_khz, 12.5) / 1000.0 / 2 + 0.004   # + the dongle's own error (10 ppm at 400 MHz)
         lo = bisect.bisect_left(self.keys, mhz - half)
@@ -238,7 +243,7 @@ class RrPack:
         else:
             name, conf = who, "POSSIBLE"
         x = {"rr_agency": agency, "rr_description": desc, "rr_tag": tag, "rr_mode": mode, "agency": ag,
-             "listen": RR_LISTEN.get(mode.lower(), "auto")}
+             "listen": RR_LISTEN.get(mode.lower(), "auto"), "lic_mhz": f"{self._freq(hits[0]):.5f}"}
         if alpha: x["rr_alpha"] = alpha
         if r.get("County"): x["rr_county"] = r["County"]
         if call: x["call_sign"] = call
@@ -336,7 +341,7 @@ class FccPack:
         else:
             name, conf = f"{who} · base / repeater (regional)", "POSSIBLE"
         x = {"agency": agency, "licensee": e["name"], "call_sign": e["call"], "service": e["service_label"],
-             "place": e.get("place", "")}
+             "place": e.get("place", ""), "lic_mhz": f"{e['mhz']:.5f}"}   # the licensed centre: Listen tunes it exactly
         if is_input(e):
             x["repeater_input"] = "a mobile or handheld transmitting up to its repeater — heard only from close by"
         else:
@@ -1260,7 +1265,7 @@ def follow_busy(now: float) -> bool:
     tuned, or audio in the last few seconds."""
     if LISTEN["proc"] is None or now - LISTEN["tuned_at"] < FOLLOW_MIN_S or now - LISTEN["last_audio"] < FOLLOW_HANG_S:
         return True
-    return LISTEN["mode"] == "auto" and now - LISTEN["chan_at"] < FOLLOW_PROBE_S
+    return (LISTEN["mode"] == "auto" or LISTEN["mode"] in DIGITAL_MODES) and now - LISTEN["chan_at"] < FOLLOW_PROBE_S
 
 
 def follow_mode(mhz: float):
@@ -1348,6 +1353,12 @@ def follow_hit(obj: dict) -> None:
     known = str(x.get("listen") or "")      # the RadioReference overlay's mode for this channel
     if known in ("fm", "am", "dmr", "p25", "nxdn"):
         mode = known                         # no 8 s probe: tune it as what it is
+    try:
+        lic = float(x.get("lic_mhz") or 0)   # the licence's own centre beats any channel-plan guess
+    except ValueError:
+        lic = 0.0
+    if lic and abs(lic - mhz) <= max(tol, 0.0125):
+        mhz, tol = lic, 0.0
     now = time.time()
     LISTEN["recent"][follow_key(mhz)] = (now, mhz, mode, tol)
     if LISTEN["req"] is not None:
@@ -1479,8 +1490,8 @@ def listen_resolve(mode: str, why: str, mhz: "float | None" = None) -> None:
 def hone(reading: float) -> None:
     """Each sweep reading of the tuned carrier refines its position; when the average lands on another
     channel than the one tuned, retune there. A HackRF's ±25 kHz is more than a 12.5 kHz channel."""
-    if LISTEN["mode"] in TRUNK_MODES:
-        return                               # dsd-fme owns the tuning on a trunked system
+    if LISTEN["mode"] in TRUNK_MODES or LISTEN["tol"] == 0.0:
+        return                               # dsd-fme owns the tuning on a trunked system; a licensed centre is exact
     rd = LISTEN["readings"]
     rd.append(reading)
     del rd[:-8]
