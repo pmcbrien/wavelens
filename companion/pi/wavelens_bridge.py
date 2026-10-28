@@ -1244,6 +1244,7 @@ LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "mhz": 0.0, 
           "carrier_at": 0.0, "detected": "",   # auto: when the sweep last saw the tuned carrier; what dsd-fme found
           "call": "", "call_at": 0.0,       # trunk: the talkgroup dsd-fme is following right now, and when it started
           "starting": False,                # the worker is bringing the tools up (dongle spoken for, proc not yet set)
+          "pages": False,                   # decode POCSAG/FLEX on analog listens: only when the client asks (Lab)
           "recent": {}, "played": {},      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
           "lockout": []}                   # MHz the phone told us never to follow (a pager, a busy repeater)
 LOCKOUT_TOL = 0.02                         # a hit within this of a locked-out frequency is the same channel
@@ -1788,7 +1789,8 @@ def _serve_listen(req: tuple, gen: int) -> None:
         dc = "" if mode == "fm" else " -E dc"    # FM keeps its DC: it is the AFC reading (removed below)
         # With a pager decoder available, narrow FM is demodulated at its rate and fed to both the
         # decoder and (resampled) the phone; without it, 16 kHz in and 8 kHz out as before.
-        pager = mode == "fm" and shutil.which("multimon-ng") is not None
+        # The pager decoder runs only for a client that asked for it ({"c":"pages","v":true}: the Lab app).
+        pager = mode == "fm" and LISTEN["pages"] and shutil.which("multimon-ng") is not None
         rate_in = PAGER_RATE if pager else int(AFC_RATE_IN)
         demod_rate = float(rate_in)
         demod = f"-M fm -s {rate_in}" if mode == "fm" else LISTEN_MODES[mode]
@@ -2208,6 +2210,9 @@ def run_peripheral(name: str) -> None:
             else:
                 msg = "sweeping the full range"
             emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"], "park": state["park"]})
+        elif c == "pages":
+            LISTEN["pages"] = bool(cmd.get("v", True))
+            emit({"t": "status", "msg": "pager decoding " + ("on" if LISTEN["pages"] else "off"), "band": state["band"], "mode": state["mode"]})
         elif c == "listen":
             if "listen" not in CAPS:
                 emit({"t": "status", "msg": "no RTL-SDR to listen with (add --rtl-power …@SERIAL or --listen-device)",

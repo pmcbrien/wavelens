@@ -402,9 +402,9 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // squelch, changeable any time. Renew within 5 min or it stops itself.
 ```
 
-**Listening (SDR bridge, capability `listen`) — Wavelens Lab only.** The Play Store app never sends a
-`listen` command and never subscribes to the audio characteristic; Listen, Follow and digital voice
-exist only in the author's private experimental build (`lab` product flavor, package `.lab`). The bridge borrows an RTL-SDR — by default the first
+**Listening (SDR bridge, capability `listen`).** Listen, Follow, digital voice and trunk-tracking are in
+the Play Store app as well as Wavelens Lab (since 28 Oct); only pager decoding is Lab-only, and the
+bridge runs that decoder only for a client that sends `{"c":"pages","v":true}`. The bridge borrows an RTL-SDR — by default the first
 `--rtl-power` dongle pinned with `@SERIAL`, or `--listen-device SERIAL` — pauses that sweep, runs
 `rtl_fm` and sends audio on a third characteristic, `…0004` (notify): 8 kHz mono IMA ADPCM in 164-byte
 frames — `seq` (u8), predictor (i16 LE), step index (u8), then 320 samples as 4-bit codes, high nibble
@@ -424,12 +424,12 @@ DC removed) to a POCSAG512/1200/2400 + FLEX decoder. The first page decoded sets
 `POCSAG`/`FLEX`, mutes the audio frames, and pages go to the phone as
 `{"t":"page","f":460.6,"proto":"POCSAG1200","addr":"1234567","msg":"…"}`. The Lab app shows them
 under the companion line on the Live tab, on the Companion screen, and on More → Pages (a page-only
-view with per-address filtering), and reads them aloud (toggle on either screen). Lab only; nothing is stored.
+view with per-address filtering), and reads them aloud (toggle on either screen). Lab only — the Play app never asks for it; nothing is stored.
 Public-safety dispatch paging on an agency's own system is lawful to receive in the US
 (18 U.S.C. § 2511(2)(g)); commercial paging-carrier traffic is not — the decoder runs only on the
 frequency that was tuned.
 
-**RadioReference overlay (Lab).** `--rr-pack county.csv` (repeatable) loads a RadioReference frequency
+**RadioReference overlay.** `--rr-pack county.csv` (repeatable) loads a RadioReference frequency
 export — the CSV its county pages offer — and names sweep hits from it: *Agency · Description (Alpha
 Tag)*, on both sides of a repeater pair (the input side is "radio keying up nearby", LIKELY). Extras
 carry `rr_agency`, `rr_description`, `rr_alpha`, `rr_mode`, `rr_tone`, `rr_tag`; `agency` is mapped
@@ -437,7 +437,7 @@ from the Tag column so the agency-type alerts work from it; `listen` says how to
 DMR, P25, NXDN) and the app's Listen uses it; trunked-site rows say so. Preferred over the FCC pack
 where it has the frequency. Several exports layer: give them most local first (county, statewide, nationwide); a statewide export's County column ranks the `--rr-county` counties and "Statewide" rows ahead of other counties'. The exports are the user's own files on the Pi; nothing from them is shipped.
 
-**Trunked systems (Lab).** `{"c":"listen","v":"trunk","qpsk":true}` follows the nearest trunked system
+**Trunked systems.** `{"c":"listen","v":"trunk","qpsk":true}` follows the nearest trunked system
 the RadioReference overlay knows: the bridge counts every sweep hit on a system's site frequencies and
 tries the one that never stops (an always-on carrier) as the control channel, then the next if dsd-fme
 shows no sync within 12 s. `"mhz"` names a control channel instead. `{"c":"listen","v":"trunkauto",
