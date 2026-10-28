@@ -164,7 +164,7 @@ class RrPack:
         distinct = {(r.get("Alpha Tag") or r.get("Description")) for _, _, r in hits}
         if len(distinct) > 1 and tol_khz > 25:
             tags = ", ".join(sorted(distinct)[:4]) + (" …" if len(distinct) > 4 else "")
-            return (f"RadioReference: {len(distinct)} known channels in this {tol_khz:.0f} kHz ({tags})", "UNKNOWN", "POSSIBLE",
+            return (f"{len(distinct)} known channels in this {tol_khz:.0f} kHz: {tags}", "UNKNOWN", "POSSIBLE",
                     {"rr_channels": "; ".join(sorted(distinct)[:8]),
                      "ambiguous": f"a {tol_khz:.0f} kHz sweep bin spans several channels; an RTL-SDR sweep at 12.5 kHz names the one"})
         _, side, r = hits[0]
@@ -175,12 +175,14 @@ class RrPack:
         if ag == "Amateur radio":
             agency = f"Amateur {agency}"
         who = agency if trs or not desc else f"{agency} · {desc}"
+        # The name is who: agency and channel description (alpha tag, mode, tone go in the extras, which the
+        # app shows on the card's second line). The input side of a pair says so: a radio keying up nearby.
         if trs:
-            name, conf = f"{agency} · trunked site, {desc} · {mode}", "POSSIBLE"
+            name, conf = f"{agency} · {desc} (trunked site)", "POSSIBLE"
         elif side == "input":
-            name, conf = f"{who} · radio keying up nearby ({alpha or mode})", "LIKELY"
+            name, conf = f"{who} · keying up nearby", "LIKELY"
         else:
-            name, conf = f"{who} ({alpha or mode})", "POSSIBLE"
+            name, conf = who, "POSSIBLE"
         x = {"rr_agency": agency, "rr_description": desc, "rr_tag": tag, "rr_mode": mode, "agency": ag,
              "listen": RR_LISTEN.get(mode.lower(), "auto")}
         if alpha: x["rr_alpha"] = alpha
@@ -275,9 +277,9 @@ class FccPack:
         agency = agency_of(e)
         # The registrant leads the name: "Example County Sheriff · law enforcement radio nearby · WQZZ001".
         if is_input(e):
-            name, conf = f"{who} · {agency.lower()} radio nearby · {e['call']}", "LIKELY"
+            name, conf = f"{who} · keying up nearby", "LIKELY"
         else:
-            name, conf = f"{who} · {agency.lower()} base / repeater (regional) · {e['call']}", "POSSIBLE"
+            name, conf = f"{who} · base / repeater (regional)", "POSSIBLE"
         x = {"agency": agency, "licensee": e["name"], "call_sign": e["call"], "service": e["service_label"],
              "place": e.get("place", "")}
         if is_input(e):
