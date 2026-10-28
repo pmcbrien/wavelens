@@ -20,5 +20,8 @@ WAVELENS_RTL433="-f 315M -f 433.92M -f 915M -H 30 -g 40"
 #                                           other one with -d :SERIAL in WAVELENS_RTL433
 #   --dump1090 localhost:30003              aircraft from dump1090 / readsb (needs a second dongle)
 #   --fcc-pack /usr/local/lib/wavelens/fcc-local.json
+#   --rr-pack /usr/local/lib/wavelens/rr/pinellas.csv --rr-pack /usr/local/lib/wavelens/rr/hillsborough.csv
+#                                           RadioReference frequency exports (CSV) for your counties: hits are named
+#                                           by agency, description, alpha tag and mode; preferred over the FCC pack
 #   --name Wavelens-Car                     the name the app lists under Find
 WAVELENS_ARGS=""

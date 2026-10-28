@@ -429,6 +429,21 @@ Public-safety dispatch paging on an agency's own system is lawful to receive in 
 (18 U.S.C. § 2511(2)(g)); commercial paging-carrier traffic is not — the decoder runs only on the
 frequency that was tuned.
 
+**RadioReference overlay (Lab).** `--rr-pack county.csv` (repeatable) loads a RadioReference frequency
+export — the CSV its county pages offer — and names sweep hits from it: *Agency · Description (Alpha
+Tag)*, on both sides of a repeater pair (the input side is "radio keying up nearby", LIKELY). Extras
+carry `rr_agency`, `rr_description`, `rr_alpha`, `rr_mode`, `rr_tone`, `rr_tag`; `agency` is mapped
+from the Tag column so the agency-type alerts work from it; `listen` says how to demodulate (FM, AM,
+DMR, P25, NXDN) and the app's Listen uses it; trunked-site rows say so. Preferred over the FCC pack
+where it has the frequency. The export is the user's own file on the Pi; nothing from it is shipped.
+
+**Trunked systems (Lab).** `{"c":"listen","mhz":857.0375,"mode":"trunk"}` (or `"trunkq"` for QPSK/LSM
+simulcast sites) treats `mhz` as a control channel: `dsd-fme -ft -T` decodes the grants and retunes
+the dongle (through rtl_tcp) to each voice channel and back — P25 phase 1/2, DMR Tier III / Cap+ /
+Con+. No snapping or honing; status carries `call` ("TG 1234 from 5678") while a call is followed.
+Encrypted calls are never tuned (dsd-fme's default). Unencrypted public-safety trunked traffic is
+lawful to receive in the US; check state law for a receiver in a vehicle.
+
 **Auto mode** starts `dsd-fme -fa`; the sync it reports on stderr ("Sync: +DMR", "+P25p1") names the
 protocol and the audio layout (TDMA is stereo). If the carrier is on (the sweep still sees it) and no
 digital sync appears within 3 s, it is analog: the listen restarts as narrow FM. Decided once per tune.

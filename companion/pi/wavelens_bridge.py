@@ -85,6 +85,121 @@ def hello() -> None:
     emit({"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""), "caps": sorted(set(CAPS))})
 
 
+
+# ---------------------------------------------------------------- RadioReference overlay (Lab)
+
+# Tag column of a RadioReference export → the agency-type labels the FCC pack uses (so the
+# "keys up nearby" agency chips and the law-enforcement switch work from this table too).
+RR_TAG_AGENCY = [
+    (("law",), "Law enforcement"), (("corrections",), "Law enforcement"), (("fire",), "Fire / rescue"),
+    (("ems",), "EMS / ambulance"), (("hospital",), "Hospital / medical"), (("schools", "school"), "School / campus"),
+    (("aircraft", "airport"), "Airport"), (("public works",), "Local government"), (("security",), "Security company"),
+    (("transportation", "transit"), "Transit / roads"), (("utilities", "utility"), "Utility"),
+    (("federal", "military"), "Federal"), (("emergency ops", "emergency"), "911 / emergency management"),
+    (("ham",), "Amateur radio"), (("media",), "Business"), (("business",), "Business"),
+]
+# Mode column → how to listen (the app's Listen uses it instead of guessing from the band).
+RR_LISTEN = {"fm": "fm", "fmn": "fm", "am": "am", "dmr": "dmr", "dmre": "dmr", "p25": "p25", "p25e": "p25",
+             "nxdn48": "nxdn", "nxdn96": "nxdn", "nxdn": "nxdn", "project 25": "p25", "telm": "fm",   # telemetry/paging: FM, the pager decoder reads it
+             "edacs": "trunked", "ltr": "trunked"}
+RR_PUBLIC = ("county", "city", "sheriff", "police", "law", "state", "fire", "ems", "town", "village", "government")
+
+
+class RrPack:
+    """Frequency → what RadioReference says is there, from one or more of its CSV exports
+    (columns: Frequency Output, Frequency Input, FCC Callsign, Agency/Category, Description, Alpha Tag,
+    PL Output Tone, PL Input Tone, Mode, Class Station Code, Tag). Both the output and the input
+    frequency of a pair are indexed: a hit on the input side is a mobile or handheld keying up nearby.
+    The data is the user's own export, loaded from the Pi; nothing from it is shipped or stored.
+    Wavelens Lab only, by use: the Play app never asks for Listen and shows a name like any other."""
+
+    def __init__(self, paths):
+        import csv
+        self.rows = []          # (mhz, side, row)
+        for path in paths:
+            with open(path, encoding="utf-8-sig", newline="") as f:
+                for r in csv.DictReader(f):
+                    row = {k.strip(): (v or "").strip() for k, v in r.items() if k}
+                    try:
+                        out = float(row.get("Frequency Output") or 0)
+                    except ValueError:
+                        out = 0.0
+                    try:
+                        inp = float(row.get("Frequency Input") or 0)
+                    except ValueError:
+                        inp = 0.0
+                    if 24.0 <= out <= 6000.0:
+                        self.rows.append((out, "output", row))
+                    if 24.0 <= inp <= 6000.0:      # a mangled input (one export had 46053250.0) is skipped
+                        self.rows.append((inp, "input", row))
+        self.rows.sort(key=lambda t: t[0])
+        self.keys = [t[0] for t in self.rows]
+
+    def lookup(self, mhz: float, tol_khz: float):
+        half = max(tol_khz, 6.25) / 2000.0
+        lo = bisect.bisect_left(self.keys, mhz - half)
+        hi = bisect.bisect_right(self.keys, mhz + half)
+        return [(abs(f - mhz), side, row) for f, side, row in self.rows[lo:hi]]
+
+    @staticmethod
+    def agency(row: dict) -> str:
+        tag = (row.get("Tag") or "").lower()
+        if tag == "trs":                     # a trunked site: judge by whose system it is
+            who = (row.get("Agency/Category") or "").lower()
+            return "Public safety" if any(k in who for k in RR_PUBLIC) else "Business"
+        if tag == "data":
+            return "Data / telemetry"
+        for keys, label in RR_TAG_AGENCY:
+            if any(k in tag for k in keys):
+                return label
+        return "Business" if tag else "Licensed"
+
+    def label(self, mhz: float, tol_khz: float = 12.5):
+        """(name, cat, conf, extras) like FccPack.label, or None. Nearest entry wins; several in a wide
+        bin are listed instead of named, as the FCC pack does."""
+        hits = self.lookup(mhz, tol_khz)
+        if not hits:
+            return None
+        hits.sort(key=lambda t: t[0])
+        distinct = {(r.get("Alpha Tag") or r.get("Description")) for _, _, r in hits}
+        if len(distinct) > 1 and tol_khz > 25:
+            tags = ", ".join(sorted(distinct)[:4]) + (" …" if len(distinct) > 4 else "")
+            return (f"RadioReference: {len(distinct)} known channels in this {tol_khz:.0f} kHz ({tags})", "UNKNOWN", "POSSIBLE",
+                    {"rr_channels": "; ".join(sorted(distinct)[:8]),
+                     "ambiguous": f"a {tol_khz:.0f} kHz sweep bin spans several channels; an RTL-SDR sweep at 12.5 kHz names the one"})
+        _, side, r = hits[0]
+        agency, desc, alpha = r.get("Agency/Category", ""), r.get("Description", ""), r.get("Alpha Tag", "")
+        mode, tag, call = r.get("Mode", ""), r.get("Tag", ""), r.get("FCC Callsign", "")
+        ag = self.agency(r)
+        trs = tag.upper() == "TRS"
+        if ag == "Amateur radio":
+            agency = f"Amateur {agency}"
+        who = agency if trs or not desc else f"{agency} · {desc}"
+        if trs:
+            name, conf = f"{agency} · trunked site, {desc} · {mode}", "POSSIBLE"
+        elif side == "input":
+            name, conf = f"{who} · radio keying up nearby ({alpha or mode})", "LIKELY"
+        else:
+            name, conf = f"{who} ({alpha or mode})", "POSSIBLE"
+        x = {"rr_agency": agency, "rr_description": desc, "rr_tag": tag, "rr_mode": mode, "agency": ag,
+             "listen": RR_LISTEN.get(mode.lower(), "auto")}
+        if alpha: x["rr_alpha"] = alpha
+        if call: x["call_sign"] = call
+        tone = r.get("PL Output Tone") if side == "output" else r.get("PL Input Tone")
+        if tone: x["rr_tone"] = tone
+        if mode.lower().endswith("e") and mode.lower() in ("dmre", "p25e"):
+            x["encrypted"] = "RadioReference marks this channel encrypted: nothing to hear"
+        if side == "input":
+            x["repeater_input"] = "the mobile/handheld side of a repeater pair — heard only from close by"
+        elif trs:
+            x["trunked_site"] = "a trunked system's site channel; Follow system from the Companion screen with its control channel"
+        else:
+            x["base_output"] = "the repeater or base output: heard for miles, not a sign of anything nearby"
+        return name, "UNKNOWN", conf, x
+
+
+RR: "RrPack | None" = None
+
 # ---------------------------------------------------------------- local FCC license pack
 
 class FccPack:
@@ -158,10 +273,11 @@ class FccPack:
         e, d = (inputs or hits)[0]
         who = e['name'] or e['call']
         agency = agency_of(e)
+        # The registrant leads the name: "Example County Sheriff · law enforcement radio nearby · WQZZ001".
         if is_input(e):
-            name, conf = f"{agency} radio nearby · {who} · {e['call']}", "LIKELY"
+            name, conf = f"{who} · {agency.lower()} radio nearby · {e['call']}", "LIKELY"
         else:
-            name, conf = f"{agency} base / repeater (regional): {who} · {e['call']}", "POSSIBLE"
+            name, conf = f"{who} · {agency.lower()} base / repeater (regional) · {e['call']}", "POSSIBLE"
         x = {"agency": agency, "licensee": e["name"], "call_sign": e["call"], "service": e["service_label"],
              "place": e.get("place", "")}
         if is_input(e):
@@ -202,6 +318,16 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 FCC: "FccPack | None" = None
+
+
+def licensed_label(mhz: float, tol_khz: float):
+    """What is known to be on a frequency: the RadioReference overlay first (curated, with mode and
+    tone), then the FCC pack. Either returns (name, cat, conf, extras) or None."""
+    if RR:
+        lic = RR.label(mhz, tol_khz=tol_khz)
+        if lic:
+            return lic
+    return FCC.label(mhz, tol_khz=tol_khz) if FCC else None
 HACKRF_ON = False
 
 
@@ -509,7 +635,7 @@ class Sweep:
                 run = self.runs.pop(hz, None)       # quiet on this pass: the run of hot passes is over
                 if run and run[0] < STEADY_N:
                     b = band_of(mhz)
-                    if b["steady"] and not (FCC and FCC.label(mhz, tol_khz=max(step / 1000.0, 12.5))):
+                    if b["steady"] and not licensed_label(mhz, max(step / 1000.0, 12.5)):
                         # it came and went: report it now with the burst label
                         self.fresh = self.peak_ok = True
                         self.report(mhz, run[1], step, run[1] - f, b["name"], b["cat"], b["conf"], b, None, now, {})
@@ -538,7 +664,7 @@ class Sweep:
             # through, and it is not "a band that rose together" with anything.
             self.fresh = hot_for < STORM_FRESH_S
             x = {"over_floor_db": f"{db - f:.0f}", "bin_hz": f"{step:.0f}"}
-            lic = FCC.label(mhz, tol_khz=max(step / 1000.0, 12.5)) if FCC else None
+            lic = licensed_label(mhz, max(step / 1000.0, 12.5))
             if lic:
                 name, cat, conf, lx = lic
                 x.update(lx)
@@ -964,7 +1090,16 @@ LISTEN_MODES = {"fm": "-M fm -s 16k", "am": "-M am -s 16k", "wbfm": "-M wbfm"}
 # port the bridge listens on. TDMA modes (DMR, P25 phase 2) come out stereo, one slot per channel: mixed.
 # Encrypted traffic decodes to nothing; that is the law and the maths, not a setting.
 DIGITAL_MODES = {"dmr": ("-fs", 2), "p25": ("-f1", 1), "nxdn": ("-fi", 1), "dstar": ("-fd", 1),
-                 "auto": ("-fa", 1)}       # auto: dsd-fme's own detection (DMR, P25 phase 1 and 2); see AUTO_* below
+                 "auto": ("-fa", 1),       # auto: dsd-fme's own detection (DMR, P25 phase 1 and 2); see AUTO_* below
+                 # Trunked systems: mhz is the control channel; dsd-fme follows the system's grants, retuning
+                 # the dongle to each voice channel and back (P25 phase 1/2, DMR Tier III / Cap+ / Con+). -ft is
+                 # its trunking preset (P25p1 + p2 + DMR, C4FM); "trunkq" adds -mq for QPSK/LSM simulcast sites.
+                 # Encrypted calls are never tuned (dsd-fme's default). Lab only; the app sends it from the
+                 # Companion screen's "Trunked systems" section.
+                 "trunk": ("-ft -T", 2), "trunkq": ("-ft -T -mq", 2)}
+TRUNK_MODES = ("trunk", "trunkq")
+CALL_RE = re.compile(r"\bTG[:= ]\s*(\d+)")
+SRC_RE = re.compile(r"\bSRC[:= ]\s*(\d+)")
 # Mode "auto": start in dsd-fme's auto-detect; it says on stderr what sync it finds ("Sync: +P25p1"), which
 # also tells us the audio layout (TDMA is stereo). If the carrier is on and no digital sync shows within
 # AUTO_WAIT_S, it's analog: restart as narrow FM. Decided once per tune; the app's renewals keep "auto".
@@ -1036,6 +1171,7 @@ LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "mhz": 0.0, 
           "until": 0.0, "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0,
           "chan_at": 0.0,                   # when this channel was first asked for (tuned_at restarts on AUTO → FM)
           "carrier_at": 0.0, "detected": "",   # auto: when the sweep last saw the tuned carrier; what dsd-fme found
+          "call": "",                       # trunk: the talkgroup dsd-fme is following right now
           "recent": {}, "played": {},      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
           "lockout": []}                   # MHz the phone told us never to follow (a pager, a busy repeater)
 LOCKOUT_TOL = 0.02                         # a hit within this of a locked-out frequency is the same channel
@@ -1214,6 +1350,7 @@ def listen_status(msg: str) -> None:
     emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"],
           "listen": {"mhz": LISTEN["mhz"] if on else 0, "mode": LISTEN["mode"] if on else "",
                      "asked": LISTEN["asked"] if on else "", "detected": LISTEN["detected"] if on else "",
+                     "call": LISTEN["call"] if on else "",
                      "sq": LISTEN["sq"], "follow": bool(LISTEN["follow"]),
                      "lockout": LISTEN["lockout"]} if (on or LISTEN["follow"]) else "off"})
 
@@ -1235,7 +1372,7 @@ def listen_start(mhz: float, mode: str, sq: int, tol: float = 0.05) -> None:
     channel for that (snap_channel), and later sweep readings may move it (hone)."""
     mode = mode if mode in LISTEN_MODES or mode in DIGITAL_MODES else "fm"
     raw = mhz
-    mhz = snap_channel(mhz, tol)
+    mhz = round(mhz, 4) if mode in TRUNK_MODES else snap_channel(mhz, tol)   # a control channel is given exactly
     with LISTEN_CV:
         same = (LISTEN["req"] is not None and abs(LISTEN["raw_mhz"] - raw) < 0.0005 and LISTEN["asked"] == mode
                 and LISTEN["sq"] == sq)
@@ -1248,7 +1385,7 @@ def listen_start(mhz: float, mode: str, sq: int, tol: float = 0.05) -> None:
         LISTEN["req"] = (mhz, mode, sq)
         LISTEN["mhz"], LISTEN["mode"], LISTEN["asked"], LISTEN["sq"] = mhz, mode, mode, sq
         LISTEN["raw_mhz"], LISTEN["tol"], LISTEN["readings"], LISTEN["honed_at"] = raw, tol, [raw], 0.0
-        LISTEN["carrier_at"], LISTEN["detected"] = 0.0, ""
+        LISTEN["carrier_at"], LISTEN["detected"], LISTEN["call"] = 0.0, "", ""
         LISTEN["chan_at"] = time.time()
         LISTEN["gen"] += 1
         LISTEN_CV.notify()
@@ -1274,6 +1411,8 @@ def listen_resolve(mode: str, why: str, mhz: "float | None" = None) -> None:
 def hone(reading: float) -> None:
     """Each sweep reading of the tuned carrier refines its position; when the average lands on another
     channel than the one tuned, retune there. A HackRF's ±25 kHz is more than a 12.5 kHz channel."""
+    if LISTEN["mode"] in TRUNK_MODES:
+        return                               # dsd-fme owns the tuning on a trunked system
     rd = LISTEN["readings"]
     rd.append(reading)
     del rd[:-8]
@@ -1340,6 +1479,7 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
             return False
         p.err_tail = deque(maxlen=3)
         p.sync, p.sync_at = "", 0.0
+        p.call, p.call_at = "", 0.0
 
         def drain(proc=p):                   # dsd-fme chatters on stderr; an undrained pipe would stall it
             for ln in proc.stderr:
@@ -1351,6 +1491,11 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                     m = SYNC_RE.search(ln)
                     if m:
                         proc.sync, proc.sync_at = m.group(1), time.time()
+                    m = CALL_RE.search(ln)
+                    if m:
+                        src = SRC_RE.search(ln)
+                        proc.call = f"TG {m.group(1)}" + (f" from {src.group(1)}" if src else "")
+                        proc.call_at = time.time()
         threading.Thread(target=drain, daemon=True).start()
         time.sleep(0.5)
         if p.poll() is None:
@@ -1410,7 +1555,8 @@ def serve_listen(req: tuple, gen: int) -> None:
         time.sleep(0.8)                      # rtl_tcp needs a moment before it accepts a client
         # rtltcp:host:port:freq:gain:ppm:bw(kHz):squelch:volume — dsd-fme does its own FM demodulation.
         # No -N: that turns the ncurses screen ON, and under systemd there is no terminal to open.
-        d = start_tool(f"dsd-fme {flag} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:12:{sq}:2 "
+        bw = 24 if mode in TRUNK_MODES else 12
+        d = start_tool(f"dsd-fme {flag} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:{bw}:{sq}:2 "
                        f"-o udp:127.0.0.1:{DSD_UDP_PORT}", gen, attempts=4, watch_sync=True)
         if d is False or d is None:
             stop_tools(procs)
@@ -1467,7 +1613,20 @@ def serve_listen(req: tuple, gen: int) -> None:
             if now > LISTEN["until"]:
                 listen_stop("timed out (5 min); tap Listen again to continue")
                 break
-            if mode == "auto":
+            if mode in TRUNK_MODES:
+                call = getattr(p, "call", "")
+                if call and now - p.call_at < 8.0:
+                    if LISTEN["call"] != call:
+                        LISTEN["call"] = call
+                        listen_status(f"trunked call: {call}")
+                elif LISTEN["call"]:
+                    LISTEN["call"] = ""
+                    listen_status(f"on the control channel {mhz:.4f} MHz, waiting for a call")
+                sync = getattr(p, "sync", "")
+                if sync and now - p.sync_at < 5.0 and LISTEN["detected"] != sync:
+                    LISTEN["detected"] = sync
+                    chans = 2 if sync.upper().startswith(TDMA_SYNCS) else 1
+            elif mode == "auto":
                 sync = getattr(p, "sync", "")
                 if sync and now - p.sync_at < 5.0:
                     if LISTEN["detected"] != sync:
@@ -1664,8 +1823,8 @@ def feed_rtl433(line: str) -> None:
     except (TypeError, ValueError):
         rssi = -70
     x = {k: str(v) for k, v in d.items() if k in ("pressure_kPa", "pressure_PSI", "temperature_C", "battery_ok", "mic", "type")}
-    if FCC and cat == "UNKNOWN" and freq_f:
-        lic = FCC.label(freq_f)
+    if (FCC or RR) and cat == "UNKNOWN" and freq_f:
+        lic = licensed_label(freq_f, 12.5)
         if lic:
             _, cat, conf, lx = lic
             x.update(lx)
@@ -1997,16 +2156,23 @@ def main() -> None:
     ap.add_argument("--dump1090", metavar="HOST:PORT", help="relay aircraft from a dump1090/readsb SBS port")
     ap.add_argument("--kismet-json", metavar="PATH", help="relay Wi-Fi devices from a Kismet JSON export")
     ap.add_argument("--fcc-pack", metavar="PATH", help="local FCC license pack from tools/fcc_local_pack.py; labels licensed carriers")
+    ap.add_argument("--rr-pack", metavar="CSV", action="append", default=[],
+                    help="a RadioReference frequency export (CSV) for your county; repeatable. Names hits by agency, description, "
+                         "alpha tag and mode, on both sides of a repeater pair. Preferred over --fcc-pack where it has the frequency")
     ap.add_argument("--echo", action="store_true", help="print every line sent to the phone on stderr (see it with journalctl -u wavelens-bridge -f)")
     ap.add_argument("--name", default="", help="advertised name (default Wavelens-XXXX from the adapter address)")
     a = ap.parse_args()
 
-    global FCC, ECHO, HACKRF_ON
+    global FCC, RR, ECHO, HACKRF_ON
     ECHO = a.echo
     if a.fcc_pack:
         FCC = FccPack(a.fcc_pack)
         CAPS.append("fcc")
         print(f"bridge: FCC pack loaded, {len(FCC.entries)} licensed frequencies", file=sys.stderr)
+    if a.rr_pack:
+        RR = RrPack(a.rr_pack)
+        CAPS.append("rr")
+        print(f"bridge: RadioReference overlay loaded, {len(RR.rows)} frequencies from {len(a.rr_pack)} file(s)", file=sys.stderr)
 
     if a.kismet_json:
         CAPS.append("wifi")
