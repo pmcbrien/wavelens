@@ -1206,7 +1206,7 @@ def follow_watch() -> None:
 def listen_busy(dev: str) -> bool:
     """The dongle is spoken for from the moment a listen is asked for until it ends — not just while
     rtl_fm runs. Otherwise the sweep restarts in the gap and grabs it back (usb_claim_interface -6)."""
-    return LISTEN["req"] is not None and LISTEN["dev"] == dev
+    return (LISTEN["req"] is not None or LISTEN["proc"] is not None) and LISTEN["dev"] == dev
 
 
 def listen_status(msg: str) -> None:
@@ -1561,8 +1561,8 @@ def serve_listen(req: tuple, gen: int) -> None:
                 except Exception:
                     pass                     # the link is behind: drop this frame, keep the latest
     finally:
+        stop_tools(procs)                    # the dongle stays "busy" until the tools are gone (listen_busy)
         LISTEN["proc"] = None
-        stop_tools(procs)
         if sock is not None:
             sock.close()
         if ended_itself and LISTEN["req"] is not None and LISTEN["gen"] == gen:
@@ -1742,6 +1742,26 @@ def blink(secs: int) -> None:
         pass
 
 
+def drop_stale_centrals() -> None:
+    """A restart leaves the phone's connection alive in BlueZ while the GATT server it was talking to
+    is gone: the app shows "connected" and hears nothing. Disconnect whoever is still attached, so the
+    app sees the drop and reconnects to this instance."""
+    try:
+        import dbus
+        bus = dbus.SystemBus()
+        om = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
+        for path, ifaces in om.GetManagedObjects().items():
+            d = ifaces.get("org.bluez.Device1")
+            if d and d.get("Connected"):
+                try:
+                    dbus.Interface(bus.get_object("org.bluez", path), "org.bluez.Device1").Disconnect()
+                    print("bridge: dropped a central left over from the previous run; it will reconnect", file=sys.stderr)
+                except Exception as e:
+                    print(f"bridge: could not drop a stale central ({e})", file=sys.stderr)
+    except Exception as e:
+        print(f"bridge: stale-central check skipped ({e})", file=sys.stderr)
+
+
 def run_peripheral(name: str) -> None:
     from bluezero import adapter, peripheral
     from bluezero import advertisement as bz_ad
@@ -1773,6 +1793,7 @@ def run_peripheral(name: str) -> None:
     if name in ("", "Wavelens Pi", "Wavelens-Pi"):
         name = f"Wavelens-{code}"          # same scheme as the ESP32: the code is the end of the BT address
     state["name"], state["code"] = name, code
+    drop_stale_centrals()
     dev = peripheral.Peripheral(dongle.address, local_name=name)
     dev.add_service(srv_id=1, uuid=SVC, primary=True)
 
@@ -1922,6 +1943,13 @@ def run_peripheral(name: str) -> None:
         from gi.repository import GLib
 
         def on_term():
+            # The radio tools go first, hard: rtl_fm / rtl_power ignore SIGTERM while blocked in a USB
+            # read, and systemd would wait out TimeoutStopSec before killing them (a slow restart that
+            # also leaves the phone's link dangling). Our own children only: pkill -P.
+            try:
+                subprocess.call(["pkill", "-KILL", "-P", str(os.getpid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
             try:
                 mgr, adv = getattr(dev, "ad_manager", None), getattr(dev, "advert", None)
                 if mgr is not None and adv is not None:
