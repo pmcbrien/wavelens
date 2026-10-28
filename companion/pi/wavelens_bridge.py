@@ -122,6 +122,7 @@ RR_TAG_AGENCY = [
     (("aircraft", "airport"), "Airport"), (("public works",), "Local government"), (("security",), "Security company"),
     (("transportation", "transit"), "Transit / roads"), (("utilities", "utility"), "Utility"),
     (("federal", "military"), "Federal"), (("emergency ops", "emergency"), "911 / emergency management"),
+    (("interop", "multi-"), "Public safety"), (("railroad",), "Transit / roads"),
     (("ham",), "Amateur radio"), (("media",), "Business"), (("business",), "Business"),
 ]
 # Mode column → how to listen (the app's Listen uses it instead of guessing from the band).
@@ -139,13 +140,22 @@ class RrPack:
     The data is the user's own export, loaded from the Pi; nothing from it is shipped or stored.
     Wavelens Lab only, by use: the Play app never asks for Listen and shows a name like any other."""
 
-    def __init__(self, paths):
+    def __init__(self, paths, counties=()):
+        """paths in order of preference: the county exports first, then a statewide one, then nationwide.
+        A statewide export carries a County column: rows for the given counties (or "Statewide") rank
+        ahead of other counties' rows, which stay usable for a drive out of the area."""
         import csv
-        self.rows = []          # (mhz, side, row)
-        for path in paths:
+        self.rows = []          # (mhz, side, row); row["_rank"] orders competing matches
+        want = {c.strip().lower() for c in counties if c.strip()}
+        for rank, path in enumerate(paths):
             with open(path, encoding="utf-8-sig", newline="") as f:
                 for r in csv.DictReader(f):
                     row = {k.strip(): (v or "").strip() for k, v in r.items() if k}
+                    # A nationwide export names the agency in its own first column and leaves Agency/Category empty.
+                    if not row.get("Agency/Category") and row.get("Nationwide Agency"):
+                        row["Agency/Category"] = row["Nationwide Agency"]
+                    county = row.get("County", "")
+                    row["_rank"] = rank * 2 + (0 if not county or county.lower() == "statewide" or county.lower() in want else 1)
                     try:
                         out = float(row.get("Frequency Output") or 0)
                     except ValueError:
@@ -162,7 +172,7 @@ class RrPack:
         self.keys = [t[0] for t in self.rows]
 
     def lookup(self, mhz: float, tol_khz: float):
-        half = max(tol_khz, 6.25) / 2000.0
+        half = max(tol_khz, 12.5) / 1000.0 / 2 + 0.004   # + the dongle's own error (10 ppm at 400 MHz)
         lo = bisect.bisect_left(self.keys, mhz - half)
         hi = bisect.bisect_right(self.keys, mhz + half)
         return [(abs(f - mhz), side, row) for f, side, row in self.rows[lo:hi]]
@@ -178,6 +188,11 @@ class RrPack:
         for keys, label in RR_TAG_AGENCY:
             if any(k in tag for k in keys):
                 return label
+        who = (row.get("Agency/Category") or "").lower()       # "Other", blank: judge by the agency's name
+        if any(k in who for k in ("sheriff", "police", "law enforcement", "highway patrol")):
+            return "Law enforcement"
+        if "fire" in who:
+            return "Fire / rescue"
         return "Business" if tag else "Licensed"
 
     def label(self, mhz: float, tol_khz: float = 12.5):
@@ -186,6 +201,8 @@ class RrPack:
         hits = self.lookup(mhz, tol_khz)
         if not hits:
             return None
+        best = min(r["_rank"] for _, _, r in hits)
+        hits = [h for h in hits if h[2]["_rank"] == best]        # the most local source that knows the frequency
         hits.sort(key=lambda t: t[0])
         distinct = {(r.get("Alpha Tag") or r.get("Description")) for _, _, r in hits}
         if len(distinct) > 1 and tol_khz > 25:
@@ -223,6 +240,7 @@ class RrPack:
         x = {"rr_agency": agency, "rr_description": desc, "rr_tag": tag, "rr_mode": mode, "agency": ag,
              "listen": RR_LISTEN.get(mode.lower(), "auto")}
         if alpha: x["rr_alpha"] = alpha
+        if r.get("County"): x["rr_county"] = r["County"]
         if call: x["call_sign"] = call
         tone = r.get("PL Output Tone") if side == "output" else r.get("PL Input Tone")
         if tone: x["rr_tone"] = tone
@@ -1213,6 +1231,7 @@ LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "mhz": 0.0, 
           "chan_at": 0.0,                   # when this channel was first asked for (tuned_at restarts on AUTO → FM)
           "carrier_at": 0.0, "detected": "",   # auto: when the sweep last saw the tuned carrier; what dsd-fme found
           "call": "",                       # trunk: the talkgroup dsd-fme is following right now
+          "starting": False,                # the worker is bringing the tools up (dongle spoken for, proc not yet set)
           "recent": {}, "played": {},      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
           "lockout": []}                   # MHz the phone told us never to follow (a pager, a busy repeater)
 LOCKOUT_TOL = 0.02                         # a hit within this of a locked-out frequency is the same channel
@@ -1233,6 +1252,7 @@ FOLLOW_MAX_S = 30.0         # a channel gets at most this long, then the next wa
 FOLLOW_PROBE_S = AUTO_NO_CARRIER_WAIT_S + 3.0   # AUTO still deciding (no audio flows while dsd-fme probes): not "quiet"
 FOLLOW_COOLDOWN_S = 60.0    # a channel just played isn't returned to for this long (a busy repeater would hog it)
 FOLLOW_RECENT_S = 60.0      # a hit older than this is no longer a candidate
+FOLLOW_TTL_S = 15 * 60.0    # Follow stops by itself this long after the app's last renewal (it renews every minute)
 
 
 def follow_busy(now: float) -> bool:
@@ -1390,7 +1410,7 @@ def follow_watch() -> None:
 def listen_busy(dev: str) -> bool:
     """The dongle is spoken for from the moment a listen is asked for until it ends — not just while
     rtl_fm runs. Otherwise the sweep restarts in the gap and grabs it back (usb_claim_interface -6)."""
-    return (LISTEN["req"] is not None or LISTEN["proc"] is not None) and LISTEN["dev"] == dev
+    return (LISTEN["req"] is not None or LISTEN["proc"] is not None or LISTEN["starting"]) and LISTEN["dev"] == dev
 
 
 def listen_status(msg: str) -> None:
@@ -1581,6 +1601,14 @@ def start_pager(gen: int, mhz: float):
 
 
 def serve_listen(req: tuple, gen: int) -> None:
+    LISTEN["starting"] = True
+    try:
+        _serve_listen(req, gen)
+    finally:
+        LISTEN["starting"] = False
+
+
+def _serve_listen(req: tuple, gen: int) -> None:
     mhz, mode, sq = req
     dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
     procs = []
@@ -1644,6 +1672,7 @@ def serve_listen(req: tuple, gen: int) -> None:
             else:
                 pager = False
     LISTEN["proc"] = p
+    LISTEN["starting"] = False
     LISTEN["tuned_at"] = LISTEN["last_audio"] = time.time()
     print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})", file=sys.stderr)
     listen_status(f"listening on {mhz:.4f} MHz ({mode.upper()}); the RTL-SDR sweep is paused")
@@ -2063,7 +2092,7 @@ def run_peripheral(name: str) -> None:
                 if sq is not None:
                     LISTEN["sq"] = max(0, min(1000, int(sq)))
                 fresh = not LISTEN["follow"]
-                LISTEN["follow"], LISTEN["follow_until"] = True, time.time() + LISTEN_MAX_S
+                LISTEN["follow"], LISTEN["follow_until"] = True, time.time() + FOLLOW_TTL_S
                 if fresh:
                     listen_status("following hits: each new carrier in a voice band is tuned and played")
             else:
@@ -2205,8 +2234,11 @@ def main() -> None:
     ap.add_argument("--kismet-json", metavar="PATH", help="relay Wi-Fi devices from a Kismet JSON export")
     ap.add_argument("--fcc-pack", metavar="PATH", help="local FCC license pack from tools/fcc_local_pack.py; labels licensed carriers")
     ap.add_argument("--rr-pack", metavar="CSV", action="append", default=[],
-                    help="a RadioReference frequency export (CSV) for your county; repeatable. Names hits by agency, description, "
-                         "alpha tag and mode, on both sides of a repeater pair. Preferred over --fcc-pack where it has the frequency")
+                    help="a RadioReference frequency export (CSV); repeatable, most local first (county, then statewide, then "
+                         "nationwide). Names hits by agency, description, alpha tag and mode, on both sides of a repeater pair. "
+                         "Preferred over --fcc-pack where it has the frequency")
+    ap.add_argument("--rr-county", metavar="NAME", action="append", default=[],
+                    help="county (repeatable) whose rows in a statewide export rank ahead of other counties'")
     ap.add_argument("--echo", action="store_true", help="print every line sent to the phone on stderr (see it with journalctl -u wavelens-bridge -f)")
     ap.add_argument("--name", default="", help="advertised name (default Wavelens-XXXX from the adapter address)")
     a = ap.parse_args()
@@ -2218,7 +2250,7 @@ def main() -> None:
         CAPS.append("fcc")
         print(f"bridge: FCC pack loaded, {len(FCC.entries)} licensed frequencies", file=sys.stderr)
     if a.rr_pack:
-        RR = RrPack(a.rr_pack)
+        RR = RrPack(a.rr_pack, a.rr_county)
         CAPS.append("rr")
         print(f"bridge: RadioReference overlay loaded, {len(RR.rows)} frequencies from {len(a.rr_pack)} file(s)", file=sys.stderr)
 

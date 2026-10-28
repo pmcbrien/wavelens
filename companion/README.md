@@ -435,7 +435,7 @@ Tag)*, on both sides of a repeater pair (the input side is "radio keying up near
 carry `rr_agency`, `rr_description`, `rr_alpha`, `rr_mode`, `rr_tone`, `rr_tag`; `agency` is mapped
 from the Tag column so the agency-type alerts work from it; `listen` says how to demodulate (FM, AM,
 DMR, P25, NXDN) and the app's Listen uses it; trunked-site rows say so. Preferred over the FCC pack
-where it has the frequency. The export is the user's own file on the Pi; nothing from it is shipped.
+where it has the frequency. Several exports layer: give them most local first (county, statewide, nationwide); a statewide export's County column ranks the `--rr-county` counties and "Statewide" rows ahead of other counties'. The exports are the user's own files on the Pi; nothing from them is shipped.
 
 **Trunked systems (Lab).** `{"c":"listen","mhz":857.0375,"mode":"trunk"}` (or `"trunkq"` for QPSK/LSM
 simulcast sites) treats `mhz` as a control channel: `dsd-fme -ft -T` decodes the grants and retunes
