@@ -29,6 +29,7 @@ not yet run on a Pi by the author.
 import argparse
 from collections import deque
 import bisect
+import glob
 import json
 import math
 import os
@@ -1046,6 +1047,87 @@ def parse_mask(spec: str) -> "list[tuple[float, float]]":
     return out
 
 
+
+# ---------------------------------------------------------------- PortaPack: switch to HackRF mode
+
+# A HackRF One with a PortaPack running Mayhem boots into its own menu, where it is a USB serial
+# console, not a HackRF: hackrf_sweep finds nothing until someone taps "HackRF" on the screen.
+# Mayhem's console has a `hackrf` command that does the same, so the bridge sends it.
+HACKRF_USB = ("1d50", "6089")
+PORTAPACK_TTY = ""           # --portapack-port; empty = look for one
+_pp_last = 0.0
+
+
+def hackrf_on_usb() -> bool:
+    """True when a HackRF in HackRF mode is on the bus (1d50:6089), without opening it."""
+    for d in glob.glob("/sys/bus/usb/devices/*"):
+        try:
+            with open(d + "/idVendor") as a, open(d + "/idProduct") as b:
+                if (a.read().strip(), b.read().strip()) == HACKRF_USB:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def portapack_tty() -> str:
+    """The PortaPack's serial console, if one is plugged in and in its own (Mayhem) mode."""
+    if PORTAPACK_TTY:
+        return PORTAPACK_TTY if os.path.exists(PORTAPACK_TTY) else ""
+    for path in sorted(glob.glob("/dev/serial/by-id/*")):
+        if re.search(r"portapack|mayhem|great_scott|hackrf", os.path.basename(path), re.I):
+            return path
+    # No by-id link (older udev): any ttyACM whose USB parent is a Great Scott Gadgets device.
+    for tty in sorted(glob.glob("/sys/class/tty/ttyACM*")):
+        try:
+            dev = os.path.realpath(tty + "/device/..")
+            with open(dev + "/idVendor") as a:
+                if a.read().strip() == "1d50":
+                    return "/dev/" + os.path.basename(tty)
+        except OSError:
+            continue
+    return ""
+
+
+def ensure_hackrf_mode(wait_s: float = 10.0) -> bool:
+    """If the HackRF is sitting in the PortaPack menu, send Mayhem's `hackrf` command and wait for it to
+    come back as a HackRF. True when a HackRF is (now) on the bus. At most one try every 30 s."""
+    global _pp_last
+    if hackrf_on_usb():
+        return True
+    tty = portapack_tty()
+    if not tty or time.time() - _pp_last < 30:
+        return False
+    _pp_last = time.time()
+    try:
+        fd = os.open(tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            try:
+                import termios, tty as ttymod
+                ttymod.setraw(fd)                    # no \n → \r\n translation: send exactly what's written
+                termios.tcflush(fd, termios.TCIOFLUSH)
+            except (ImportError, OSError):
+                pass
+            os.write(fd, b"\r\n")
+            time.sleep(0.3)
+            os.write(fd, b"hackrf\r\n")
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print(f"bridge: PortaPack on {tty}: {e}", file=sys.stderr)
+        return False
+    print(f"bridge: PortaPack on {tty}: asked it to switch to HackRF mode", file=sys.stderr)
+    end = time.time() + wait_s
+    while time.time() < end:
+        time.sleep(0.5)
+        if hackrf_on_usb():
+            time.sleep(1.0)              # let it finish enumerating before hackrf_sweep opens it
+            print("bridge: PortaPack is in HackRF mode", file=sys.stderr)
+            return True
+    print("bridge: PortaPack did not come back as a HackRF; will try again", file=sys.stderr)
+    return False
+
+
 def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20, mask: str = "", ppm: float = 0.0) -> None:
     """hackrf_sweep over range_mhz, or over the parked slice while the phone has asked to park.
     A park change stops the running sweep and starts the other one."""
@@ -1056,6 +1138,7 @@ def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20, mask:
         park = state.get("park", "off")
         rng = PARK_RANGES.get(park, range_mhz)
         cmd = f"hackrf_sweep -f {rng} -w {bin_hz} -l {lna} -g {vga}"
+        ensure_hackrf_mode()
         p = spawn(cmd)
         if p is None:
             return
@@ -2385,6 +2468,7 @@ def probe_radios():
     except (OSError, subprocess.TimeoutExpired):
         pass
     hackrf = False
+    ensure_hackrf_mode()
     if shutil.which("hackrf_info"):
         try:
             r = subprocess.run(["hackrf_info"], capture_output=True, text=True, timeout=15)
@@ -2464,6 +2548,9 @@ def main() -> None:
     ap.add_argument("--hackrf-sweep", action="store_true", help="run hackrf_sweep and report carriers by band")
     ap.add_argument("--hackrf-range", default="1:6000", help="MHz range for hackrf_sweep (default 1:6000, the whole range)")
     ap.add_argument("--hackrf-bin", type=int, default=500000, help="bin width Hz (default 500000)")
+    ap.add_argument("--portapack-port", metavar="TTY", default="",
+                    help="PortaPack serial console (default: found automatically); the bridge sends Mayhem's "
+                         "`hackrf` command there when the HackRF is sitting in the PortaPack menu")
     ap.add_argument("--hackrf-lna", type=int, default=32, help="HackRF LNA gain 0-40 dB in 8 dB steps (default 32); lower it if nearby transmitters overload the sweep")
     ap.add_argument("--hackrf-vga", type=int, default=20, help="HackRF baseband gain 0-62 dB in 2 dB steps (default 20)")
     ap.add_argument("--hackrf-mask", metavar="LO:HI[,LO:HI...]", default="",
@@ -2503,6 +2590,7 @@ def main() -> None:
     ap.add_argument("--plan", action="store_true",
                     help="print shell assignments (PLAN_RTL433_DEV, PLAN_ARGS) for the radios found, and exit; run-bridge.sh uses it when WAVELENS_AUTO=1")
     a = ap.parse_args()
+    globals()["PORTAPACK_TTY"] = a.portapack_port
     if a.plan:
         print_plan_shell("")
         return

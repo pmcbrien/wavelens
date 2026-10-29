@@ -17,6 +17,8 @@ WAVELENS_RTL433="-f 315M -f 433.92M -f 915M -H 30 -g 40"
 #   --hackrf-sweep                          HackRF energy sweep of the whole 1 MHz–6 GHz range (~1 s a pass),
 #                                           every carrier labelled by band; see README "HackRF: what the full sweep labels"
 #   --hackrf-sweep --hackrf-range 5600:5950 HackRF on 5.8 GHz video only (faster passes)
+#   --portapack-port /dev/ttyACM0           HackRF with a PortaPack (Mayhem): the bridge switches it to HackRF
+#                                           mode by itself; set this only if it doesn't find the console
 #   --hackrf-park-range 450:470             where the HackRF parks when the app's "Body cams & radios"
 #                                           is on (default 796:816, 700/800 MHz public-safety radios)
 #   HackRF + two RTL-SDRs on one Pi: use a powered USB hub (diagrams/pi-hackrf-2sdr.svg)

@@ -244,6 +244,14 @@ where handhelds and car radios transmit — so a radio keying up nearby shows on
 whose or what. Change the slice with `--hackrf-park-range 450:470` (for example, where your county's
 radios are UHF). Everything else, drones and 5.8 GHz video included, goes quiet while parked.
 
+**HackRF with a PortaPack.** A HackRF One fitted with a PortaPack running Mayhem boots into its own
+menu, where it is a USB serial console rather than a HackRF, and `hackrf_sweep` finds nothing. The
+bridge handles that: before each sweep, if no HackRF is on the bus but a PortaPack console is, it
+sends Mayhem's `hackrf` console command and waits for the radio to come back as a HackRF — the same
+as tapping *HackRF* on the screen. The console is found under `/dev/serial/by-id/`, or any `ttyACM`
+from a Great Scott Gadgets device; pin it with `--portapack-port /dev/ttyACM0` if needed. It tries
+at most once every 30 s, and the log says `PortaPack is in HackRF mode` when it worked.
+
 A Pi with all three receivers: [diagrams/pi-hackrf-2sdr.svg](diagrams/pi-hackrf-2sdr.svg). Put them
 on a **powered USB hub**; a Pi 4 cannot supply a HackRF and two RTL-SDRs on its own.
 
