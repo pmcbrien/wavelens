@@ -402,6 +402,14 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // squelch, changeable any time. Renew within 5 min or it stops itself.
 ```
 
+**Automatic radio plan.** `WAVELENS_AUTO=1` in `/etc/default/wavelens-bridge` (the default for new
+installs) makes `run-bridge.sh` ask the bridge for a plan (`wavelens_bridge.py --plan`) at every start:
+it counts the RTL-SDRs (`rtl_test -t`) and checks for a HackRF (`hackrf_info`) and assigns roles —
+1 dongle: rtl_433 sensors; 2: + the VHF/UHF/800 sweep, which listening borrows; 3: + a dongle of its own
+for listening; 4: VHF and UHF sweeps on separate dongles; 5+: a 900 MHz / 1.2 GHz / GNSS sweep too; the
+HackRF, when present, sweeps 1–6000 MHz. Dongles are addressed by serial when unique, else by index.
+`WAVELENS_ARGS` then carries only the extras (mask, packs, name). Replug and restart to re-plan.
+
 **Listening (SDR bridge, capability `listen`).** Listen, Follow, digital voice and trunk-tracking are in
 the Play Store app as well as Wavelens Lab (since 28 Oct); only pager decoding is Lab-only, and the
 bridge runs that decoder only for a client that sends `{"c":"pages","v":true}`. The bridge borrows an RTL-SDR — by default the first

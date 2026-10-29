@@ -2369,6 +2369,95 @@ def run_peripheral(name: str) -> None:
     dev.publish()
 
 
+
+# ---------------------------------------------------------------- radio plan: adapt to what is plugged in
+
+def probe_radios():
+    """RTL-SDR dongles (index, serial) from rtl_test -t, and whether a HackRF answers. Both tools are
+    quick and release the device when done; a dongle another process holds still lists."""
+    rtls = []
+    try:
+        out = subprocess.run(["rtl_test", "-t"], capture_output=True, text=True, timeout=15)
+        for ln in (out.stdout + out.stderr).splitlines():
+            m = re.match(r"\s*(\d+):\s*(.+?),\s*(.+?),\s*SN:\s*(\S+)", ln)
+            if m:
+                rtls.append((int(m.group(1)), m.group(4).strip()))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    hackrf = False
+    if shutil.which("hackrf_info"):
+        try:
+            r = subprocess.run(["hackrf_info"], capture_output=True, text=True, timeout=15)
+            hackrf = r.returncode == 0 and "Serial number" in (r.stdout + r.stderr)
+        except (OSError, subprocess.TimeoutExpired):
+            hackrf = False
+    return rtls, hackrf
+
+
+SWEEP_VHF = ["144M:174M:12.5k"]
+SWEEP_UHF = ["440M:470M:12.5k", "806M:824M:12.5k"]
+SWEEP_ISM = ["902M:928M:25k", "1240M:1300M:100k", "1559M:1610M:100k"]
+
+
+def plan_radios(rtls, hackrf) -> dict:
+    """Roles by how many RTL-SDRs there are. The sensor decoder (rtl_433) always comes first: it is what
+    the app's TPMS / sensor side needs. Then the VHF/UHF sweeps, then a dongle of its own for listening,
+    then the two sweeps on separate dongles, then the ISM / video / GNSS ranges.
+      1  rtl_433
+      2  rtl_433 · VHF+UHF+800 sweep (listening borrows it)
+      3  rtl_433 · VHF+UHF+800 sweep · listen
+      4  rtl_433 · VHF sweep · UHF+800 sweep · listen
+      5+ … · 900 MHz / 1.2 GHz / GNSS sweep
+    Dongles are addressed by serial when the serials are unique, else by index (cheap ones all say
+    00000001; rtl_eeprom -s sets a new serial)."""
+    serials = [sn for _, sn in rtls]
+    unique = len(set(serials)) == len(serials)
+    ids = [sn if unique else str(i) for i, sn in rtls]
+    plan = {"rtl433": "", "sweeps": [], "listen": "", "hackrf": hackrf, "by": "serial" if unique else "index",
+            "roles": []}
+    n = len(ids)
+    if n >= 1:
+        plan["rtl433"] = ids[0]; plan["roles"].append((ids[0], "rtl_433 sensors (TPMS, 315/433/915 MHz)"))
+    if n == 2:
+        plan["sweeps"] += [f"{r}@{ids[1]}" for r in SWEEP_VHF + SWEEP_UHF]
+        plan["listen"] = ids[1]; plan["roles"].append((ids[1], "VHF + UHF + 800 sweep; listening borrows it"))
+    elif n == 3:
+        plan["sweeps"] += [f"{r}@{ids[1]}" for r in SWEEP_VHF + SWEEP_UHF]
+        plan["listen"] = ids[2]
+        plan["roles"] += [(ids[1], "VHF + UHF + 800 sweep"), (ids[2], "listen / Follow / trunking")]
+    elif n >= 4:
+        plan["sweeps"] += [f"{r}@{ids[1]}" for r in SWEEP_VHF] + [f"{r}@{ids[2]}" for r in SWEEP_UHF]
+        plan["listen"] = ids[3]
+        plan["roles"] += [(ids[1], "VHF sweep 144–174"), (ids[2], "UHF 440–470 + 806–824 sweep"), (ids[3], "listen / Follow / trunking")]
+        if n >= 5:
+            plan["sweeps"] += [f"{r}@{ids[4]}" for r in SWEEP_ISM]
+            plan["roles"].append((ids[4], "900 MHz ISM / 1.2 GHz video / GNSS sweep"))
+        for extra in ids[5:]:
+            plan["roles"].append((extra, "spare"))
+    return plan
+
+
+def print_plan_shell(extra_hackrf: str) -> None:
+    """--plan: print shell assignments for run-bridge.sh (WAVELENS_AUTO=1). Everything else the user put
+    in WAVELENS_ARGS (masks, packs, name) is appended by the script as before."""
+    rtls, hackrf = probe_radios()
+    plan = plan_radios(rtls, hackrf)
+    for dev, role in plan["roles"]:
+        print(f"bridge: plan: RTL-SDR {dev} → {role}", file=sys.stderr)
+    print(f"bridge: plan: HackRF {'found → 1–6000 MHz sweep' if hackrf else 'not found'}; {len(rtls)} RTL-SDR(s) by {plan['by']}", file=sys.stderr)
+    args = []
+    for sp in plan["sweeps"]:
+        args += ["--rtl-power", sp]
+    if plan["listen"]:
+        args += ["--listen-device", plan["listen"]]
+    if hackrf:
+        args += ["--hackrf-sweep", "--hackrf-range", "1:6000", "--hackrf-lna", "16", "--hackrf-bin", "100000"]
+    rtl433 = ""
+    if plan["rtl433"]:
+        rtl433 = f"-d {':' + plan['rtl433'] if plan['by'] == 'serial' else plan['rtl433']}"
+    print(f"PLAN_RTL433_DEV={shlex.quote(rtl433)}")
+    print(f"PLAN_ARGS={shlex.quote(' '.join(shlex.quote(x) for x in args))}")
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rtl433", action="store_true", help="stdin is rtl_433 -F json")
@@ -2411,7 +2500,12 @@ def main() -> None:
                     help="county (repeatable) whose rows in a statewide export rank ahead of other counties'")
     ap.add_argument("--echo", action="store_true", help="print every line sent to the phone on stderr (see it with journalctl -u wavelens-bridge -f)")
     ap.add_argument("--name", default="", help="advertised name (default Wavelens-XXXX from the adapter address)")
+    ap.add_argument("--plan", action="store_true",
+                    help="print shell assignments (PLAN_RTL433_DEV, PLAN_ARGS) for the radios found, and exit; run-bridge.sh uses it when WAVELENS_AUTO=1")
     a = ap.parse_args()
+    if a.plan:
+        print_plan_shell("")
+        return
 
     global FCC, RR, ECHO, HACKRF_ON
     ECHO = a.echo

@@ -32,6 +32,20 @@ done
 # it); otherwise BlueZ refuses the new advert. hciconfig is deprecated but present on Raspberry Pi OS.
 if command -v hciconfig >/dev/null 2>&1; then hciconfig hci0 noleadv >/dev/null 2>&1 || true; fi
 
+# WAVELENS_AUTO=1: the bridge looks at what is plugged in (rtl_test, hackrf_info) and assigns roles —
+# sensors, VHF/UHF sweeps, a listening dongle, the HackRF sweep — by how many radios there are.
+# WAVELENS_ARGS then carries only the extras (masks, packs, name); WAVELENS_RTL433 only rtl_433's
+# frequencies and gain (the -d is added here). Replug a dongle and restart: the plan is redone.
+if [ "${WAVELENS_AUTO:-0}" = "1" ]; then
+    eval "$(python3 $BRIDGE --plan)"
+    WAVELENS_ARGS="${PLAN_ARGS:-} ${WAVELENS_ARGS:-}"
+    if [ -n "${PLAN_RTL433_DEV:-}" ]; then
+        WAVELENS_RTL433="$PLAN_RTL433_DEV ${WAVELENS_RTL433:--f 315M -f 433.92M -f 915M -H 30 -g 40}"
+    else
+        WAVELENS_RTL433=""
+    fi
+fi
+
 # shellcheck disable=SC2086  # word splitting of the argument strings is intended
 if [ -n "${WAVELENS_RTL433:-}" ]; then
     # The bridge is the main process and reads rtl_433 through process substitution, so if the

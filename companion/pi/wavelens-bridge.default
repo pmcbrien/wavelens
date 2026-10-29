@@ -1,8 +1,16 @@
 # /etc/default/wavelens-bridge — settings for wavelens-bridge.service.
 # After editing: sudo systemctl restart wavelens-bridge
 
+# Automatic radio plan. With WAVELENS_AUTO=1 the bridge counts the RTL-SDRs and the HackRF at every start
+# and assigns roles — 1: sensors; 2: + VHF/UHF/800 sweep (listening borrows it); 3: + a dongle of its own
+# for listening; 4: VHF and UHF sweeps on separate dongles; 5+: 900 MHz / 1.2 GHz / GNSS sweep too.
+# WAVELENS_RTL433 then holds only rtl_433's frequencies and gain, and WAVELENS_ARGS only the extras
+# (--hackrf-mask, --fcc-pack, --rr-pack, --name): the sweeps, --listen-device and --hackrf-sweep come
+# from the plan. Set it to 0 to pin everything by hand as below.
+WAVELENS_AUTO=1
+
 # RTL-SDR decoding with rtl_433. Hops 315 / 433.92 / 915 MHz every 30 s with fixed gain.
-# Leave empty if no RTL-SDR is plugged in.
+# Leave empty if no RTL-SDR is plugged in. (With WAVELENS_AUTO=1, no -d here: the plan adds it.)
 WAVELENS_RTL433="-f 315M -f 433.92M -f 915M -H 30 -g 40"
 
 # Extra bridge flags. Examples:
