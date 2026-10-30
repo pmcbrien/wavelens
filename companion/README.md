@@ -453,18 +453,24 @@ from the Tag column so the agency-type alerts work from it; `listen` says how to
 DMR, P25, NXDN) and the app's Listen uses it; trunked-site rows say so. Preferred over the FCC pack
 where it has the frequency. Several exports layer: give them most local first (county, statewide, nationwide); a statewide export's County column ranks the `--rr-county` counties and "Statewide" rows ahead of other counties'. The exports are the user's own files on the Pi; nothing from them is shipped.
 
-**Trunked systems.** `{"c":"listen","v":"trunk","qpsk":true}` follows the nearest trunked system
-the RadioReference overlay knows: the bridge counts every sweep hit on a system's site frequencies and
-tries the one that never stops (an always-on carrier) as the control channel, then the next if dsd-fme
-shows no sync within 12 s. `"mhz"` names a control channel instead. `{"c":"listen","v":"trunkauto",
-"on":true}` lets Follow take trunked systems on its own when the sweep hears one (it stays until four
-minutes pass without a call). EDACS and DMR Cap+/Con+/Tier III sites get a channel map written from the
-overlay's site frequencies (LCN by ascending frequency — the usual convention, not a guarantee). Encrypted
-calls are never tuned, but their grants are reported: `call` reads "TG 1234 from 5678 · encrypted (ALGID 0xAA)".
-Motorola Type II / SmartNet and LTR cannot be decoded by dsd-fme. With a control channel, the command treats `mhz` as one: `dsd-fme -ft -T` decodes the grants and retunes
-the dongle (through rtl_tcp) to each voice channel and back — P25 phase 1/2, DMR Tier III / Cap+ /
-Con+. No snapping or honing; status carries `call` ("TG 1234 from 5678") while a call is followed.
-Encrypted calls are never tuned (dsd-fme's default). Unencrypted public-safety trunked traffic is
+**Trunked systems.** `{"c":"listen","v":"trunk"}` locks onto the nearest trunked system's control
+channel without being told it. Candidates, in order: the control channel that worked last time
+(`/var/lib/wavelens/control-channel.json`); site frequencies the sweep has matched to a RadioReference
+trunked site, most constant first; and, always, a **hunt** on the listening dongle — `rtl_power` over the
+base-station side of the trunking bands (851–869, 769–775, 935–940, 450–470, 150.8–174 MHz, about 6 s
+each), keeping carriers that are at least 12 dB over the band in *every* reading. A control channel never
+stops; voice channels and conventional repeaters come and go. Each candidate is tried with `dsd-fme -ft -T`
+in C4FM, then in CQPSK (`-mq`, simulcast/LSM sites — most large county P25 systems), 8 s each; the first
+sync locks on and is remembered. RadioReference modes P25, P25e, Project 25, APCO-25 and TDMA (phase II)
+are all treated as P25. `"mhz"` still names a control channel directly if a client wants to.
+`{"c":"listen","v":"trunkauto","on":true}` lets Follow take trunked systems the sweep hears on its own (it
+stays until four minutes pass without a call). EDACS and DMR Cap+/Con+/Tier III sites get a channel map
+written from the overlay's site frequencies (LCN by ascending frequency — the usual convention, not a
+guarantee). dsd-fme decodes the grants and retunes the dongle (through rtl_tcp) to each voice channel and
+back — P25 phase 1/2, DMR Tier III / Cap+ / Con+. Status carries `call` while a call is followed:
+**talkgroup only** ("TG 1234"; encrypted grants read "TG 1234 · encrypted (ALGID 0xAA)") — the source
+radio's unit ID is never read or shown. Encrypted calls are never tuned (dsd-fme's default). Motorola
+Type II / SmartNet and LTR cannot be decoded by dsd-fme. Unencrypted public-safety trunked traffic is
 lawful to receive in the US; check state law for a receiver in a vehicle.
 
 **Auto mode** starts `dsd-fme -fa`; the sync it reports on stderr ("Sync: +DMR", "+P25p1") names the
