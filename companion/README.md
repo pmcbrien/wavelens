@@ -486,7 +486,9 @@ in C4FM, then in CQPSK (`-mq`, simulcast/LSM sites — most large county P25 sys
 sync locks on and is remembered. RadioReference modes P25, P25e, Project 25, APCO-25 and TDMA (phase II)
 are all treated as P25. `"mhz"` still names a control channel directly if a client wants to.
 `{"c":"listen","v":"trunkauto","on":true}` lets Follow take trunked systems the sweep hears on its own (it
-stays until four minutes pass without a call). EDACS and DMR Cap+/Con+/Tier III sites get a channel map
+stays until four minutes pass without a call) — public-safety systems only: never military / federal, and
+never business systems (FleetTalk, BCI, hotels, utilities), even ones a talkgroups export covers. Lock onto
+the nearest system still considers every system; it only ranks those lower. EDACS and DMR Cap+/Con+/Tier III sites get a channel map
 written from the overlay's site frequencies (LCN by ascending frequency — the usual convention, not a
 guarantee). dsd-fme decodes the grants and retunes the dongle (through rtl_tcp) to each voice channel and
 back — P25 phase 1/2, DMR Tier III / Cap+ / Con+. Status carries `call` while a call is followed:

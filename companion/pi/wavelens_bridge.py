@@ -407,6 +407,40 @@ def rr_site(row: dict):
     return agency, site, trunk_kind(row.get("Mode") or row.get("System Type") or "p25") or "p25"
 
 
+FEDERAL_WORDS = ("united states", "air force", "army", "navy", "marine corps", "coast guard",
+                 "federal", "u.s.", "usaf", "national guard", "department of defense")
+
+
+def is_federal(who: str) -> bool:
+    return any(k in who.lower() for k in FEDERAL_WORDS)
+
+
+def is_public_system(who: str) -> bool:
+    w = who.lower()
+    return any(k in w for k in RR_PUBLIC) or any(k in w for k in ("county", "city of", "local government", "sheriff", "police"))
+
+
+def trunk_auto_ok(x: dict) -> bool:
+    """Follow takes a trunked system by itself only when it is public safety — never military / federal, and
+    never a business system (FleetTalk, BCI, a hotel, a utility), even one your talkgroups export covers.
+    Lock onto the nearest system is unaffected: it ranks, it doesn't exclude."""
+    raw = ""
+    if RR:
+        try:
+            lic = float(x.get("lic_mhz") or 0)
+        except ValueError:
+            lic = 0.0
+        row = (RR.control_at(lic) or (None, None, None))[2] if lic else None
+        row = row or (RR.site_at(lic) if lic else None)
+        raw = (row.get("Agency/Category") or "") if row else ""
+    who = raw or x.get("rr_agency") or ""
+    if is_federal(who):
+        return False
+    if x.get("agency") == "Business" or not is_public_system(who) and x.get("agency") != "Public safety":
+        return False
+    return True
+
+
 def rr_controls_ranked(limit: int = 6):
     """RadioReference control channels, best first: ones the sweep has heard lately, then the nearest site
     (when the phone shares its position and the export has coordinates), then the most local export."""
@@ -429,10 +463,8 @@ def rr_controls_ranked(limit: int = 6):
             except ValueError:
                 pass
         who = (row.get("Agency/Category") or "").lower()
-        federal = any(k in who for k in ("united states", "air force", "army", "navy", "marine corps", "coast guard",
-                                          "federal", "u.s.", "usaf", "national guard", "department of defense"))
-        public = not federal and (any(k in who for k in RR_PUBLIC) or
-                                  any(k in who for k in ("county", "city of", "local government", "sheriff", "police")))
+        federal = is_federal(who)
+        public = not federal and is_public_system(who)
         # Inside a site's own coverage (RadioReference's Range, miles; 25 if blank) every site counts as
         # local, and among local sites the public-safety system goes before a utility or a hotel. Many
         # exports place every site at its county's centre, so distance alone is a poor tiebreak.
@@ -1953,7 +1985,7 @@ def follow_hit(obj: dict) -> None:
     x = obj.get("x") or {}
     if "trunked_site" in x:
         # A trunked site's channel is not voice to play; with automatic trunking on, the system is followed instead.
-        if TRUNK["auto"] and (LISTEN["req"] is None or LISTEN["mode"] not in TRUNK_MODES):
+        if TRUNK["auto"] and (LISTEN["req"] is None or LISTEN["mode"] not in TRUNK_MODES) and trunk_auto_ok(x):
             site = (x.get("rr_agency") or "?", x.get("rr_description") or "?", trunk_kind(x.get("rr_mode") or ""))
             if (LISTEN["req"] is None or not follow_busy(time.time())) and not HUNT["on"]:
                 trunk_start(site)
