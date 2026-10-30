@@ -2039,7 +2039,10 @@ def cc_hunt(first: list) -> None:
     TRUNK["hunted"] = True
     found = []
     try:
-        time.sleep(2.5)                      # the sweep on this dongle sees listen_busy and lets go of it
+        # The sweep on this dongle sees listen_busy and is told to stop, but rtl_power can sit in a USB read
+        # for many seconds after SIGTERM. Don't wait on its manners: terminate any rtl_power on this device
+        # now, SIGKILL after 3 s, and only then open the dongle. (The sweep thread waits while HUNT is on.)
+        free_dongle(LISTEN["dev"])
         dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
         ppm = f" -p {LISTEN['ppm']}" if LISTEN["ppm"] else ""
         for spec, lo, hi, label in CC_BANDS:
@@ -2102,6 +2105,20 @@ def cc_hunt(first: list) -> None:
         for f, _, row in rr_controls_ranked(CC_MAX_TRIES):
             tries += [(f, md) for md in trunk_modes(rr_site(row)[2])]
     trunk_try(tries, "the nearest system" + (f" ({len(found)} steady carriers heard)" if found else " (nothing steady heard; trying your list)"))
+
+
+def free_dongle(dev: str, wait_s: float = 3.0) -> None:
+    """Stop every rtl_power / rtl_fm / rtl_tcp holding this dongle (by serial or index as given on their
+    command line), waiting up to wait_s for a clean exit before killing."""
+    pat = f"(rtl_power|rtl_fm|rtl_tcp)( .*)? -d {re.escape(dev)}( |$)" if dev else r"(rtl_power|rtl_fm)( |$)"
+    for sig, pause in (("-TERM", wait_s), ("-KILL", 1.0)):
+        subprocess.call(["pkill", sig, "-f", pat], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        t0 = time.time()
+        while time.time() - t0 < pause:
+            if subprocess.call(["pgrep", "-f", pat], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+                time.sleep(0.5)              # libusb needs a moment after the process is gone
+                return
+            time.sleep(0.2)
 
 
 def cc_steady(rows: list) -> list:
