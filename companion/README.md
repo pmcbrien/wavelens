@@ -455,10 +455,15 @@ where it has the frequency. Several exports layer: give them most local first (c
 
 **Trunked systems.** `{"c":"listen","v":"trunk"}` locks onto the nearest trunked system's control
 channel without being told it. Candidates, in order: the control channel that worked last time
-(`/var/lib/wavelens/control-channel.json`); site frequencies the sweep has matched to a RadioReference
-trunked site, most constant first; and, always, a **hunt** on the listening dongle — `rtl_power` over the
+(`/var/lib/wavelens/control-channel.json`); **the control channels in your RadioReference exports** —
+marked `851.0125c` (primary) / `851.0125a` (alternate), a Control / Use column, a description such as
+"Control Channel", or a site export with the frequencies in one cell — ones the sweep has heard first, then
+the nearest site (when the phone shares its position and the export has Lat/Lon), primaries before
+alternates; site frequencies the sweep has matched to a RadioReference trunked site, most constant first;
+and, if none of those syncs, a **hunt** on the listening dongle — `rtl_power` over the
 base-station side of the trunking bands (851–869, 769–775, 935–940, 450–470, 150.8–174 MHz, about 6 s
-each), keeping carriers that are at least 12 dB over the band in *every* reading. A control channel never
+each), keeping carriers that are at least 12 dB over the band in *every* reading (ones your list calls control
+channels first, at their listed frequency). A control channel never
 stops; voice channels and conventional repeaters come and go. Each candidate is tried with `dsd-fme -ft -T`
 in C4FM, then in CQPSK (`-mq`, simulcast/LSM sites — most large county P25 systems), 8 s each; the first
 sync locks on and is remembered. RadioReference modes P25, P25e, Project 25, APCO-25 and TDMA (phase II)

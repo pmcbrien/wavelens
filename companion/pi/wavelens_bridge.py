@@ -148,6 +148,9 @@ class RrPack:
         ahead of other counties' rows, which stay usable for a drive out of the area."""
         import csv
         self.rows = []          # (mhz, side, row); row["_rank"] orders competing matches
+        # Trunked-site control channels: RadioReference marks them "851.0125c" (primary) / "851.0125a"
+        # (alternate), or a column / description says "control". [(mhz, primary, row)]
+        self.controls = []
         want = {c.strip().lower() for c in counties if c.strip()}
         for rank, path in enumerate(paths):
             with open(path, encoding="utf-8-sig", newline="") as f:
@@ -158,20 +161,40 @@ class RrPack:
                         row["Agency/Category"] = row["Nationwide Agency"]
                     county = row.get("County", "")
                     row["_rank"] = rank * 2 + (0 if not county or county.lower() == "statewide" or county.lower() in want else 1)
-                    try:
-                        out = float(row.get("Frequency Output") or 0)
-                    except ValueError:
-                        out = 0.0
-                    try:
-                        inp = float(row.get("Frequency Input") or 0)
-                    except ValueError:
-                        inp = 0.0
+                    out, flag = rr_freq(row.get("Frequency Output"))
+                    inp, _ = rr_freq(row.get("Frequency Input"))
+                    if flag or rr_says_control(row):
+                        if 24.0 <= out <= 6000.0:
+                            self.controls.append((out, flag != "a", row))
+                    if not row.get("Frequency Output"):
+                        # A site export: one row per site, its frequencies in several cells ("851.0125c, 852.5375 …").
+                        for k, v in row.items():
+                            if k.startswith("_"):
+                                continue
+                            for tok in re.split(r"[\s,;]+", v or ""):
+                                f, fl = rr_freq(tok)
+                                if fl and 24.0 <= f <= 6000.0:
+                                    self.controls.append((f, fl != "a", row))
                     if 24.0 <= out <= 6000.0:
                         self.rows.append((out, "output", row))
                     if 24.0 <= inp <= 6000.0:      # a mangled input (one export had 46053250.0) is skipped
                         self.rows.append((inp, "input", row))
         self.rows.sort(key=lambda t: t[0])
         self.keys = [t[0] for t in self.rows]
+        seen, uniq = set(), []
+        for f, primary, row in sorted(self.controls, key=lambda c: (not c[1], c[2].get("_rank", 9), c[0])):
+            if round(f, 4) not in seen:
+                seen.add(round(f, 4)); uniq.append((f, primary, row))
+        self.controls = uniq
+
+    def control_at(self, mhz: float, tol_mhz: float = 0.0065):
+        """The control-channel entry at this frequency, or None."""
+        best = None
+        for f, primary, row in self.controls:
+            d = abs(f - mhz)
+            if d <= tol_mhz and (best is None or d < best[0]):
+                best = (d, (f, primary, row))
+        return best[1] if best else None
 
     @staticmethod
     def _freq(hit) -> float:
@@ -263,6 +286,59 @@ class RrPack:
 
 
 RR: "RrPack | None" = None
+
+
+def rr_freq(v):
+    """'851.01250c' → (851.0125, 'c'); '453.2' → (453.2, ''); anything else → (0.0, '')."""
+    m = re.match(r"^\s*(\d{2,4}\.\d+)\s*([ca])?\*?\s*$", str(v or ""), re.I)
+    if not m:
+        return 0.0, ""
+    return float(m.group(1)), (m.group(2) or "").lower()
+
+
+def rr_says_control(row: dict) -> bool:
+    """A column or the description naming the channel a control channel ("Control", "CC", "Use: c")."""
+    for k, v in row.items():
+        if k.startswith("_") or not isinstance(v, str):
+            continue
+        kl, vl = k.lower(), v.strip().lower()
+        if kl in ("control", "control channel", "cc") and vl in ("1", "y", "yes", "true", "x", "c", "primary", "alternate", "a"):
+            return True
+        if kl in ("use", "type", "channel type", "usage") and (vl in ("c", "a", "cc") or "control" in vl):
+            return True
+    d = f"{row.get('Description', '')} {row.get('Alpha Tag', '')}".lower()
+    return bool(re.search(r"\bcontrol( channel)?\b|\bcntl\b|\bctrl\b", d))
+
+
+def rr_site(row: dict):
+    """(agency, site, kind) for a control-channel row, named the way the rest of the bridge names it."""
+    agency = abbrev(row.get("Agency/Category") or row.get("System Name") or row.get("System") or "?")
+    site = abbrev(row.get("Description") or row.get("Site Name") or row.get("Site") or "?")
+    return agency, site, trunk_kind(row.get("Mode") or row.get("System Type") or "p25") or "p25"
+
+
+def rr_controls_ranked(limit: int = 6):
+    """RadioReference control channels, best first: ones the sweep has heard lately, then the nearest site
+    (when the phone shares its position and the export has coordinates), then the most local export."""
+    if not RR or not RR.controls:
+        return []
+    now = time.time()
+    heard = {round(m, 4): v for m, v in TRUNK["seen"].items() if now - v[1] <= TRUNK_SEEN_S}
+    lat, lon = state.get("lat"), state.get("lon")
+
+    def key(c):
+        f, primary, row = c
+        h = any(abs(f - m) <= 0.0065 for m in heard)
+        d = 1e9
+        if lat is not None and lon is not None:
+            try:
+                la = float(row.get("Lat") or row.get("Latitude") or "x")
+                lo = float(row.get("Lon") or row.get("Long") or row.get("Longitude") or "x")
+                d = haversine_km(lat, lon, la, lo)
+            except ValueError:
+                pass
+        return (not h, d, not primary, row.get("_rank", 9))
+    return sorted(RR.controls, key=key)[:limit]
 
 # ---------------------------------------------------------------- local FCC license pack
 
@@ -1540,11 +1616,24 @@ def trunk_start(site=None, qpsk=None) -> bool:
     Each candidate is tried with C4FM and with simulcast QPSK. Returns True (the search runs in the background)."""
     if qpsk is not None:
         TRUNK["qpsk"] = bool(qpsk)
+    TRUNK["hunted"] = False
     site, cands = trunk_candidates(site)
     tries = []
     last = cc_load()
     if last and site is None:
         tries.append((last[0], last[1]))
+    if site is not None and RR:
+        # The system the sweep heard: its own control channels from the export go first.
+        own = [c for c in rr_controls_ranked(50) if rr_site(c[2])[:2] == site[:2]]
+        for f, _, row in own[:4]:
+            tries += [(f, md) for md in trunk_modes(rr_site(row)[2])]
+    if site is None and RR and RR.controls:
+        # Nearest system: the export's control channels, heard / nearest first; the hunt follows if none syncs.
+        TRUNK["site"], TRUNK["map"] = ("?", "nearest system", "p25"), ""
+        for f, _, row in rr_controls_ranked():
+            tries += [(f, md) for md in trunk_modes(rr_site(row)[2])]
+        trunk_try(tries, "the nearest system (control channels from your RadioReference list)")
+        return True
     if cands:
         for m in cands[:5]:
             tries += [(m, md) for md in trunk_modes(site[2])]
@@ -1564,6 +1653,9 @@ def trunk_try(tries: list, what: str) -> None:
         k = (round(m, 4), md)
         if k not in seen:
             seen.add(k); uniq.append((m, md))
+    if not uniq and not TRUNK.get("hunted"):
+        threading.Thread(target=cc_hunt, args=([],), daemon=True).start()
+        return
     if not uniq:
         listen_stop("no control channel found")
         listen_status("trunked: no control channel found nearby — no steady carrier in the trunking bands synced as P25 or DMR")
@@ -1578,6 +1670,7 @@ def cc_hunt(first: list) -> None:
     """Scan the trunking bands on the listening dongle for carriers that are on in every reading (a control
     channel transmits continuously; voice channels and conventional repeaters come and go), strongest first."""
     HUNT["on"], HUNT["cancel"] = True, False
+    TRUNK["hunted"] = True
     found = []
     try:
         time.sleep(2.5)                      # the sweep on this dongle sees listen_busy and lets go of it
@@ -1610,8 +1703,13 @@ def cc_hunt(first: list) -> None:
     if HUNT["cancel"]:
         return
     tries = list(first)
+    if RR and RR.controls:
+        found.sort(key=lambda c: (RR.control_at(c[0]) is None, -c[1]))   # carriers your list calls control channels first
     for m, _ in found[:CC_MAX_TRIES]:
-        tries += [(m, md) for md in trunk_modes("p25")]
+        cc = RR.control_at(m) if RR else None
+        if cc:
+            m = cc[0]                        # the listed frequency is exact; the scan's is within a channel
+        tries += [(m, md) for md in trunk_modes(rr_site(cc[2])[2] if cc else "p25")]
     trunk_try(tries, "the nearest system")
 
 
@@ -1690,6 +1788,8 @@ def trunk_next(why: str) -> None:
         listen_status(f"trunked: {why}; trying {nxt:.4f} MHz ({'QPSK' if md == 'trunkq' else 'C4FM' if md == 'trunk' else md})"
                       + (f" for {site[0]}" if site[0] != "?" else ""))
         listen_start(nxt, md, LISTEN["sq"], 0.0)
+    elif not TRUNK.get("hunted"):
+        threading.Thread(target=cc_hunt, args=([],), daemon=True).start()
     else:
         listen_stop("no control channel found")
         listen_status("trunked: no control channel found nearby — none of the steady carriers synced as P25 or DMR")
@@ -2103,6 +2203,10 @@ def _serve_listen(req: tuple, gen: int) -> None:
                         TRUNK["cc_at"], TRUNK["tries"] = 0.0, []
                         site = TRUNK["site"] or ("?", "nearest system", "")
                         name = site[0] if site[0] != "?" else site[1]
+                        cc = RR.control_at(mhz) if RR else None
+                        if cc:
+                            a, s, _ = rr_site(cc[2])
+                            name = f"{a} ({s})" if s != "?" else a
                         cc_save(mhz, mode, name)
                         listen_status(f"trunked: locked onto the control channel {mhz:.4f} MHz ({sync}, "
                                       f"{'QPSK' if mode == 'trunkq' else 'C4FM' if mode == 'trunk' else mode}) — waiting for a call")
@@ -2772,7 +2876,8 @@ def main() -> None:
     if a.rr_pack:
         RR = RrPack(a.rr_pack, a.rr_county)
         CAPS.append("rr")
-        print(f"bridge: RadioReference overlay loaded, {len(RR.rows)} frequencies from {len(a.rr_pack)} file(s)", file=sys.stderr)
+        print(f"bridge: RadioReference overlay loaded, {len(RR.rows)} frequencies, {len(RR.controls)} trunked control channels "
+              f"from {len(a.rr_pack)} file(s)", file=sys.stderr)
 
     if a.kismet_json:
         CAPS.append("wifi")
