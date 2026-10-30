@@ -1868,7 +1868,10 @@ def cc_sync_ok(sync: str, mode: str) -> bool:
 
 def cc_forget(mhz: float) -> None:
     """A candidate that failed is not the control channel; if it is the one the cache remembers, drop it,
-    or every later Follow would start on it again."""
+    or every later Follow would start on it again. The hunt's ranking remembers the failure too."""
+    for r in TRUNK.get("ranked") or []:
+        if abs(r["mhz"] - mhz) <= 0.001:
+            r["failed_at"] = time.time()
     last = cc_load()
     if last and abs(last[0] - mhz) < 0.001:
         try:
@@ -1879,7 +1882,39 @@ def cc_forget(mhz: float) -> None:
 
 TRUNK_SEEN_S = 180.0        # a site frequency counts as a candidate for this long after its last hit
 TRUNK_CC_WAIT_S = 12.0      # dsd-fme must show a sync on a candidate within this, else the next is tried (rtl_tcp start + sync)
-TRUNK_IDLE_S = 240.0        # Follow leaves a trunked system after this long without a call
+TRUNK_IDLE_S = 45.0         # a locked system with no call for this long: on to the next strongest system
+TRUNK_RANK_TTL_S = 15 * 60.0  # the hunt's ranking of nearby systems is re-done after this
+TRUNK_FAIL_SKIP_S = 10 * 60.0 # a carrier that gave no sync is not retried for this long
+
+
+def trunk_next_system(now: float) -> bool:
+    """Scanner behaviour on a quiet system: the next strongest steady carrier from the last hunt that
+    isn't the one we're on and hasn't just failed to sync. Round-robin back to the strongest when the
+    list is exhausted; a fresh hunt when the ranking is stale. False if there is nothing else to try."""
+    ranked = TRUNK.get("ranked") or []
+    if not ranked or now - TRUNK.get("ranked_at", 0.0) > TRUNK_RANK_TTL_S:
+        if LISTEN["follow"] and not HUNT["on"]:
+            listen_status("trunked: system quiet; looking again for the strongest systems nearby")
+            threading.Thread(target=cc_hunt, args=([],), daemon=True).start()
+            return True
+        return False
+    cur = LISTEN["mhz"]
+    for r in ranked:
+        if r["mhz"] == cur:
+            r["ok"] = True
+    others = [r for r in ranked if abs(r["mhz"] - cur) > 0.001 and now - r["failed_at"] > TRUNK_FAIL_SKIP_S]
+    if not others:
+        return False
+    # the next one down the power ranking after the current; wrap to the top
+    idx = next((i for i, r in enumerate(ranked) if abs(r["mhz"] - cur) <= 0.001), -1)
+    order = [r for r in ranked[idx + 1:] + ranked[:idx + 1] if r in others]
+    nxt = order[0]
+    TRUNK["tries"] = [(nxt["mhz"], md) for md in nxt["modes"][1:]]
+    TRUNK["cc_at"] = time.time()
+    trunk_prep(nxt["mhz"], nxt["modes"][0])
+    listen_status(f"trunked: {cur:.4f} MHz quiet for {TRUNK_IDLE_S:.0f} s; next system {nxt['mhz']:.4f} MHz (+{nxt['lvl']:.0f} dB)")
+    listen_start(nxt["mhz"], nxt["modes"][0], LISTEN["sq"], 0.0)
+    return True
 
 
 def tg_named(call: str) -> str:
@@ -2046,17 +2081,21 @@ def cc_hunt(first: list) -> None:
     if HUNT["cancel"]:
         return
     tries = list(first)
-    if RR and (RR.controls or RR.sites):
-        # carriers your list calls control channels first, then any other trunked-site channel, then the rest
-        found.sort(key=lambda c: (RR.control_at(c[0]) is None, RR.site_at(c[0]) is None, -c[1]))
-    for m, _ in found[:CC_MAX_TRIES]:
+    # Like a scanner: the strongest steady carrier first, then the next. The RadioReference list only
+    # decides how to decode a carrier (P25 / DMR / EDACS) and which ones to skip (LTR can't be followed).
+    found.sort(key=lambda c: -c[1])
+    ranked = []
+    for m, lvl in found[:CC_MAX_TRIES]:
         cc = RR.control_at(m) if RR else None
         row = cc[2] if cc else (RR.site_at(m) if RR else None)
         if cc:
             m = cc[0]                        # the listed frequency is exact; the scan's is within a channel
         if row is not None and row.get("Mode") == "ltr":
             continue
-        tries += [(m, md) for md in trunk_modes(rr_site(row)[2] if row is not None else "p25")]
+        modes = trunk_modes(rr_site(row)[2] if row is not None else "p25")
+        ranked.append({"mhz": m, "lvl": lvl, "modes": modes, "failed_at": 0.0, "ok": False})
+        tries += [(m, md) for md in modes]
+    TRUNK["ranked"], TRUNK["ranked_at"] = ranked, time.time()
     if RR and RR.controls:
         # After what was heard: the list's control channels in its own order, in case the hunt's floor
         # judgement missed a weak one.
@@ -2160,6 +2199,9 @@ def trunk_next(why: str) -> None:
         listen_start(nxt, md, LISTEN["sq"], 0.0)
     elif not TRUNK.get("hunted"):
         threading.Thread(target=cc_hunt, args=([],), daemon=True).start()
+    elif any(time.time() - r["failed_at"] > TRUNK_FAIL_SKIP_S and abs(r["mhz"] - LISTEN["mhz"]) > 0.001 for r in TRUNK.get("ranked") or []) \
+            and trunk_next_system(time.time()):
+        pass                                 # on to the next strongest system in the ranking
     else:
         listen_stop("no control channel found")
         listen_status("trunked: no control channel found nearby — none of the steady carriers synced as P25 or DMR")
@@ -2266,8 +2308,9 @@ def follow_watch() -> None:
         if LISTEN["proc"] is None:
             continue
         if LISTEN["mode"] in TRUNK_MODES:
-            if now - max(LISTEN["chan_at"], LISTEN.get("call_at", 0.0)) >= TRUNK_IDLE_S:
-                follow_leave(now, f"no call on the trunked system for {TRUNK_IDLE_S / 60:.0f} min")
+            if LISTEN["detected"] and now - max(LISTEN["chan_at"], LISTEN.get("call_at", 0.0)) >= TRUNK_IDLE_S:
+                if not trunk_next_system(now):
+                    follow_leave(now, f"no call on the trunked system for {TRUNK_IDLE_S:.0f} s")
             continue
         if now - LISTEN["chan_at"] >= FOLLOW_MAX_S:
             follow_leave(now, f"{FOLLOW_MAX_S:.0f} s on {LISTEN['mhz']:.4f} MHz is enough")
@@ -2602,7 +2645,6 @@ def _serve_listen(req: tuple, gen: int) -> None:
     buf = b""
 
     def watch():                             # squelched, the tools send nothing, so the reads below can't notice
-        nonlocal chans
         while p.poll() is None:
             if LISTEN["gen"] != gen:
                 break                        # retuned or stopped
@@ -2630,7 +2672,6 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 sync = getattr(p, "sync", "")
                 if sync and now - p.sync_at < 5.0 and LISTEN["detected"] != sync:
                     LISTEN["detected"] = sync
-                    chans = 2 if sync.upper().startswith(TDMA_SYNCS) else 1
                     if TRUNK["cc_at"] and not cc_sync_ok(sync, mode):
                         # A sync, but not a control channel's: P25 phase 2 is TDMA voice, so this is one of the
                         # system's voice channels. Its control channel is a phase 1 carrier nearby; keep looking.
@@ -2654,7 +2695,6 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 if sync and now - p.sync_at < 5.0:
                     if LISTEN["detected"] != sync:
                         LISTEN["detected"] = sync
-                        chans = 2 if sync.upper().startswith(TDMA_SYNCS) else 1
                         listen_status(f"{sync} on {mhz:.4f} MHz")
                 elif not LISTEN["detected"]:
                     carrier = LISTEN["carrier_at"]
@@ -2667,34 +2707,12 @@ def _serve_listen(req: tuple, gen: int) -> None:
         stop_tools(procs)
     threading.Thread(target=watch, daemon=True).start()
 
-    # What dsd-fme actually sends on the UDP port is measured, not assumed: 8 kHz mono for a phase 1 /
-    # FDMA channel, 8 kHz stereo (two TDMA slots) for phase 2 / DMR, and on a trunked system it changes
-    # with every call. Treating stereo as mono plays at half speed an octave down ("a slow robot");
-    # mono as stereo is chipmunks. The byte rate over the last second of continuous audio says which:
-    # 16 kB/s mono, 32 kB/s stereo (96 / 192 kB/s if a build ever sends 48 kHz).
-    meter = {"t0": 0.0, "last": 0.0, "bytes": 0, "rate": 0, "ch": 0, "said": ""}
-
-    def classify(data: bytes) -> tuple:
-        now = time.time()
-        if now - meter["last"] > 0.3:        # a gap: the call ended; start the measurement again
-            meter["t0"], meter["bytes"] = now, 0
-        meter["last"] = now
-        meter["bytes"] += len(data)
-        span = now - meter["t0"]
-        if span >= 1.0 and not meter["said"]:
-            bps = meter["bytes"] / span
-            # Compare in log space: 16k vs 32k is a factor of 2, like 96k vs 192k; a stream read at 70 %
-            # of its true rate (drops) still lands on the right one.
-            rate, ch = min(((16000, 8000, 1), (32000, 8000, 2), (96000, 48000, 1), (192000, 48000, 2)),
-                           key=lambda k: abs(math.log(k[0]) - math.log(max(bps, 1.0))))[1:]
-            meter["rate"], meter["ch"] = rate, ch
-            meter["said"] = f"{rate // 1000} kHz {'stereo' if ch == 2 else 'mono'}"
-            print(f"bridge: dsd-fme audio measured as {meter['said']} ({bps / 1000:.0f} kB/s); converting to 8 kHz mono", file=sys.stderr)
-            listen_status(f"audio: dsd-fme sends {meter['said']}")
-        return (meter["rate"], meter["ch"]) if meter["rate"] else (LISTEN_RATE, chans)
-
-    rc_state = {"st": None, "rate": 0}        # audioop.ratecv carries filter state between chunks
-
+    # dsd-fme's UDP output (dsd_rigctl.c udp_socket_blaster, dsd_main.c pulse_digi_out_channels) is
+    # always 8 kHz 16-bit, and the channel count is fixed by the decoder flag, not by what it syncs to:
+    # -ft / -fs / -fa are stereo (two TDMA slots, L and R — a phase 1 call just plays the same on both),
+    # -f1 / -fi / -fd / -fE are mono. That is what DIGITAL_MODES records, and it never changes mid-listen.
+    # (Switching it on the sync line — "P25p1, so mono" — while dsd-fme kept sending stereo played every
+    # call at half speed an octave down.)
     def read_chunk():
         if sock is None:
             return p.stdout.read(need - len(buf))
@@ -2703,27 +2721,14 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 data = sock.recv(65536)
             except socket.timeout:
                 continue
-            rate, ch = classify(data)
+            if chans != 2:
+                return data[:len(data) & ~1]
+            data = data[:len(data) & ~3]     # two TDMA slots, L and R: mix to mono
             if audioop is not None:
-                if ch == 2:                  # two TDMA slots, L and R: mix to mono (C speed)
-                    data = audioop.tomono(data[:len(data) & ~3], 2, 0.5, 0.5)
-                else:
-                    data = data[:len(data) & ~1]
-                if rate != LISTEN_RATE:      # 48 kHz → 8 kHz
-                    if rc_state["rate"] != rate:
-                        rc_state["st"], rc_state["rate"] = None, rate
-                    data, rc_state["st"] = audioop.ratecv(data, 2, 1, rate, LISTEN_RATE, rc_state["st"])
-                return data
-            # No audioop (Python 3.13+): the slow way
-            n = len(data) // (2 * ch)
-            smp = struct.unpack(f"<{n * ch}h", data[:2 * n * ch])
-            if ch == 2:
-                smp = [(smp[2 * i] + smp[2 * i + 1]) // 2 for i in range(n)]
-            if rate != LISTEN_RATE and rate % LISTEN_RATE == 0:
-                k = rate // LISTEN_RATE
-                smp = [sum(smp[i:i + k]) // k for i in range(0, len(smp) - k + 1, k)]
-            return struct.pack(f"<{len(smp)}h", *[max(-32768, min(32767, v)) for v in smp])
-        return b""
+                return audioop.tomono(data, 2, 0.5, 0.5)
+            n = len(data) // 4
+            lr = struct.unpack(f"<{2 * n}h", data)
+            return struct.pack(f"<{n}h", *[(lr[2 * i] + lr[2 * i + 1]) // 2 for i in range(n)])
 
     ended_itself = True
     afc = []                                 # offsets (Hz) from frames with signal, analog FM only
