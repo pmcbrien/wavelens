@@ -1712,10 +1712,16 @@ FOLLOW_RECENT_S = 60.0      # a hit older than this is no longer a candidate
 FOLLOW_TTL_S = 15 * 60.0    # Follow stops by itself this long after the app's last renewal (it renews every minute)
 
 
+TRUNK_HOLD_S = 20.0         # a locked trunked system keeps the dongle until it has had no call for this long
+
+
 def follow_busy(now: float) -> bool:
     """The current channel keeps the dongle: still tuning, still being probed for a digital sync, just
-    tuned, or audio in the last few seconds."""
+    tuned, or audio in the last few seconds. A locked trunked system is busy until it has gone quiet for
+    TRUNK_HOLD_S: a conventional hit should not pull the dongle off the system between two calls."""
     if LISTEN["proc"] is None or now - LISTEN["tuned_at"] < FOLLOW_MIN_S or now - LISTEN["last_audio"] < FOLLOW_HANG_S:
+        return True
+    if LISTEN["mode"] in TRUNK_MODES and LISTEN["detected"] and now - max(LISTEN.get("call_at", 0.0), LISTEN["tuned_at"]) < TRUNK_HOLD_S:
         return True
     return (LISTEN["mode"] == "auto" or LISTEN["mode"] in DIGITAL_MODES) and now - LISTEN["chan_at"] < FOLLOW_PROBE_S
 
@@ -2419,6 +2425,8 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                 if not ln:
                     continue
                 proc.err_tail.append(ln)
+                if re.search(r"(?i)sync:|\bTG\b|ENC|ALG|error|fail|cannot|unable|exit", ln):
+                    log_line(f"dsd-fme: {ln}")
                 if kw.get("watch_sync"):
                     m = SYNC_RE.search(ln)
                     if m and m.group(1).lower() not in ("no", "none", "lost"):
@@ -2595,21 +2603,22 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 listen_stop("timed out (5 min); tap Listen again to continue")
                 break
             if mode in TRUNK_MODES:
-                call = getattr(p, "call", "")
-                if call and now - p.call_at < 8.0:
-                    call = tg_named(call)
-                    if LISTEN["call"] != call:
+                raw = getattr(p, "call", "")
+                active = bool(raw) and now - p.call_at < 8.0     # dsd-fme's last grant / voice line was recent
+                if active:
+                    call = tg_named(raw)
+                    if LISTEN["call"] != call:                  # a new call: say so once, not every frame
                         LISTEN["call"] = call
                         LISTEN["call_at"] = now
                         listen_status(f"trunked call: {call}")
-                if not LISTEN["detected"] and not call and now - LISTEN["tuned_at"] >= TRUNK_CC_WAIT_S and TRUNK["cc_at"]:
+                elif LISTEN["call"]:                            # the call ended
+                    LISTEN["call"] = ""
+                    listen_status(f"on the control channel {mhz:.4f} MHz, waiting for a call")
+                if not LISTEN["detected"] and not active and now - LISTEN["tuned_at"] >= TRUNK_CC_WAIT_S and TRUNK["cc_at"]:
                     TRUNK["cc_at"] = 0.0         # once per candidate
                     cc_forget(mhz)
                     trunk_next(f"no control channel on {mhz:.4f} MHz")
                     break
-                elif LISTEN["call"]:
-                    LISTEN["call"] = ""
-                    listen_status(f"on the control channel {mhz:.4f} MHz, waiting for a call")
                 sync = getattr(p, "sync", "")
                 if sync and now - p.sync_at < 5.0 and LISTEN["detected"] != sync:
                     LISTEN["detected"] = sync
@@ -2650,6 +2659,32 @@ def _serve_listen(req: tuple, gen: int) -> None:
         stop_tools(procs)
     threading.Thread(target=watch, daemon=True).start()
 
+    # What dsd-fme actually sends on the UDP port is measured, not assumed: 8 kHz mono for a phase 1 /
+    # FDMA channel, 8 kHz stereo (two TDMA slots) for phase 2 / DMR, and on a trunked system it changes
+    # with every call. Treating stereo as mono plays at half speed an octave down ("a slow robot");
+    # mono as stereo is chipmunks. The byte rate over the last second of continuous audio says which:
+    # 16 kB/s mono, 32 kB/s stereo (96 / 192 kB/s if a build ever sends 48 kHz).
+    meter = {"t0": 0.0, "last": 0.0, "bytes": 0, "rate": 0, "ch": 0, "said": ""}
+
+    def classify(data: bytes) -> tuple:
+        now = time.time()
+        if now - meter["last"] > 0.3:        # a gap: the call ended; start the measurement again
+            meter["t0"], meter["bytes"] = now, 0
+        meter["last"] = now
+        meter["bytes"] += len(data)
+        span = now - meter["t0"]
+        if span >= 0.6:
+            bps = meter["bytes"] / span
+            rate, ch = min(((16000, 8000, 1), (32000, 8000, 2), (96000, 48000, 1), (192000, 48000, 2)),
+                           key=lambda k: abs(k[0] - bps))[1:]
+            if (rate, ch) != (meter["rate"], meter["ch"]):
+                meter["rate"], meter["ch"] = rate, ch
+                tag = f"{rate // 1000} kHz {'stereo' if ch == 2 else 'mono'}"
+                if tag != meter["said"]:
+                    meter["said"] = tag
+                    print(f"bridge: dsd-fme audio measured as {tag} ({bps / 1000:.0f} kB/s)", file=sys.stderr)
+        return (meter["rate"], meter["ch"]) if meter["rate"] else (LISTEN_RATE, chans)
+
     def read_chunk():
         if sock is None:
             return p.stdout.read(need - len(buf))
@@ -2658,11 +2693,15 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 data = sock.recv(8192)
             except socket.timeout:
                 continue
-            if chans == 2:                   # two TDMA slots, L and R: mix to mono
-                n = len(data) // 4
-                lr = struct.unpack(f"<{2 * n}h", data[:4 * n])
-                data = struct.pack(f"<{n}h", *[max(-32768, min(32767, (lr[2 * i] + lr[2 * i + 1]) // 2)) for i in range(n)])
-            return data
+            rate, ch = classify(data)
+            n = len(data) // (2 * ch)
+            smp = struct.unpack(f"<{n * ch}h", data[:2 * n * ch])
+            if ch == 2:                      # two TDMA slots, L and R: mix to mono
+                smp = [(smp[2 * i] + smp[2 * i + 1]) // 2 for i in range(n)]
+            if rate != LISTEN_RATE and rate % LISTEN_RATE == 0:
+                k = rate // LISTEN_RATE      # 48 kHz → 8 kHz: average each run of k samples
+                smp = [sum(smp[i:i + k]) // k for i in range(0, len(smp) - k + 1, k)]
+            return struct.pack(f"<{len(smp)}h", *[max(-32768, min(32767, v)) for v in smp])
         return b""
 
     ended_itself = True
