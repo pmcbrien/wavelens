@@ -3437,6 +3437,7 @@ def main() -> None:
     if a.listen_device:
         LISTEN["dev"] = a.listen_device
         CAPS.append("listen")
+        CAPS.append("trunk")                   # digital voice + trunk-tracking (dsd-fme); an ESP32 companion has "listen" only
         kill_strays()
         threading.Thread(target=listen_worker, daemon=True).start()
         threading.Thread(target=follow_watch, daemon=True).start()
