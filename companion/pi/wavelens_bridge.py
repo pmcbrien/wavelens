@@ -27,6 +27,7 @@ not yet run on a Pi by the author.
 """
 
 import argparse
+import base64
 from collections import deque
 import bisect
 import glob
@@ -833,6 +834,66 @@ def gnss_window(hz: float):
     return None
 
 
+# Spectrum for the phone. The Scanner and Spectrum screens ask for a window ({"c":"spec","on":true,
+# "lo":851,"hi":869}); about once a second the bridge sends the latest sweep readings inside it,
+# reduced to at most SPEC_BINS bins (the strongest reading in each), as one byte per bin:
+# 0.5 dB steps from SPEC_DB0. Nothing is sent unless a screen is looking, and it stops by itself
+# SPEC_TTL_S after the phone's last request (the app renews while the screen is open).
+SWEEPS = []                   # every Sweep in this process (hackrf_sweep, rtl_power)
+SPEC = {"on": False, "lo": 1.0, "hi": 6000.0, "until": 0.0, "src": ""}
+SPEC_BINS = 200
+SPEC_DB0 = -120.0             # byte 0; byte 255 = +7.5 dB
+SPEC_RATE_S = 1.0
+SPEC_TTL_S = 90.0
+
+
+def spec_pick(lo_mhz: float, hi_mhz: float):
+    """The sweep covering most of the window: HackRF (whole range) over an RTL-SDR range, unless
+    only the RTL-SDR sweep covers it."""
+    best, best_n = None, 0
+    for sw in SWEEPS:
+        n = sum(1 for hz in sw.latest if lo_mhz * 1e6 <= hz < hi_mhz * 1e6)
+        if n > best_n:
+            best, best_n = sw, n
+    return best
+
+
+def spec_frame():
+    lo, hi = SPEC["lo"], SPEC["hi"]
+    sw = spec_pick(lo, hi)
+    if sw is None or not sw.step_hz:
+        return None
+    pts = sorted((hz, db) for hz, db in sw.latest.items() if lo * 1e6 <= hz < hi * 1e6)
+    if not pts:
+        return None
+    n = min(SPEC_BINS, len(pts))
+    width = (hi - lo) * 1e6 / n
+    out = [None] * n
+    for hz, db in pts:
+        i = min(n - 1, int((hz - lo * 1e6) / width))
+        if out[i] is None or db > out[i]:
+            out[i] = db
+    fill = min(db for _, db in pts)
+    raw = bytes(max(0, min(255, int(round(((db if db is not None else fill) - SPEC_DB0) * 2)))) for db in out)
+    return {"t": "spec", "src": sw.src, "lo": round(lo, 4), "hi": round(hi, 4), "n": n,
+            "bin_hz": int(sw.step_hz), "db0": SPEC_DB0, "step_db": 0.5, "b": base64.b64encode(raw).decode()}
+
+
+def spec_pump() -> None:
+    while True:
+        time.sleep(SPEC_RATE_S)
+        if not SPEC["on"]:
+            continue
+        if time.time() > SPEC["until"]:
+            SPEC["on"] = False
+            for sw in SWEEPS:
+                sw.latest.clear()
+            continue
+        fr = spec_frame()
+        if fr is not None:
+            emit(fr)
+
+
 class Sweep:
     """Parses hackrf_sweep / rtl_power CSV rows and reports bins that rise above a rolling floor.
 
@@ -854,6 +915,9 @@ class Sweep:
         self.seen = {}        # bin Hz → time of the previous visit
         self.runs = {}        # bin Hz → [passes in a row over the floor, last dB, bin width]
         self.bhot = {}        # 1 MHz bucket → [first hot, last hot]: a spur drifts across bins, the bucket holds
+        self.latest = {}      # bin Hz → last dB read: the spectrum the phone's Scanner / Spectrum screens draw
+        self.step_hz = 0.0
+        SWEEPS.append(self)
 
     def row(self, line: str) -> None:
         parts = [p.strip() for p in line.split(",")]
@@ -867,6 +931,11 @@ class Sweep:
         now = time.time()
         if now < self.settle_until:
             return
+        if SPEC["on"]:
+            self.step_hz = step
+            for i, db in enumerate(vals):
+                if db == db and db not in (float("inf"), float("-inf")):
+                    self.latest[lo + i * step] = db
         gnss_rows = {}      # GNSS window → [bins judged, hot bins]
         for i, db in enumerate(vals):
             if db != db or db in (float("inf"), float("-inf")):
@@ -1658,7 +1727,7 @@ def follow_key(mhz: float) -> int:
 # stops transmitting; the sweep sees it on every pass while voice channels come and go. Every hit on a
 # RadioReference "TRS" row is counted here per site; asked to follow a system, the bridge tries the
 # site's most constant frequency first and the next if dsd-fme finds no control-channel sync.
-TRUNK = {"auto": False, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc_at": 0.0, "map": ""}
+TRUNK = {"auto": True, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc_at": 0.0, "map": ""}
 HUNT = {"on": False, "cancel": False}
 TRUNK_KINDS = ("p25", "dmr", "nxdn", "edacs")
 # Where control channels live: the base-station (output) side of the trunking bands, 800 MHz first
@@ -2044,8 +2113,28 @@ def follow_leave(now: float, why: str) -> None:
     if LISTEN["req"] is not None:
         LISTEN["played"][follow_key(LISTEN["mhz"])] = now
     if not follow_next(now):
+        if TRUNK["auto"] and LISTEN["follow"] and not HUNT["on"] and "trunked system" not in why and trunk_resume():
+            listen_status(f"follow: {why}; back to the trunked system")
+            return
         listen_stop(why)
         listen_status(f"follow: {why}; waiting for the next signal")
+
+
+def trunk_resume() -> bool:
+    """Nothing conventional is waiting: return to a trunked system if one is known — the control channel
+    that worked last time, or a site the sweep has been seeing. No hunt here: that borrows the dongle
+    for a minute and belongs to a fresh Follow, not every quiet moment."""
+    last = cc_load()
+    if last:
+        TRUNK["tries"], TRUNK["cc_at"] = [], time.time()
+        if last[2]:
+            TRUNK["system"] = last[2]
+        listen_start(last[0], last[1], LISTEN["sq"], 0.0)
+        return True
+    site, cands = trunk_candidates(None)
+    if cands:
+        return trunk_start(site)
+    return False
 
 
 def follow_watch() -> None:
@@ -2783,6 +2872,21 @@ def run_peripheral(name: str) -> None:
                     state["pos_at"] = time.time()
                 except (KeyError, TypeError, ValueError):
                     pass
+        elif c == "spec":
+            # A Scanner / Spectrum screen is looking: send the sweep's readings in this window about once a second.
+            if "sweep" not in CAPS:
+                emit({"t": "status", "msg": "no sweep running to draw a spectrum from (add --hackrf-sweep or --rtl-power)",
+                      "band": state["band"], "mode": state["mode"]})
+            elif not cmd.get("on", True):
+                SPEC["on"] = False
+            else:
+                try:
+                    lo, hi = float(cmd.get("lo", 1.0)), float(cmd.get("hi", 6000.0))
+                except (TypeError, ValueError):
+                    lo, hi = 1.0, 6000.0
+                if hi - lo < 0.1:
+                    lo, hi = 1.0, 6000.0
+                SPEC.update(on=True, lo=lo, hi=hi, until=time.time() + SPEC_TTL_S)
         elif c == "park":
             v = str(cmd.get("v") or "off")
             state["park"] = v if v in PARK_RANGES else "off"
@@ -2845,6 +2949,11 @@ def run_peripheral(name: str) -> None:
                 LISTEN["follow"], LISTEN["follow_until"] = True, time.time() + FOLLOW_TTL_S
                 if fresh:
                     listen_status("following hits: each new carrier in a voice band is tuned and played")
+                    # A scanner starts listening at once: with nothing playing, lock onto the nearest trunked
+                    # system (its control channel is found by the sweep, the RadioReference list, or a hunt),
+                    # and conventional hits take turns with it as they come.
+                    if TRUNK["auto"] and LISTEN["req"] is None and not HUNT["on"]:
+                        trunk_start(None)
             else:
                 try:
                     mhz = float(cmd.get("mhz"))
@@ -3109,6 +3218,8 @@ def main() -> None:
         threading.Thread(target=feed_kismet_json, args=(a.kismet_json,), daemon=True).start()
     if a.hackrf_park_range:
         PARK_RANGES["le"] = a.hackrf_park_range
+    if a.hackrf_sweep or a.rtl_power:
+        threading.Thread(target=spec_pump, daemon=True).start()
     if a.hackrf_sweep:
         HACKRF_ON = True
         CAPS.append("sweep")
