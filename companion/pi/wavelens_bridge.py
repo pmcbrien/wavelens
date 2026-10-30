@@ -415,6 +415,7 @@ def rr_controls_ranked(limit: int = 6):
     now = time.time()
     heard = {round(m, 4): v for m, v in TRUNK["seen"].items() if now - v[1] <= TRUNK_SEEN_S}
     lat, lon = state.get("lat"), state.get("lon")
+    tg_systems = {h[0].lower() for hs in RR.talkgroups.values() for h in hs}
 
     def key(c):
         f, primary, row = c
@@ -428,7 +429,10 @@ def rr_controls_ranked(limit: int = 6):
             except ValueError:
                 pass
         who = (row.get("Agency/Category") or "").lower()
-        public = any(k in who for k in RR_PUBLIC) or any(k in who for k in ("county", "city of", "local government", "sheriff", "police"))
+        federal = any(k in who for k in ("united states", "air force", "army", "navy", "marine corps", "coast guard",
+                                          "federal", "u.s.", "usaf", "national guard", "department of defense"))
+        public = not federal and (any(k in who for k in RR_PUBLIC) or
+                                  any(k in who for k in ("county", "city of", "local government", "sheriff", "police")))
         # Inside a site's own coverage (RadioReference's Range, miles; 25 if blank) every site counts as
         # local, and among local sites the public-safety system goes before a utility or a hotel. Many
         # exports place every site at its county's centre, so distance alone is a poor tiebreak.
@@ -438,7 +442,8 @@ def rr_controls_ranked(limit: int = 6):
             reach = 40.0
         local = d <= reach
         kind = {"p25": 0, "": 0, "dmr": 1, "nxdn": 2, "edacs": 3}.get(row.get("Mode", "") if row.get("_site") else trunk_kind(row.get("Mode") or ""), 2)
-        return (not h, not local, not public, kind, round(d / 10.0), not primary, row.get("_rank", 9), d)
+        listed = (row.get("Agency/Category") or "").lower() in tg_systems   # a system your talkgroups export covers
+        return (federal, not h, not local, not public, not listed, kind, round(d / 10.0), not primary, row.get("_rank", 9), d)
     out, per = [], {}
     for c in sorted(RR.controls, key=key):
         k = (c[2].get("Agency/Category"), c[2].get("Description"))
@@ -2204,7 +2209,40 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
         time.sleep(0.5)
         if p.poll() is None:
             return p
+        time.sleep(0.1)
+        LISTEN["why"] = " | ".join(p.err_tail)
     return None
+
+
+def dongle_holder() -> str:
+    """Which other program has an RTL-SDR open — on a PiAware Pi it is usually dump1090-fa or dump978-fa."""
+    try:
+        out = subprocess.run(["pgrep", "-a", "-f", "dump1090|dump978|readsb|rtl_433|rtl_tcp|rtl_fm|rtl_power|dsd-fme|piaware"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    mine = os.getpid()
+    names = []
+    for ln in out.splitlines():
+        pid, _, cmd = ln.partition(" ")
+        if pid.isdigit() and int(pid) != mine and "wavelens_bridge" not in cmd and "pgrep" not in cmd:
+            names.append(os.path.basename(cmd.split()[0]) if cmd else "?")
+    return ", ".join(sorted(set(names)))
+
+
+def no_dongle_status() -> None:
+    why = LISTEN.get("why", "")
+    dev = LISTEN["dev"] or "the first RTL-SDR"
+    if re.search(r"(?i)usb_claim_interface|busy|-6\b", why):
+        who = dongle_holder()
+        msg = f"RTL-SDR {dev} is in use by another program" + (f" ({who})" if who else "") + \
+              " — stop it (sudo systemctl stop dump1090-fa) or set --listen-device to a free dongle"
+    elif re.search(r"(?i)no (supported|matching) devices|no devices found|not found|invalid", why):
+        msg = f"RTL-SDR {dev} not found — check the serial with rtl_test -t and --listen-device / @SERIAL"
+    else:
+        msg = f"could not open RTL-SDR {dev} for listening" + (f": {why[-160:]}" if why else "")
+    print(f"bridge: listen: no dongle ({why or 'no output'})", file=sys.stderr)
+    listen_status(msg)
 
 
 def start_pager(gen: int, mhz: float):
@@ -2258,7 +2296,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
             listen_stop("rtl_tcp missing"); listen_status("rtl_tcp not found on the Pi (apt install rtl-sdr)"); return
         if p is None:
             if LISTEN["gen"] == gen:
-                listen_stop("no dongle"); listen_status("could not open the RTL-SDR for listening (is it pinned with @SERIAL?)")
+                listen_stop("no dongle"); no_dongle_status()
             return
         procs.append(p)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -2302,7 +2340,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
             listen_stop("rtl_fm missing"); listen_status("rtl_fm not found on the Pi (apt install rtl-sdr)"); return
         if p is None:
             if LISTEN["gen"] == gen:
-                listen_stop("no dongle"); listen_status("could not open the RTL-SDR for listening (is it pinned with @SERIAL?)")
+                listen_stop("no dongle"); no_dongle_status()
             return
         procs.append(p)
         if pager:
@@ -2757,9 +2795,14 @@ def run_peripheral(name: str) -> None:
                     mhz = float(cmd.get("mhz") or 0)
                 except (TypeError, ValueError):
                     mhz = 0.0
+                searching = HUNT["on"] or bool(TRUNK["cc_at"]) or (LISTEN["req"] is not None and LISTEN["mode"] in TRUNK_MODES)
                 if mhz and 24.0 <= mhz <= 1766.0:
                     TRUNK["tries"], TRUNK["cc_at"] = [], 0.0
                     listen_start(mhz, "trunkq" if TRUNK["qpsk"] else "trunk", LISTEN["sq"], 0.0)
+                elif searching:
+                    # The app re-sends its request about once a minute to keep the listen alive: renew,
+                    # don't start the search over (it would never get past the first candidate).
+                    LISTEN["until"] = time.time() + LISTEN_MAX_S
                 else:
                     trunk_start(None)
             elif str(cmd.get("v") or "") == "follow":
