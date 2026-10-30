@@ -151,9 +151,19 @@ class RrPack:
         # Trunked-site control channels: RadioReference marks them "851.0125c" (primary) / "851.0125a"
         # (alternate), or a column / description says "control". [(mhz, primary, row)]
         self.controls = []
+        self.sites = []         # site-export rows: dicts with "_freqs" [(mhz, flag)] in RadioReference's order
+        self.talkgroups = {}    # decimal talkgroup → [(system, alpha, description, mode, tag)]
         want = {c.strip().lower() for c in counties if c.strip()}
         for rank, path in enumerate(paths):
             with open(path, encoding="utf-8-sig", newline="") as f:
+                head = [h.strip() for h in next(csv.reader([f.readline()]), [])]
+                f.seek(0)
+                if "Frequencies" in head and ("Site Dec" in head or "Site Hex" in head):
+                    self._load_sites(csv.reader(f), rank, want)
+                    continue
+                if "Decimal" in head and "Alpha Tag" in head:
+                    self._load_talkgroups(csv.DictReader(f))
+                    continue
                 for r in csv.DictReader(f):
                     row = {k.strip(): (v or "").strip() for k, v in r.items() if k}
                     # A nationwide export names the agency in its own first column and leaves Agency/Category empty.
@@ -187,6 +197,69 @@ class RrPack:
                 seen.add(round(f, 4)); uniq.append((f, primary, row))
         self.controls = uniq
 
+    def _load_sites(self, reader, rank: int, want: set) -> None:
+        """A trunked-sites export: System, SID, Counties, [RFSS, Site Dec, Site Hex, NAC …], Description,
+        County Name, Lat, Lon, Range, then the site's frequencies, one per cell, "c" on control channels.
+        The middle columns vary by system type, so a row is read from its end: the frequencies are the
+        trailing run of cells, and Range, Lon, Lat, County, Description sit just before them."""
+        next(reader, None)
+        F = re.compile(r"^\s*\d{2,4}\.\d{3,}[ca]?\s*$", re.I)
+        for cells in reader:
+            cells = [c.strip() for c in cells]
+            i = len(cells)
+            while i > 3 and F.match(cells[i - 1]):
+                i -= 1
+            freqs = [rr_freq(c) for c in cells[i:]]
+            freqs = [(fq, fl) for fq, fl in freqs if 24.0 <= fq <= 6000.0]
+            if not freqs or len(cells) < 4:
+                continue
+            j = i
+            rng = ""
+            if j > 0 and re.match(r"^\d+$", cells[j - 1]):
+                rng, j = cells[j - 1], j - 1
+            lon, lat = (cells[j - 1], cells[j - 2]) if j >= 2 else ("", "")
+            county, desc = (cells[j - 3] if j >= 3 else ""), (cells[j - 4] if j >= 4 else "")
+            system = cells[0]
+            row = {"Agency/Category": system, "System Name": system, "Description": desc or "?", "County": county,
+                   "Lat": lat, "Lon": lon, "Range": rng, "Mode": rr_system_kind(system), "Tag": "TRS", "_sid": cells[1],
+                   "_rank": rank * 2 + (0 if county.lower() in want or not want else 1), "_freqs": freqs, "_site": True}
+            self.sites.append(row)
+            if row["Mode"] == "ltr":
+                continue                     # LTR / Type II: no control channel dsd-fme can follow
+            for fq, fl in freqs:
+                if fl:
+                    self.controls.append((fq, fl != "a", row))
+                # labels read the frequency from the row: give each channel its own view of the site row
+                self.rows.append((fq, "output", {**row, "Frequency Output": f"{fq:.5f}"}))
+
+    def _load_talkgroups(self, reader) -> None:
+        for r in reader:
+            try:
+                dec = int((r.get("Decimal") or "").strip())
+            except ValueError:
+                continue
+            self.talkgroups.setdefault(dec, []).append(((r.get("System") or "").strip(), (r.get("Alpha Tag") or "").strip(),
+                                                        (r.get("Description") or "").strip(), (r.get("Mode") or "").strip(),
+                                                        (r.get("Tag") or "").strip()))
+
+    def talkgroup(self, dec: int, system: str = ""):
+        """(alpha, description, mode, tag) for a talkgroup, preferring the system being followed."""
+        hits = self.talkgroups.get(dec) or []
+        if not hits:
+            return None
+        sysl = system.lower()
+        own = [h for h in hits if sysl and h[0].lower() == sysl]
+        if own:
+            return own[0][1:]
+        return hits[0][1:] if len({h[0] for h in hits}) == 1 else None
+
+    def site_at(self, mhz: float, tol_mhz: float = 0.0065):
+        """The site-export row that lists this frequency (any channel, control or not), or None."""
+        for row in self.sites:
+            if any(abs(fq - mhz) <= tol_mhz for fq, _ in row["_freqs"]):
+                return row
+        return None
+
     def control_at(self, mhz: float, tol_mhz: float = 0.0065):
         """The control-channel entry at this frequency, or None."""
         best = None
@@ -199,7 +272,7 @@ class RrPack:
     @staticmethod
     def _freq(hit) -> float:
         _, side, r = hit
-        return float(r.get("Frequency Input") if side == "input" else r.get("Frequency Output"))
+        return rr_freq(r.get("Frequency Input") if side == "input" else r.get("Frequency Output"))[0]
 
     def lookup(self, mhz: float, tol_khz: float):
         half = max(tol_khz, 12.5) / 1000.0 / 2 + 0.004   # + the dongle's own error (10 ppm at 400 MHz)
@@ -296,6 +369,23 @@ def rr_freq(v):
     return float(m.group(1)), (m.group(2) or "").lower()
 
 
+def rr_system_kind(system: str) -> str:
+    """The system type RadioReference puts in a trunked system's name: "(EDACS)", "(P25)", "Duke Energy P25",
+    "(Capacity Plus)", "(470 Connect Plus)", "(DMR)", "(NXDN)", "(LTR)". Unknown → "" (tried as P25/DMR)."""
+    s = system.lower()
+    if "edacs" in s:
+        return "edacs"
+    if "p25" in s or "project 25" in s:
+        return "p25"
+    if "dmr" in s or "capacity plus" in s or "connect plus" in s or "trbo" in s:
+        return "dmr"
+    if "nxdn" in s:
+        return "nxdn"
+    if "ltr" in s or "type ii" in s or "smartnet" in s:
+        return "ltr"
+    return ""
+
+
 def rr_says_control(row: dict) -> bool:
     """A column or the description naming the channel a control channel ("Control", "CC", "Use: c")."""
     for k, v in row.items():
@@ -337,8 +427,28 @@ def rr_controls_ranked(limit: int = 6):
                 d = haversine_km(lat, lon, la, lo)
             except ValueError:
                 pass
-        return (not h, d, not primary, row.get("_rank", 9))
-    return sorted(RR.controls, key=key)[:limit]
+        who = (row.get("Agency/Category") or "").lower()
+        public = any(k in who for k in RR_PUBLIC) or any(k in who for k in ("county", "city of", "local government", "sheriff", "police"))
+        # Inside a site's own coverage (RadioReference's Range, miles; 25 if blank) every site counts as
+        # local, and among local sites the public-safety system goes before a utility or a hotel. Many
+        # exports place every site at its county's centre, so distance alone is a poor tiebreak.
+        try:
+            reach = float(row.get("Range") or 25) * 1.609
+        except ValueError:
+            reach = 40.0
+        local = d <= reach
+        kind = {"p25": 0, "": 0, "dmr": 1, "nxdn": 2, "edacs": 3}.get(row.get("Mode", "") if row.get("_site") else trunk_kind(row.get("Mode") or ""), 2)
+        return (not h, not local, not public, kind, round(d / 10.0), not primary, row.get("_rank", 9), d)
+    out, per = [], {}
+    for c in sorted(RR.controls, key=key):
+        k = (c[2].get("Agency/Category"), c[2].get("Description"))
+        if per.get(k, 0) >= 2:
+            continue                         # two per site, so the next site gets a turn
+        per[k] = per.get(k, 0) + 1
+        out.append(c)
+        if len(out) >= limit:
+            break
+    return out
 
 # ---------------------------------------------------------------- local FCC license pack
 
@@ -1569,6 +1679,22 @@ TRUNK_CC_WAIT_S = 8.0       # dsd-fme must show a sync on a candidate within thi
 TRUNK_IDLE_S = 240.0        # Follow leaves a trunked system after this long without a call
 
 
+def tg_named(call: str) -> str:
+    """'TG 1234 …' → 'TG 1234 · PCSO Disp (Law Dispatch) …' from the RadioReference talkgroup export, and
+    'encrypted' when the export says so (Mode DE / TE). Talkgroups only: there are no radio IDs to name."""
+    m = re.match(r"TG (\d+)(.*)$", call)
+    if not m or not RR or not RR.talkgroups:
+        return call
+    tg = RR.talkgroup(int(m.group(1)), TRUNK.get("system", ""))
+    if not tg:
+        return call
+    alpha, desc, mode, tag = tg
+    name = alpha or desc
+    extra = f" ({tag})" if tag and tag.lower() not in name.lower() else ""
+    enc = " · encrypted" if "e" in mode.lower() and "encrypted" not in m.group(2) else ""
+    return f"TG {m.group(1)} · {name}{extra}{enc}{m.group(2)}"
+
+
 def trunk_note(obj: dict) -> None:
     x = obj.get("x") or {}
     if "trunked_site" not in x:
@@ -1630,7 +1756,7 @@ def trunk_start(site=None, qpsk=None) -> bool:
     if site is None and RR and RR.controls:
         # Nearest system: the export's control channels, heard / nearest first; the hunt follows if none syncs.
         TRUNK["site"], TRUNK["map"] = ("?", "nearest system", "p25"), ""
-        for f, _, row in rr_controls_ranked():
+        for f, _, row in rr_controls_ranked(CC_MAX_TRIES):
             tries += [(f, md) for md in trunk_modes(rr_site(row)[2])]
         trunk_try(tries, "the nearest system (control channels from your RadioReference list)")
         return True
@@ -1662,6 +1788,7 @@ def trunk_try(tries: list, what: str) -> None:
         return
     (m, md), TRUNK["tries"] = uniq[0], uniq[1:]
     TRUNK["cc_at"] = time.time()
+    trunk_prep(m, md)
     listen_status(f"trunked: trying {m:.4f} MHz ({'QPSK' if md == 'trunkq' else 'C4FM' if md == 'trunk' else md}) as the control channel of {what}")
     listen_start(m, md, LISTEN["sq"], 0.0)
 
@@ -1703,13 +1830,17 @@ def cc_hunt(first: list) -> None:
     if HUNT["cancel"]:
         return
     tries = list(first)
-    if RR and RR.controls:
-        found.sort(key=lambda c: (RR.control_at(c[0]) is None, -c[1]))   # carriers your list calls control channels first
+    if RR and (RR.controls or RR.sites):
+        # carriers your list calls control channels first, then any other trunked-site channel, then the rest
+        found.sort(key=lambda c: (RR.control_at(c[0]) is None, RR.site_at(c[0]) is None, -c[1]))
     for m, _ in found[:CC_MAX_TRIES]:
         cc = RR.control_at(m) if RR else None
+        row = cc[2] if cc else (RR.site_at(m) if RR else None)
         if cc:
             m = cc[0]                        # the listed frequency is exact; the scan's is within a channel
-        tries += [(m, md) for md in trunk_modes(rr_site(cc[2])[2] if cc else "p25")]
+        if row is not None and row.get("Mode") == "ltr":
+            continue
+        tries += [(m, md) for md in trunk_modes(rr_site(row)[2] if row is not None else "p25")]
     trunk_try(tries, "the nearest system")
 
 
@@ -1759,13 +1890,18 @@ def cc_steady(rows: list) -> list:
     return out
 
 
-def write_trunk_map(site) -> str:
-    """dsd-fme channel map for a site: 'lcn,hz' per line, LCN/LSN by ascending frequency (the common
+def write_trunk_map(site, row=None) -> str:
+    """dsd-fme channel map for a site: 'lcn,hz' per line. From a sites export, in the order RadioReference
+    lists the site's frequencies (its LCN order); otherwise LCN by ascending frequency (the common
     convention; not guaranteed). All of the site's frequencies the overlay lists, not just those heard."""
     if not RR:
         return ""
-    freqs = sorted({f for f, side, r in RR.rows if side == "output" and (r.get("Tag") or "").upper() == "TRS"
-                    and (r.get("Agency/Category") or "?") == site[0] and (r.get("Description") or "?") == site[1]})
+    if row is not None and row.get("_freqs"):
+        freqs = [fq for fq, _ in row["_freqs"]]
+        site = (row.get("Agency/Category") or "?", row.get("Description") or "?", "")
+    else:
+        freqs = sorted({f for f, side, r in RR.rows if side == "output" and (r.get("Tag") or "").upper() == "TRS"
+                        and (r.get("Agency/Category") or "?") == site[0] and (r.get("Description") or "?") == site[1]})
     if not freqs:
         return ""
     path = "/tmp/wavelens-trunk-map.csv"
@@ -1775,8 +1911,20 @@ def write_trunk_map(site) -> str:
                 f.write(f"{i},{int(round(mhz * 1e6))}\n")
     except OSError:
         return ""
-    print(f"bridge: trunk map for {site[0]} ({site[1]}): {len(freqs)} channels, LCN by ascending frequency", file=sys.stderr)
+    print(f"bridge: trunk map for {site[0]} ({site[1]}): {len(freqs)} channels"
+          + (", LCN in RadioReference's order" if row is not None else ", LCN by ascending frequency"), file=sys.stderr)
     return path
+
+
+def trunk_prep(mhz: float, mode: str) -> None:
+    """Before trying a candidate: which system it belongs to (for talkgroup names), and for EDACS / DMR the
+    channel map dsd-fme needs, from that site's own list."""
+    row = (RR.control_at(mhz) or (None, None, None))[2] if RR else None
+    if row is None and RR:
+        row = RR.site_at(mhz)
+    TRUNK["system"] = (row.get("Agency/Category") or "") if row else ""
+    if mode in ("trunke", "trunkd"):
+        TRUNK["map"] = write_trunk_map(TRUNK["site"] or ("?", "?", ""), row) if row is not None else TRUNK.get("map", "")
 
 
 def trunk_next(why: str) -> None:
@@ -1784,6 +1932,7 @@ def trunk_next(why: str) -> None:
     if TRUNK["tries"]:
         (nxt, md) = TRUNK["tries"].pop(0)
         TRUNK["cc_at"] = time.time()
+        trunk_prep(nxt, md)
         site = TRUNK["site"] or ("?", "?", "")
         listen_status(f"trunked: {why}; trying {nxt:.4f} MHz ({'QPSK' if md == 'trunkq' else 'C4FM' if md == 'trunk' else md})"
                       + (f" for {site[0]}" if site[0] != "?" else ""))
@@ -2184,6 +2333,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
             if mode in TRUNK_MODES:
                 call = getattr(p, "call", "")
                 if call and now - p.call_at < 8.0:
+                    call = tg_named(call)
                     if LISTEN["call"] != call:
                         LISTEN["call"] = call
                         LISTEN["call_at"] = now
@@ -2876,8 +3026,8 @@ def main() -> None:
     if a.rr_pack:
         RR = RrPack(a.rr_pack, a.rr_county)
         CAPS.append("rr")
-        print(f"bridge: RadioReference overlay loaded, {len(RR.rows)} frequencies, {len(RR.controls)} trunked control channels "
-              f"from {len(a.rr_pack)} file(s)", file=sys.stderr)
+        print(f"bridge: RadioReference overlay loaded, {len(RR.rows)} frequencies, {len(RR.sites)} trunked sites, "
+              f"{len(RR.controls)} control channels, {len(RR.talkgroups)} talkgroups from {len(a.rr_pack)} file(s)", file=sys.stderr)
 
     if a.kismet_json:
         CAPS.append("wifi")

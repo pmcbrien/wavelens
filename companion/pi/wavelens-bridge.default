@@ -32,8 +32,11 @@ WAVELENS_RTL433="-f 315M -f 433.92M -f 915M -H 30 -g 40"
 #   --fcc-pack /usr/local/lib/wavelens/fcc-local.json
 #   --rr-pack /usr/local/lib/wavelens/rr/pinellas.csv --rr-pack /usr/local/lib/wavelens/rr/hillsborough.csv \
 #   --rr-pack /usr/local/lib/wavelens/rr/florida.csv --rr-pack /usr/local/lib/wavelens/rr/nationwide.csv \
+#   --rr-pack /usr/local/lib/wavelens/rr/trunked_sites.csv --rr-pack /usr/local/lib/wavelens/rr/talkgroups.csv \
 #   --rr-county Pinellas --rr-county Hillsborough
 #                                           RadioReference frequency exports (CSV) for your counties: hits are named
 #                                           by agency, description, alpha tag and mode; preferred over the FCC pack
+#                                           (a trunked-sites export gives trunk lock-on its control channels;
+#                                           a talkgroups export names the calls)
 #   --name Wavelens-Car                     the name the app lists under Find
 WAVELENS_ARGS=""

@@ -453,6 +453,23 @@ from the Tag column so the agency-type alerts work from it; `listen` says how to
 DMR, P25, NXDN) and the app's Listen uses it; trunked-site rows say so. Preferred over the FCC pack
 where it has the frequency. Several exports layer: give them most local first (county, statewide, nationwide); a statewide export's County column ranks the `--rr-county` counties and "Statewide" rows ahead of other counties'. The exports are the user's own files on the Pi; nothing from them is shipped.
 
+Two more RadioReference exports load with the same flag, recognised by their header:
+- **Trunked sites** (`System, SID, Counties, Site Dec, Site Hex, Description, County Name, Lat, Lon, Range,
+  Frequencies`): one row per site, its frequencies in the trailing cells with `c` on control channels. The
+  middle columns differ by system type (P25 rows add RFSS and NAC), so each row is read from its end. The
+  system type comes from the system name — "(EDACS)", "(P25)", "Capacity Plus", "Connect Plus", "(DMR)",
+  "(NXDN)"; LTR / Type II sites are skipped (dsd-fme cannot follow them); a name without a type is tried as
+  P25 and DMR. These give trunk lock-on its control channels, the site's coordinates and coverage, and the
+  EDACS / DMR channel map in RadioReference's own LCN order. Every listed channel also names sweep hits.
+- **Talkgroups** (`System, SID, Counties, Decimal, Hex, Alpha Tag, Mode, Description, Tag, Category`): a
+  followed call reads "TG 1308 · CPD Info (Law Talk) · encrypted" instead of "TG 1308" — the system being
+  followed is preferred when several share a number. Mode `DE` / `TE` marks it encrypted (shown, never
+  tuned). Talkgroups only; there are no radio IDs in it, and none are read from the air.
+
+Ranking for lock-on with a sites export: control channels the sweep has heard first; then sites whose
+coverage (Range, miles) includes the phone's shared position; among those, public-safety systems before
+utilities and businesses, P25 before DMR before EDACS; two candidates per site so several sites get a turn.
+
 **Trunked systems.** `{"c":"listen","v":"trunk"}` locks onto the nearest trunked system's control
 channel without being told it. Candidates, in order: the control channel that worked last time
 (`/var/lib/wavelens/control-channel.json`); **the control channels in your RadioReference exports** —
