@@ -83,6 +83,59 @@ def emit(obj: dict) -> None:
 
 CAPS = ["rf"]
 
+# The bridge's own journal, for the phone. Everything the bridge prints on stderr (its "bridge: …" lines
+# and what rtl_tcp / dsd-fme / hackrf_sweep say) is kept, last LOG_KEEP lines, and streamed as
+# {"t":"log"} frames while the app's Alerts screen asks for it ({"c":"log","on":true}, renewed every
+# 30 s). The "sent …" echo lines are left out: the app already has its own packet view, and a log
+# frame echoing itself would loop. The Pi's journal (journalctl -u wavelens-bridge) is the full record.
+LOG_KEEP = 100
+LOG_TTL_S = 90.0
+LOG = {"on": False, "until": 0.0, "lines": deque(maxlen=LOG_KEEP), "pending": deque(), "lock": threading.Lock()}
+
+
+def log_line(text: str) -> None:
+    text = text.rstrip()
+    if not text or text.startswith("sent ") or '"t":"log"' in text:
+        return
+    item = (time.time(), text[:300])
+    with LOG["lock"]:
+        LOG["lines"].append(item)
+        if LOG["on"]:
+            LOG["pending"].append(item)
+
+
+class _StderrTee:
+    """Replaces sys.stderr: passes everything through to the journal and keeps whole lines for the phone."""
+    def __init__(self, real):
+        self.real, self.buf = real, ""
+    def write(self, s):
+        self.real.write(s)
+        self.buf += s
+        while "\n" in self.buf:
+            ln, self.buf = self.buf.split("\n", 1)
+            log_line(ln)
+        return len(s)
+    def flush(self):
+        self.real.flush()
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+def log_pump() -> None:
+    while True:
+        time.sleep(0.5)
+        if not LOG["on"]:
+            continue
+        if time.time() > LOG["until"]:
+            LOG["on"] = False
+            with LOG["lock"]:
+                LOG["pending"].clear()
+            continue
+        with LOG["lock"]:
+            batch = [LOG["pending"].popleft() for _ in range(min(10, len(LOG["pending"])))]
+        for ts, text in batch:
+            emit({"t": "log", "ts": int(ts), "l": text})
+
 
 def hello() -> None:
     emit({"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""), "caps": sorted(set(CAPS))})
@@ -897,7 +950,8 @@ def spec_pump() -> None:
         except Exception as e:                # never let the spectrum feed take the bridge down
             print(f"bridge: spectrum: {e}", file=sys.stderr)
             continue
-        if fr is not None:
+        if fr is not None and fr["b"] != SPEC.get("last_b"):
+            SPEC["last_b"] = fr["b"]
             emit(fr)
 
 
@@ -1286,10 +1340,12 @@ def spawn(cmd: str):
         return None
     tail = deque(maxlen=4)
 
+    tool = cmd.split()[0]
     def drain():
         for ln in p.stderr:
             if ln.strip():
                 tail.append(ln.strip())
+                log_line(f"{tool}: {ln.strip()}")
     threading.Thread(target=drain, daemon=True).start()
     p.started_at, p.err_tail = time.time(), tail
     return p
@@ -1788,6 +1844,29 @@ def cc_save(mhz: float, mode: str, system: str) -> None:
             json.dump({"mhz": round(mhz, 5), "mode": mode, "system": system, "at": int(time.time())}, f)
     except OSError:
         pass
+def cc_sync_ok(sync: str, mode: str) -> bool:
+    """Is this dsd-fme sync the kind a control channel carries? P25 control channels are phase 1 (FDMA);
+    a P25p2 sync is a TDMA voice channel of the system. DMR Tier III / Cap+ control channels show as DMR,
+    EDACS as EDACS. Anything else (NXDN, D-STAR, ProVoice…) is not something -ft follows."""
+    u = sync.upper()
+    if mode == "trunke":
+        return u.startswith("EDACS")
+    if mode == "trunkd":
+        return u.startswith("DMR")
+    return u.startswith("P25P1") or u == "P25" or u.startswith("DMR")
+
+
+def cc_forget(mhz: float) -> None:
+    """A candidate that failed is not the control channel; if it is the one the cache remembers, drop it,
+    or every later Follow would start on it again."""
+    last = cc_load()
+    if last and abs(last[0] - mhz) < 0.001:
+        try:
+            os.remove(CC_CACHE)
+        except OSError:
+            pass
+
+
 TRUNK_SEEN_S = 180.0        # a site frequency counts as a candidate for this long after its last hit
 TRUNK_CC_WAIT_S = 12.0      # dsd-fme must show a sync on a candidate within this, else the next is tried (rtl_tcp start + sync)
 TRUNK_IDLE_S = 240.0        # Follow leaves a trunked system after this long without a call
@@ -2513,6 +2592,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
                         listen_status(f"trunked call: {call}")
                 if not LISTEN["detected"] and not call and now - LISTEN["tuned_at"] >= TRUNK_CC_WAIT_S and TRUNK["cc_at"]:
                     TRUNK["cc_at"] = 0.0         # once per candidate
+                    cc_forget(mhz)
                     trunk_next(f"no control channel on {mhz:.4f} MHz")
                     break
                 elif LISTEN["call"]:
@@ -2522,6 +2602,13 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 if sync and now - p.sync_at < 5.0 and LISTEN["detected"] != sync:
                     LISTEN["detected"] = sync
                     chans = 2 if sync.upper().startswith(TDMA_SYNCS) else 1
+                    if TRUNK["cc_at"] and not cc_sync_ok(sync, mode):
+                        # A sync, but not a control channel's: P25 phase 2 is TDMA voice, so this is one of the
+                        # system's voice channels. Its control channel is a phase 1 carrier nearby; keep looking.
+                        TRUNK["cc_at"] = 0.0
+                        cc_forget(mhz)
+                        trunk_next(f"{mhz:.4f} MHz carries {sync} (a voice channel, not the control channel)")
+                        break
                     if TRUNK["cc_at"]:
                         TRUNK["cc_at"], TRUNK["tries"] = 0.0, []
                         site = TRUNK["site"] or ("?", "nearest system", "")
@@ -2886,6 +2973,17 @@ def run_peripheral(name: str) -> None:
                     state["pos_at"] = time.time()
                 except (KeyError, TypeError, ValueError):
                     pass
+        elif c == "log":
+            # The Alerts screen is showing the bridge's journal: send the backlog once, then live lines.
+            if not cmd.get("on", True):
+                LOG["on"] = False
+            else:
+                fresh = not LOG["on"]
+                LOG["on"], LOG["until"] = True, time.time() + LOG_TTL_S
+                if fresh:
+                    with LOG["lock"]:
+                        LOG["pending"].clear()
+                        LOG["pending"].extend(LOG["lines"])
         elif c == "spec":
             # A Scanner / Spectrum screen is looking: send the sweep's readings in this window about once a second.
             if "sweep" not in CAPS:
@@ -3084,7 +3182,7 @@ def probe_radios():
         for ln in (out.stdout + out.stderr).splitlines():
             m = re.match(r"\s*(\d+):\s*(.+?),\s*(.+?),\s*SN:\s*(\S+)", ln)
             if m:
-                rtls.append((int(m.group(1)), m.group(4).strip()))
+                rtls.append((int(m.group(1)), m.group(4).strip(), f"{m.group(2)} {m.group(3)}".strip()))
     except (OSError, subprocess.TimeoutExpired):
         pass
     hackrf = False
@@ -3114,9 +3212,18 @@ def plan_radios(rtls, hackrf) -> dict:
       5+ … · 900 MHz / 1.2 GHz / GNSS sweep
     Dongles are addressed by serial when the serials are unique, else by index (cheap ones all say
     00000001; rtl_eeprom -s sets a new serial)."""
-    serials = [sn for _, sn in rtls]
+    # The best radio goes to listening / sweeping, not to the sensor decoder: an RTL-SDR Blog V4 (R828D
+    # front end, proper filtering, bias tee) hears 800 MHz where a bare RTL2838 struggles, and rtl_433
+    # only needs 315/433/915 MHz. So a V4 is moved off the first slot when there is another dongle.
+    rtls = [tuple(r) + ("",) * (3 - len(r)) for r in rtls]
+    if len(rtls) >= 2:
+        v4 = [r for r in rtls if "v4" in r[2].lower() or "blog" in r[2].lower()]
+        if v4 and rtls[0] in v4 and len(v4) < len(rtls):
+            rest = [r for r in rtls if r not in v4]
+            rtls = rest[:1] + v4 + rest[1:]
+    serials = [r[1] for r in rtls]
     unique = len(set(serials)) == len(serials)
-    ids = [sn if unique else str(i) for i, sn in rtls]
+    ids = [r[1] if unique else str(r[0]) for r in rtls]
     plan = {"rtl433": "", "sweeps": [], "listen": "", "hackrf": hackrf, "by": "serial" if unique else "index",
             "roles": []}
     n = len(ids)
@@ -3210,6 +3317,9 @@ def main() -> None:
     ap.add_argument("--plan", action="store_true",
                     help="print shell assignments (PLAN_RTL433_DEV, PLAN_ARGS) for the radios found, and exit; run-bridge.sh uses it when WAVELENS_AUTO=1")
     a = ap.parse_args()
+    sys.stderr = _StderrTee(sys.stderr)
+    threading.Thread(target=log_pump, daemon=True).start()
+    CAPS.append("log")
     globals()["PORTAPACK_TTY"] = a.portapack_port
     if a.plan:
         print_plan_shell("")
