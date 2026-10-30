@@ -1781,7 +1781,7 @@ def cc_save(mhz: float, mode: str, system: str) -> None:
     except OSError:
         pass
 TRUNK_SEEN_S = 180.0        # a site frequency counts as a candidate for this long after its last hit
-TRUNK_CC_WAIT_S = 8.0       # dsd-fme must show a sync on a candidate within this, else the next is tried
+TRUNK_CC_WAIT_S = 12.0      # dsd-fme must show a sync on a candidate within this, else the next is tried (rtl_tcp start + sync)
 TRUNK_IDLE_S = 240.0        # Follow leaves a trunked system after this long without a call
 
 
@@ -1860,11 +1860,12 @@ def trunk_start(site=None, qpsk=None) -> bool:
         for f, _, row in own[:4]:
             tries += [(f, md) for md in trunk_modes(rr_site(row)[2])]
     if site is None and RR and RR.controls:
-        # Nearest system: the export's control channels, heard / nearest first; the hunt follows if none syncs.
+        # Nearest system, and the sweep hasn't matched a site: hunt first. A 30-60 s rtl_power pass over the
+        # trunking bands finds the carriers that never stop and that this dongle can actually hear, with the
+        # list's own control channels ranked ahead of the rest. Trying the list blind, 8 s a channel, spent
+        # minutes on sites that were never receivable here. The list is the fallback when nothing is steady.
         TRUNK["site"], TRUNK["map"] = ("?", "nearest system", "p25"), ""
-        for f, _, row in rr_controls_ranked(CC_MAX_TRIES):
-            tries += [(f, md) for md in trunk_modes(rr_site(row)[2])]
-        trunk_try(tries, "the nearest system (control channels from your RadioReference list)")
+        threading.Thread(target=cc_hunt, args=(tries,), daemon=True).start()
         return True
     if cands:
         for m in cands[:5]:
@@ -1947,7 +1948,12 @@ def cc_hunt(first: list) -> None:
         if row is not None and row.get("Mode") == "ltr":
             continue
         tries += [(m, md) for md in trunk_modes(rr_site(row)[2] if row is not None else "p25")]
-    trunk_try(tries, "the nearest system")
+    if RR and RR.controls:
+        # After what was heard: the list's control channels in its own order, in case the hunt's floor
+        # judgement missed a weak one.
+        for f, _, row in rr_controls_ranked(CC_MAX_TRIES):
+            tries += [(f, md) for md in trunk_modes(rr_site(row)[2])]
+    trunk_try(tries, "the nearest system" + (f" ({len(found)} steady carriers heard)" if found else " (nothing steady heard; trying your list)"))
 
 
 def cc_steady(rows: list) -> list:
@@ -2952,7 +2958,7 @@ def run_peripheral(name: str) -> None:
                     # A scanner starts listening at once: with nothing playing, lock onto the nearest trunked
                     # system (its control channel is found by the sweep, the RadioReference list, or a hunt),
                     # and conventional hits take turns with it as they come.
-                    if TRUNK["auto"] and LISTEN["req"] is None and not HUNT["on"]:
+                    if TRUNK["auto"] and not HUNT["on"] and (LISTEN["req"] is None or LISTEN["mode"] not in TRUNK_MODES):
                         trunk_start(None)
             else:
                 try:
