@@ -2001,21 +2001,33 @@ def cc_hunt(first: list) -> None:
             if HUNT["cancel"] or len(found) >= CC_MAX_TRIES:
                 break
             listen_status(f"trunked: looking for a control channel, {label} ({lo:g}–{hi:g} MHz)…")
-            rows = []
-            for attempt in range(3):         # the dongle may still be on its way back from the sweep
+            rows, err = [], ""
+            # The sweep's rtl_power on this dongle was just told to stop; it can take several seconds to
+            # release the USB device, and an open attempt before that fails at once (usb_claim_interface
+            # -6). Keep trying for up to ~12 s rather than skipping the band — the 800 MHz band goes
+            # first, and skipping it is skipping the control channel.
+            for attempt in range(12):
                 try:
                     r = subprocess.run(shlex.split(f"rtl_power{dev}{ppm} -f {spec} -i 1 -e 6 -g 40 -"),
                                        capture_output=True, text=True, timeout=30)
-                    rows = r.stdout.splitlines()
+                    rows, err = r.stdout.splitlines(), r.stderr
                 except FileNotFoundError:
                     listen_status("trunked: rtl_power not found on the Pi (apt install rtl-sdr)")
                     return
                 except subprocess.TimeoutExpired:
                     rows = []
-                if rows:
+                if rows or HUNT["cancel"]:
                     break
-                time.sleep(1.5)
-            found += [(m, lvl) for m, lvl in cc_steady(rows) if all(abs(m - f) > 0.02 for f, _ in found)]
+                time.sleep(1.0)
+            if not rows:
+                print(f"bridge: control-channel hunt: {label}: rtl_power gave nothing"
+                      + (": " + err.strip().splitlines()[-1] if err.strip() else ""), file=sys.stderr)
+                continue
+            here = [(m, lvl) for m, lvl in cc_steady(rows) if all(abs(m - f) > 0.02 for f, _ in found)]
+            print(f"bridge: control-channel hunt: {label}: {len(rows)} rows, {len(here)} steady"
+                  + (" — " + ", ".join(f"{m:.4f} (+{l:.0f} dB)" for m, l in sorted(here, key=lambda c: -c[1])[:4]) if here else ""),
+                  file=sys.stderr)
+            found += here
         found.sort(key=lambda c: -c[1])
         print("bridge: control-channel hunt: " + (", ".join(f"{m:.4f} (+{l:.0f} dB)" for m, l in found[:CC_MAX_TRIES]) or "nothing steady"),
               file=sys.stderr)
