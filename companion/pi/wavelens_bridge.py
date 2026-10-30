@@ -847,24 +847,26 @@ SPEC_RATE_S = 1.0
 SPEC_TTL_S = 90.0
 
 
+SPEC_LOCK = threading.Lock()   # the sweep threads write Sweep.latest; spec_pump reads it
+
+
 def spec_pick(lo_mhz: float, hi_mhz: float):
     """The sweep covering most of the window: HackRF (whole range) over an RTL-SDR range, unless
-    only the RTL-SDR sweep covers it."""
-    best, best_n = None, 0
-    for sw in SWEEPS:
-        n = sum(1 for hz in sw.latest if lo_mhz * 1e6 <= hz < hi_mhz * 1e6)
-        if n > best_n:
-            best, best_n = sw, n
-    return best
+    only the RTL-SDR sweep covers it. Returns (sweep, its readings in the window) from one snapshot."""
+    best, best_pts = None, []
+    with SPEC_LOCK:
+        snaps = [(sw, list(sw.latest.items())) for sw in SWEEPS]
+    for sw, items in snaps:
+        pts = [(hz, db) for hz, db in items if lo_mhz * 1e6 <= hz < hi_mhz * 1e6]
+        if len(pts) > len(best_pts):
+            best, best_pts = sw, pts
+    return best, sorted(best_pts)
 
 
 def spec_frame():
     lo, hi = SPEC["lo"], SPEC["hi"]
-    sw = spec_pick(lo, hi)
-    if sw is None or not sw.step_hz:
-        return None
-    pts = sorted((hz, db) for hz, db in sw.latest.items() if lo * 1e6 <= hz < hi * 1e6)
-    if not pts:
+    sw, pts = spec_pick(lo, hi)
+    if sw is None or not sw.step_hz or not pts:
         return None
     n = min(SPEC_BINS, len(pts))
     width = (hi - lo) * 1e6 / n
@@ -886,10 +888,15 @@ def spec_pump() -> None:
             continue
         if time.time() > SPEC["until"]:
             SPEC["on"] = False
-            for sw in SWEEPS:
-                sw.latest.clear()
+            with SPEC_LOCK:
+                for sw in SWEEPS:
+                    sw.latest.clear()
             continue
-        fr = spec_frame()
+        try:
+            fr = spec_frame()
+        except Exception as e:                # never let the spectrum feed take the bridge down
+            print(f"bridge: spectrum: {e}", file=sys.stderr)
+            continue
         if fr is not None:
             emit(fr)
 
@@ -933,9 +940,10 @@ class Sweep:
             return
         if SPEC["on"]:
             self.step_hz = step
-            for i, db in enumerate(vals):
-                if db == db and db not in (float("inf"), float("-inf")):
-                    self.latest[lo + i * step] = db
+            with SPEC_LOCK:
+                for i, db in enumerate(vals):
+                    if db == db and db not in (float("inf"), float("-inf")):
+                        self.latest[lo + i * step] = db
         gnss_rows = {}      # GNSS window → [bins judged, hot bins]
         for i, db in enumerate(vals):
             if db != db or db in (float("inf"), float("-inf")):
