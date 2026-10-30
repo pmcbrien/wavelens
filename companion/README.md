@@ -19,6 +19,8 @@ permission, and nothing the companion hears leaves the phone.
 | Any SDR build + [local FCC pack](#local-fcc-license-pack--who-owns-that-carrier) | Licensed carriers named: which agency or business holds the frequency, and how far its site is | — | One script run per area |
 | Arduino | Only with a BLE module (HM-10) *and* a radio module; an ESP32 does both for less | — | Not recommended; see [diagrams](diagrams/) |
 
+**Shopping list for a car install:** [CAR_KIT.md](CAR_KIT.md) — Pi, two RTL-SDRs (which one does what, and why the V4 needs its own driver), antennas by band, powered hub, 12 V power, and the HackRF add-on.
+
 Wiring and antenna diagrams: [diagrams/](diagrams/) — overview, ESP32, Pi + SDR, [Pi + HackRF + two RTL-SDRs](diagrams/pi-hackrf-2sdr.svg), carputer, Arduino, vehicle mounting.
 
 ### What the SDRs do and don't add

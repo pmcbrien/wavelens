@@ -44,6 +44,10 @@ import sys
 import threading
 import time
 from queue import Queue, Empty
+try:
+    import audioop                   # C-speed mixing/resampling; gone in Python 3.13 (the Pi images have it)
+except ImportError:
+    audioop = None
 
 SVC = "57617665-6c65-6e73-0100-000000000001"
 TX = "57617665-6c65-6e73-0100-000000000002"
@@ -2534,6 +2538,10 @@ def _serve_listen(req: tuple, gen: int) -> None:
             return
         procs.append(p)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
+        except OSError:
+            pass
         sock.bind(("127.0.0.1", DSD_UDP_PORT))
         sock.settimeout(0.5)
         time.sleep(0.8)                      # rtl_tcp needs a moment before it accepts a client
@@ -2673,33 +2681,46 @@ def _serve_listen(req: tuple, gen: int) -> None:
         meter["last"] = now
         meter["bytes"] += len(data)
         span = now - meter["t0"]
-        if span >= 0.6:
+        if span >= 1.0 and not meter["said"]:
             bps = meter["bytes"] / span
+            # Compare in log space: 16k vs 32k is a factor of 2, like 96k vs 192k; a stream read at 70 %
+            # of its true rate (drops) still lands on the right one.
             rate, ch = min(((16000, 8000, 1), (32000, 8000, 2), (96000, 48000, 1), (192000, 48000, 2)),
-                           key=lambda k: abs(k[0] - bps))[1:]
-            if (rate, ch) != (meter["rate"], meter["ch"]):
-                meter["rate"], meter["ch"] = rate, ch
-                tag = f"{rate // 1000} kHz {'stereo' if ch == 2 else 'mono'}"
-                if tag != meter["said"]:
-                    meter["said"] = tag
-                    print(f"bridge: dsd-fme audio measured as {tag} ({bps / 1000:.0f} kB/s)", file=sys.stderr)
+                           key=lambda k: abs(math.log(k[0]) - math.log(max(bps, 1.0))))[1:]
+            meter["rate"], meter["ch"] = rate, ch
+            meter["said"] = f"{rate // 1000} kHz {'stereo' if ch == 2 else 'mono'}"
+            print(f"bridge: dsd-fme audio measured as {meter['said']} ({bps / 1000:.0f} kB/s); converting to 8 kHz mono", file=sys.stderr)
+            listen_status(f"audio: dsd-fme sends {meter['said']}")
         return (meter["rate"], meter["ch"]) if meter["rate"] else (LISTEN_RATE, chans)
+
+    rc_state = {"st": None, "rate": 0}        # audioop.ratecv carries filter state between chunks
 
     def read_chunk():
         if sock is None:
             return p.stdout.read(need - len(buf))
         while p.poll() is None and LISTEN["gen"] == gen:
             try:
-                data = sock.recv(8192)
+                data = sock.recv(65536)
             except socket.timeout:
                 continue
             rate, ch = classify(data)
+            if audioop is not None:
+                if ch == 2:                  # two TDMA slots, L and R: mix to mono (C speed)
+                    data = audioop.tomono(data[:len(data) & ~3], 2, 0.5, 0.5)
+                else:
+                    data = data[:len(data) & ~1]
+                if rate != LISTEN_RATE:      # 48 kHz → 8 kHz
+                    if rc_state["rate"] != rate:
+                        rc_state["st"], rc_state["rate"] = None, rate
+                    data, rc_state["st"] = audioop.ratecv(data, 2, 1, rate, LISTEN_RATE, rc_state["st"])
+                return data
+            # No audioop (Python 3.13+): the slow way
             n = len(data) // (2 * ch)
             smp = struct.unpack(f"<{n * ch}h", data[:2 * n * ch])
-            if ch == 2:                      # two TDMA slots, L and R: mix to mono
+            if ch == 2:
                 smp = [(smp[2 * i] + smp[2 * i + 1]) // 2 for i in range(n)]
             if rate != LISTEN_RATE and rate % LISTEN_RATE == 0:
-                k = rate // LISTEN_RATE      # 48 kHz → 8 kHz: average each run of k samples
+                k = rate // LISTEN_RATE
                 smp = [sum(smp[i:i + k]) // k for i in range(0, len(smp) - k + 1, k)]
             return struct.pack(f"<{len(smp)}h", *[max(-32768, min(32767, v)) for v in smp])
         return b""
