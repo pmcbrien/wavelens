@@ -188,10 +188,14 @@ static void status(const char* msg) {
   enqueue(line);
 }
 
+static void hwJson(char* out, size_t cap);   // defined with the radio modules below
+
 static void hello() {
+  char hw[160];
+  hwJson(hw, sizeof hw);
   char line[QL];
   snprintf(line, sizeof line,
-           "{\"t\":\"hello\",\"fw\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\"%s%s%s%s]%s}\n",
+           "{\"t\":\"hello\",\"fw\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\"%s%s%s%s]%s,\"hw\":%s}\n",
            FW_NAME, devName, pairCode,
 #if defined(HAS_RX5808) || defined(HAS_SPECTRUM)
            ",\"rf\"",
@@ -218,7 +222,7 @@ static void hello() {
 #else
            ""
 #endif
-  );
+           , hw);
   enqueue(line);
 }
 
@@ -613,6 +617,73 @@ static Sa818 saU = { &Serial1, SA818U_TX, SA818U_RX, SA818U_SQ, SA818U_AUDIO, 40
 #ifdef HAS_SA818_V
 static Sa818 saV = { &Serial2, SA818V_TX, SA818V_RX, SA818V_SQ, SA818V_AUDIO, 134.0f, 174.0f, false };
 #endif
+
+// What this board actually has, as probed at boot — sent in every hello so the phone can say "SA818-U
+// not answering" instead of a Listen that silently does nothing. "fitted" = compiled in; "up" = answered.
+static void hwJson(char* out, size_t cap) {
+  const char* sx =
+#if defined(HAS_SPECTRUM) || defined(HAS_SUBGHZ)
+  #ifdef RF_CC1101
+      "CC1101";
+  #else
+      "SX1276";
+  #endif
+#else
+      "";
+#endif
+  bool sxUp =
+#ifdef HAS_SPECTRUM
+      specRadioUp;
+#else
+      false;
+#endif
+  int n = snprintf(out, cap, "{\"radio\":\"%s\",\"radioUp\":%s,\"sa818u\":%s,\"sa818v\":%s,\"rx5808\":%s,\"line\":\"",
+                   sx, sxUp ? "true" : "false",
+#ifdef HAS_SA818_U
+                   saU.up ? "\"up\"" : "\"fitted\"",
+#else
+                   "null",
+#endif
+#ifdef HAS_SA818_V
+                   saV.up ? "\"up\"" : "\"fitted\"",
+#else
+                   "null",
+#endif
+#ifdef HAS_RX5808
+                   "true"
+#else
+                   "false"
+#endif
+  );
+  // the human line, and what's missing
+  char miss[80] = "";
+#ifdef HAS_SA818_U
+  if (!saU.up) strlcat(miss, "SA818-U not answering; ", sizeof miss);
+#endif
+#ifdef HAS_SA818_V
+  if (!saV.up) strlcat(miss, "SA818-V not answering; ", sizeof miss);
+#endif
+  if (n < (int)cap)
+    snprintf(out + n, cap - n, "%s%s%s%s%s%s\",\"missing\":%s}",
+             sx[0] ? sx : "no sub-GHz radio",
+#ifdef HAS_SA818_U
+             saU.up ? " · SA818-U" : " · SA818-U (silent)",
+#else
+             "",
+#endif
+#ifdef HAS_SA818_V
+             saV.up ? " · SA818-V" : " · SA818-V (silent)",
+#else
+             "",
+#endif
+#ifdef HAS_RX5808
+             " · RX5808",
+#else
+             "",
+#endif
+             miss[0] ? " — " : "", miss,
+             miss[0] ? "[\"radio module not answering\"]" : "[]");
+}
 static Sa818* saFor(float mhz) {
 #ifdef HAS_SA818_U
   if (saU.up && mhz >= saU.lo && mhz <= saU.hi) return &saU;

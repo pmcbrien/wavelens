@@ -154,8 +154,82 @@ def log_pump() -> None:
             emit({"t": "log", "ts": int(ts), "l": text})
 
 
+USB_IDS = {("0bda", "2838"): "rtl", ("0bda", "2832"): "rtl", ("1d50", "6089"): "hackrf",
+           ("10c4", "ea60"): "esp32", ("1a86", "7523"): "esp32", ("1a86", "55d4"): "esp32",   # CP210x / CH340 / CH9102 USB-serial
+           ("303a", "1001"): "esp32", ("303a", "4001"): "esp32"}                               # ESP32-S3 / -C3 native USB
+
+
+def hw_inventory() -> dict:
+    """What radios are on the Pi's USB bus right now, and what each is doing — read from sysfs (no device is
+    opened, so nothing running is disturbed). Sent in every hello and said in the journal, so a dongle that
+    fell off the bus or a HackRF left in the PortaPack menu is seen at the next connect, not after an hour
+    of silence. "esp32" here is a dev board plugged into the Pi over USB-serial (it is not driven by the
+    bridge; an ESP32 companion talks to the phone on its own)."""
+    rtls, hackrf, esp = [], "none", []
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        try:
+            with open(d + "/idVendor") as a, open(d + "/idProduct") as b:
+                kind = USB_IDS.get((a.read().strip(), b.read().strip()))
+        except OSError:
+            continue
+        if not kind:
+            continue
+        try:
+            with open(d + "/serial") as f:
+                sn = f.read().strip()
+        except OSError:
+            sn = ""
+        if kind == "rtl":
+            rtls.append(sn)
+        elif kind == "hackrf":
+            hackrf = "ok"
+        elif kind == "esp32":
+            esp.append(sn or os.path.basename(d))
+    if hackrf == "none" and portapack_tty():
+        hackrf = "portapack"                 # on the bus as a PortaPack console: ensure_hackrf_mode() flips it
+    try:
+        out = subprocess.run(["pgrep", "-a", "-f", "rtl_433|rtl_power|rtl_fm|rtl_tcp|dump1090|dump978|readsb"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        out = ""
+    def role(sn: str) -> str:
+        if sn and sn == LISTEN.get("dev"):
+            return "listen"
+        for ln in out.splitlines():
+            if sn and (f"-d {sn}" in ln or f"-d :{sn}" in ln or f"@{sn}" in ln or f"serial={sn}" in ln):
+                tool = ln.split()[1] if len(ln.split()) > 1 else ""
+                return {"rtl_433": "sensors", "rtl_power": "sweep", "rtl_fm": "listen", "rtl_tcp": "listen"}.get(
+                    os.path.basename(tool), os.path.basename(tool) or "busy")
+        return "free"
+    hw = {"rtl": [{"serial": sn, "role": role(sn)} for sn in rtls], "hackrf": hackrf, "esp32": esp}
+    want = [d for d in [LISTEN.get("dev", "")] if d and d not in rtls]
+    missing = []
+    if want:
+        missing.append(f"RTL-SDR {want[0]} (configured to listen) is not on the USB bus")
+    if HACKRF.get("ctl") is not None and hackrf != "ok":
+        missing.append("HackRF configured but not on the bus" + (" (in the PortaPack menu)" if hackrf == "portapack" else ""))
+    if not rtls:
+        missing.append("no RTL-SDR: nothing to listen or sweep with")
+    hw["missing"] = missing
+    parts = []
+    if rtls:
+        parts.append(f"{len(rtls)} RTL-SDR (" + ", ".join(f"{r['serial'] or '?'}: {r['role']}" for r in hw["rtl"]) + ")")
+    parts.append({"ok": "HackRF", "portapack": "HackRF (PortaPack menu)", "none": "no HackRF"}[hackrf])
+    if esp:
+        parts.append(f"ESP32 on USB ({len(esp)})")
+    hw["line"] = " · ".join(parts) + (" — " + "; ".join(missing) if missing else "")
+    return hw
+
+
 def hello() -> None:
-    emit({"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""), "caps": sorted(set(CAPS))})
+    hw = hw_inventory()
+    emit({"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""),
+          "caps": sorted(set(CAPS)), "hw": hw})
+    if hw["line"] != state.get("hw_line"):          # hello repeats every 15 s (the app's ping): say it when it changes
+        state["hw_line"] = hw["line"]
+        print(f"bridge: hardware: {hw['line']}", file=sys.stderr)
+        if hw["missing"]:
+            emit({"t": "status", "msg": "hardware: " + "; ".join(hw["missing"]), "band": state["band"], "mode": state["mode"]})
 
 
 

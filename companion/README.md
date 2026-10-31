@@ -375,7 +375,14 @@ an MTU of 247; assume 20-byte chunks if it fails.
 ### Companion → phone
 
 ```jsonc
-{"t":"hello","fw":"wavelens-esp32 0.2","name":"Wavelens-3F2A","code":"3F2A","caps":["wifi","ble","rf"]}
+{"t":"hello","fw":"wavelens-esp32 0.3","name":"Wavelens-3F2A","code":"3F2A","caps":["wifi","ble","rf"],
+ "hw":{"radio":"SX1276","sa818u":"up","sa818v":null,"rx5808":false,"line":"SX1276 · SA818-U","missing":[]}}
+// hw: what the companion found on its own bus at this connect, probed again on every hello (the phone
+// pings every 15 s). The Pi bridge sends {"rtl":[{"serial":"00000978","role":"listen"},{"serial":"00001090",
+// "role":"sensors"}],"hackrf":"ok"|"portapack"|"none","esp32":[...usb-serial boards...],"line":"2 RTL-SDR
+// (00000978: listen, 00001090: sensors) · HackRF","missing":["RTL-SDR 00002000 (configured to listen) is
+// not on the USB bus"]}. "missing" is also sent as a status and shown amber on the Companion screen;
+// the journal gets a "bridge: hardware: …" line whenever the inventory changes.
 {"t":"status","msg":"parked on 1 channel","band":"all","mode":"both","ch":6}
 
 // Wi-Fi AP / hotspot (beacon or probe response). id = BSSID. ch or f (MHz); the phone derives the other.
