@@ -1970,7 +1970,7 @@ FOLLOW_RECENT_S = 60.0      # a hit older than this is no longer a candidate
 FOLLOW_TTL_S = 15 * 60.0    # Follow stops by itself this long after the app's last renewal (it renews every minute)
 
 
-TRUNK_HOLD_S = 20.0         # a locked trunked system keeps the dongle until it has had no call for this long
+TRUNK_HOLD_S = 5.0          # a locked trunked system keeps the dongle until it has had no call for this long
 
 
 def follow_busy(now: float) -> bool:
@@ -2151,7 +2151,8 @@ def cc_forget(mhz: float) -> None:
 
 TRUNK_SEEN_S = 180.0        # a site frequency counts as a candidate for this long after its last hit
 TRUNK_CC_WAIT_S = 18.0      # dsd-fme must show a sync on a candidate within this, else the next is tried (rtl_tcp start + sync)
-TRUNK_IDLE_S = 45.0         # a locked system with no call for this long: on to the next strongest system
+TRUNK_IDLE_S = 5.0          # a locked system with no call for this long: on to the next strongest system (scanner-style)
+TRUNK_MIN_DB = 18.0         # a system is only rotated to when its control channel was this far over the band's floor
 TRUNK_RANK_TTL_S = 15 * 60.0  # the hunt's ranking of nearby systems is re-done after this
 TRUNK_FAIL_SKIP_S = 10 * 60.0 # a carrier that gave no sync is not retried for this long
 
@@ -2171,7 +2172,8 @@ def trunk_next_system(now: float) -> bool:
     for r in ranked:
         if r["mhz"] == cur:
             r["ok"] = True
-    others = [r for r in ranked if abs(r["mhz"] - cur) > 0.001 and now - r["failed_at"] > TRUNK_FAIL_SKIP_S]
+    others = [r for r in ranked if abs(r["mhz"] - cur) > 0.001 and now - r["failed_at"] > TRUNK_FAIL_SKIP_S
+              and r["lvl"] >= TRUNK_MIN_DB]              # weak carriers are not worth leaving a system for
     if not others:
         return False
     # the next one down the power ranking after the current; wrap to the top
@@ -4015,6 +4017,10 @@ def main() -> None:
     ap.add_argument("--hackrf-ppm", type=float, default=0.0,
                     help="HackRF crystal correction: reported MHz are scaled by (1 + ppm/1e6). Key a radio on a known "
                          "frequency, read exact_mhz, then ppm = (known - read) / read * 1e6 (typically -20..20)")
+    ap.add_argument("--trunk-idle", type=float, default=5.0, metavar="SECONDS",
+                    help="Follow leaves a locked trunked system after this long without a call, for the next strongest (default 5)")
+    ap.add_argument("--trunk-min-db", type=float, default=18.0, metavar="DB",
+                    help="only rotate to a system whose control channel is at least this far over the band floor (default 18)")
     ap.add_argument("--moto-band", default="800",
                     help="Motorola Type II channel plan: 800 (standard), 800r (rebanded), 800s (splinter), 900, or obt:BASE:SPACING:OFFSET "
                          "for UHF/VHF systems (default 800)")
@@ -4081,6 +4087,9 @@ def main() -> None:
     if a.hackrf_keep_sweeping:
         globals()["HACKRF_PAUSE_ON_LISTEN"] = False
     globals()["MOTO_BAND"] = a.moto_band
+    globals()["TRUNK_IDLE_S"] = max(2.0, a.trunk_idle)
+    globals()["TRUNK_HOLD_S"] = max(2.0, a.trunk_idle)
+    globals()["TRUNK_MIN_DB"] = a.trunk_min_db
     if a.hackrf_sweep or a.rtl_power:
         threading.Thread(target=spec_pump, daemon=True).start()
     if a.hackrf_sweep:
