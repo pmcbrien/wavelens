@@ -87,6 +87,7 @@ def emit(obj: dict) -> None:
 
 
 CAPS = ["rf"]
+START_AT = time.time()
 
 # The bridge's own journal, for the phone. Everything the bridge prints on stderr (its "bridge: …" lines
 # and what rtl_tcp / dsd-fme / hackrf_sweep say) is kept, last LOG_KEEP lines, and streamed as
@@ -3477,8 +3478,17 @@ def feed_stdin(mode: str) -> None:
             if line.startswith("{"):
                 out.put(line + "\n")
     if mode == "rtl433":
-        # rtl_433 has exited (dongle busy, unplugged, wrong serial). Don't keep a Bluetooth link up
-        # with a dead radio behind it: exit so the service restarts both.
+        # rtl_433 has exited (dongle busy, unplugged, wrong serial). If it died within seconds of start
+        # — the sensor dongle isn't there — carry on without sensors rather than restart-loop the whole
+        # bridge: the scanner, sweep and trunking don't need it. A later exit (it ran for a while, then
+        # the dongle dropped) still restarts the service so both come back together.
+        up = time.time() - START_AT
+        if up < 20.0:
+            print(f"bridge: rtl_433 exited {up:.0f} s after start (no sensor dongle?): carrying on without TPMS / sensor decoding "
+                  "— replug the rtl_433 dongle and restart the service to get it back", file=sys.stderr)
+            if "rf" in CAPS and not (HACKRF_ON or SWEEP_RANGES):
+                CAPS.remove("rf")
+            return
         print("bridge: rtl_433 stopped sending; exiting so the service restarts it", file=sys.stderr)
         os._exit(1)
 
