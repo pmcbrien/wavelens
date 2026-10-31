@@ -2324,7 +2324,7 @@ def follow_watch() -> None:
             continue
         if now > LISTEN["follow_until"]:
             LISTEN["follow"] = False
-            listen_stop("follow timed out (5 min without the app renewing it)")
+            listen_stop("follow timed out (5 min without the app renewing it)", cancel_hunt=True)
             listen_status("follow ended")
             continue
         if LISTEN["proc"] is None:
@@ -2360,9 +2360,12 @@ def listen_status(msg: str) -> None:
                      "lockout": LISTEN["lockout"]} if (on or LISTEN["follow"]) else "off"})
 
 
-def listen_stop(why: str = "stopped") -> None:
-    if why != "no control channel found":
+def listen_stop(why: str = "stopped", cancel_hunt: bool = False) -> None:
+    """End the current listen. A control-channel hunt in progress is left alone unless cancel_hunt: only
+    the phone's "off" and the end of Follow should stop it — not a tool exiting or a stale listen timing out."""
+    if cancel_hunt and HUNT["on"]:
         HUNT["cancel"] = True
+        print(f"bridge: control-channel hunt cancelled: {why}", file=sys.stderr)
     with LISTEN_CV:
         was = LISTEN["req"] is not None
         LISTEN["req"] = None
@@ -3121,7 +3124,7 @@ def run_peripheral(name: str) -> None:
                       "band": state["band"], "mode": state["mode"], "listen": "off"})
             elif str(cmd.get("v") or "") == "off":
                 LISTEN["follow"] = False
-                listen_stop("stopped")
+                listen_stop("stopped", cancel_hunt=True)
                 listen_status("listening stopped")
             elif str(cmd.get("v") or "") == "lockout":
                 # The phone's list of frequencies Follow must never tune (it resends it on every connect).
@@ -3207,7 +3210,7 @@ def run_peripheral(name: str) -> None:
         chars["au"] = characteristic if notifying else None
         if not notifying and LISTEN["req"] is not None:
             LISTEN["follow"] = False
-            listen_stop("stopped (phone unsubscribed)")
+            listen_stop("stopped (phone unsubscribed)", cancel_hunt=True)
 
     dev.add_characteristic(srv_id=1, chr_id=3, uuid=AU, value=[], notifying=False,
                            flags=["notify"], notify_callback=au_notify_cb)
