@@ -1876,7 +1876,18 @@ CALL_RE = re.compile(r"\bTG[:= ]\s*(\d+)")
 # Mode "auto": start in dsd-fme's auto-detect; it says on stderr what sync it finds ("Sync: +P25p1"), which
 # also tells us the audio layout (TDMA is stereo). If the carrier is on and no digital sync shows within
 # AUTO_WAIT_S, it's analog: restart as narrow FM. Decided once per tune; the app's renewals keep "auto".
-AUTO_WAIT_S = 3.0
+AUTO_WAIT_S = 5.0
+# ...counted from dsd-fme's first "Sync:" line (it is demodulating by then), not from the tune: rtl_tcp and
+# dsd-fme take a few seconds to come up, and a 3 s window from the tune used to run out before they had
+# heard anything, so every digital repeater came out as FM — a buzz.
+# Second line of defence, in FM: a digital carrier through the FM discriminator is broadband noise at a
+# steady level — zero-crossing rate near 0.5 and almost no level change, where voice sits near 0.1 and
+# swings. DIGI_FRAMES frames of that (2 s) and the tune goes back to dsd-fme once, for AUTO_REPROBE_S;
+# if that finds no sync either it is a data or voice mode dsd-fme can't do (NXDN, dPMR, P25 data, a
+# paging/telemetry carrier): nothing to hear, so the audio stays muted and Follow moves on.
+DIGI_ZCR = 0.33
+DIGI_FRAMES = 50
+AUTO_REPROBE_S = 10.0
 # Channel plans: a sweep places a carrier to within a quarter bin (±25 kHz on a HackRF, ±3 kHz on an
 # RTL-SDR), but radios sit on channel rasters. Snap to the likeliest channel within the tolerance:
 # (lo, hi, [(step_khz, offset_khz, preference)...]) — lower preference wins when several rasters fit.
@@ -2830,6 +2841,7 @@ def listen_start(mhz: float, mode: str, sq: int, tol: float = 0.05) -> None:
         LISTEN["mhz"], LISTEN["mode"], LISTEN["asked"], LISTEN["sq"] = mhz, mode, mode, sq
         LISTEN["raw_mhz"], LISTEN["tol"], LISTEN["readings"], LISTEN["honed_at"] = raw, tol, [raw], 0.0
         LISTEN["carrier_at"], LISTEN["detected"], LISTEN["call"] = 0.0, "", ""
+        LISTEN["reprobe"] = 0.0
         LISTEN["chan_at"] = time.time()
         LISTEN["gen"] += 1
         LISTEN_CV.notify()
@@ -2942,6 +2954,8 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                     log_line(f"{tool}: {ln}")     # the per-frame control-channel chatter stays out of the phone journal
                 if kw.get("watch_sync"):
                     m = SYNC_RE.search(ln)
+                    if m and not getattr(proc, "alive_at", 0.0):
+                        proc.alive_at = time.time()       # demodulating: the auto-detect clock starts here
                     if m and m.group(1).lower() not in ("no", "none", "lost"):
                         proc.sync, proc.sync_at = m.group(1), time.time()
                     # Voice frames (P25 LDU1/LDU2, DMR voice bursts) mean a call is playing right now, whether
@@ -3350,7 +3364,17 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 elif not LISTEN["detected"]:
                     carrier = LISTEN["carrier_at"]
                     since_tune = now - LISTEN["tuned_at"]
-                    if (carrier and now - carrier < 2.0 and since_tune >= AUTO_WAIT_S) or since_tune >= AUTO_NO_CARRIER_WAIT_S:
+                    alive = getattr(p, "alive_at", 0.0)
+                    since_alive = now - alive if alive else 0.0
+                    reprobe = LISTEN.get("reprobe") == mhz
+                    wait = AUTO_REPROBE_S if reprobe else AUTO_WAIT_S
+                    if reprobe and alive and since_alive >= wait:
+                        LISTEN["detected"] = "DATA"
+                        LISTEN["reprobe"] = 0.0
+                        listen_status(f"digital carrier on {mhz:.4f} MHz: not a voice mode the companion decodes "
+                                      f"(NXDN, dPMR or data) — nothing to hear")
+                    elif not reprobe and ((carrier and now - carrier < 2.0 and alive and since_alive >= wait)
+                                          or since_tune >= AUTO_NO_CARRIER_WAIT_S + wait):
                         LISTEN["detected"] = "FM"
                         listen_resolve("fm", "carrier with no digital sync")
                         break
@@ -3383,6 +3407,33 @@ def _serve_listen(req: tuple, gen: int) -> None:
 
     ended_itself = True
     afc = []                                 # offsets (Hz) from frames with signal, analog FM only
+
+    digi = []                                # per-frame (zcr, rms) of recent FM frames with signal
+
+    def digi_frame(pcm: bytes) -> bool:
+        """True when the last DIGI_FRAMES frames of FM audio look like a digital carrier, not voice."""
+        n = len(pcm) // 2
+        samples = struct.unpack(f"<{n}h", pcm)
+        m = sum(samples) / n
+        rms = (sum((v - m) ** 2 for v in samples) / n) ** 0.5
+        if rms < 300:
+            del digi[:]                      # squelch tail / silence: start over
+            return False
+        zc = 0
+        prev = samples[0] - m
+        for v in samples[1:]:
+            v -= m
+            if (v < 0) != (prev < 0):
+                zc += 1
+            prev = v
+        digi.append((zc / (n - 1), rms))
+        if len(digi) < DIGI_FRAMES:
+            return False
+        del digi[:-DIGI_FRAMES]
+        zcrs = sorted(z for z, _ in digi)
+        rmss = [r for _, r in digi]
+        steady = (max(rmss) - min(rmss)) < 0.35 * (sum(rmss) / len(rmss))
+        return zcrs[len(zcrs) // 4] >= DIGI_ZCR and steady
 
     def afc_frame(pcm: bytes) -> bytes:
         """Measure the carrier offset from this frame's DC level, then remove the DC so it plays clean.
@@ -3433,6 +3484,15 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 pcm, buf = buf[:need], buf[need:]
                 if sock is None and mode == "fm":
                     pcm = afc_frame(pcm)
+                    if LISTEN["asked"] == "auto" and LISTEN.get("reprobe") != mhz and digi_frame(pcm):
+                        # the probe missed it (started late, or the repeater was idle): back to dsd-fme once
+                        LISTEN["reprobe"] = mhz
+                        LISTEN["detected"] = ""
+                        listen_status(f"{mhz:.4f} MHz sounds like a digital carrier — trying the decoders again")
+                        listen_resolve("auto", "FM audio is a digital carrier")
+                        break
+                if LISTEN["detected"] == "DATA":
+                    continue                 # digital carrier nobody can decode here: no audio, and Follow sees it as quiet
                 LISTEN["last_audio"] = time.time()
                 if LISTEN["detected"] in ("POCSAG", "FLEX"):
                     continue                 # pager data: nothing to hear; the pages go as lines
