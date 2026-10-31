@@ -2913,8 +2913,15 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                         proc.voice_at = time.time()
                     ma = re.search(r"ALG(?: ID)?:\s*0x([0-9A-Fa-f]+)", ln)
                     if ma:
-                        proc.enc_now = ma.group(1).upper() not in ("80", "0", "00")
-                        proc.enc_at = time.time()
+                        e = ma.group(1).upper() not in ("80", "0", "00")
+                        # two frames in a row before the flag flips: one stray ALG line from the other TDMA
+                        # slot or a late header must not label a clear dispatch call "encrypted"
+                        proc.enc_run = (getattr(proc, "enc_run", 0) + 1) if e else 0
+                        proc.clr_run = (getattr(proc, "clr_run", 0) + 1) if not e else 0
+                        if proc.enc_run >= 2:
+                            proc.enc_now, proc.enc_at = True, time.time()
+                        elif proc.clr_run >= 2:
+                            proc.enc_now, proc.enc_at = False, time.time()
                     m = CALL_RE.search(ln)
                     if m:
                         enc = ENC_RE.search(ln)
