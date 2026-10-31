@@ -343,6 +343,15 @@ python.org's installers; `apt install python3-tk` on Debian/Ubuntu.
 computer's speakers (the IMA ADPCM decoder in it is the reference for the frame format above).
 One central at a time: disconnect the phone first.
 
+## Two companions at once
+
+The app holds two BLE links: the **main companion** (everything — listening, the scanner, spectrum, journal; the
+Pi) and a **second companion** (a Wi-Fi / BLE sniffer: a bare ESP32). Pair the second from More → Companion
+radio → "Second companion" → Find → *Pair as second*. Its `wifi` / `ble` / `rf` lines join the same pipeline,
+tagged by `src`; it gets the same `mode` / `band` / `ch` / `park` commands as the main one; `listen`, `spec`,
+`log` and audio are never sent to it. Both reconnect on their own. A companion's own advertisement is never
+adopted as the other link.
+
 ## Pairing
 
 1. Power the companion near the phone. It blinks twice, then advertises the Wavelens
