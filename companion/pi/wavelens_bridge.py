@@ -1890,6 +1890,14 @@ PAGER_CMD = "multimon-ng -t raw -a POCSAG512 -a POCSAG1200 -a POCSAG2400 -a FLEX
 PAGE_RE = re.compile(r"^(POCSAG\d+|FLEX)[:|]\s*(.*)$")
 PAGE_ADDR_RE = re.compile(r"Address:\s*(\d+)|\[(\d+)\]")
 PAGE_MSG_RE = re.compile(r"(?:Alpha|Numeric|ALN|NUM|TON|BIN):\s*(.*)$|(?:ALN|NUM)\s+(.*)$")
+# multimon-ng prints control characters as named tokens (<NUL>, <ETX>, <EOT>, <ESC> …) and leaves others
+# raw; neither belongs on a screen or in a voice. Removed before the page leaves the Pi.
+PAGE_CTRL_RE = re.compile(r"<(?:NUL|SOH|STX|ETX|EOT|ENQ|ACK|BEL|BS|HT|LF|VT|FF|CR|SO|SI|DLE|DC[1-4]|NAK|SYN|ETB|CAN|EM|SUB|ESC|FS|GS|RS|US|DEL|SP|0x[0-9A-Fa-f]{2})>|[\x00-\x1f\x7f-\x9f]")
+
+
+def page_clean(msg: str) -> str:
+    msg = PAGE_CTRL_RE.sub(" ", msg)
+    return re.sub(r"\s+", " ", msg).strip()
 AFC_FRAMES = 12              # 40 ms frames with signal before judging (about half a second)
 AFC_MIN_HZ = 1500            # smaller offsets are the dongle's crystal, not a wrong channel
 
@@ -2155,7 +2163,8 @@ def trunk_next_system(now: float) -> bool:
     TRUNK["tries"] = [(nxt["mhz"], md) for md in nxt["modes"][1:]]
     TRUNK["cc_at"] = time.time()
     trunk_prep(nxt["mhz"], nxt["modes"][0])
-    listen_status(f"trunked: {cur:.4f} MHz quiet for {TRUNK_IDLE_S:.0f} s; next system {nxt['mhz']:.4f} MHz (+{nxt['lvl']:.0f} dB)")
+    listen_status(f"trunked: {cur:.4f} MHz quiet for {TRUNK_IDLE_S:.0f} s; next system {nxt['mhz']:.4f} MHz (+{nxt['lvl']:.0f} dB)"
+                  + (f" {nxt['name']}" if nxt.get("name") else ""))
     listen_start(nxt["mhz"], nxt["modes"][0], LISTEN["sq"], 0.0)
     return True
 
@@ -2365,18 +2374,31 @@ def cc_hunt(first: list) -> None:
     # Like a scanner: the strongest steady carrier first, then the next. The RadioReference list only
     # decides how to decode a carrier (P25 / DMR / EDACS) and which ones to skip (LTR can't be followed).
     found.sort(key=lambda c: -c[1])
-    ranked = []
-    for m, lvl in found[:CC_MAX_TRIES]:
+    ranked, sites_seen = [], set()
+    for m, lvl in found[:CC_MAX_TRIES * 2]:
         cc = RR.control_at(m) if RR else None
         row = cc[2] if cc else (RR.site_at(m) if RR else None)
         if cc:
             m = cc[0]                        # the listed frequency is exact; the scan's is within a channel
         if row is not None and row.get("Mode") == "ltr":
             continue
+        # One entry per site: a site's voice channels are steady carriers too (busy systems keep several
+        # up), but they are the same system — the strongest carrier of the site stands for it, and the
+        # scanner rotation moves between systems, not between a system's own channels.
+        key = (row.get("System Name") or row.get("Agency/Category") or "", row.get("Description") or "") if row is not None else None
+        if key and key in sites_seen:
+            continue
+        if key:
+            sites_seen.add(key)
         modes = trunk_modes(rr_site(row)[2] if row is not None else "p25", row)
-        ranked.append({"mhz": m, "lvl": lvl, "modes": modes, "failed_at": 0.0, "ok": False})
+        name = f"{key[0]} ({key[1]})" if key and key[0] else ""
+        ranked.append({"mhz": m, "lvl": lvl, "modes": modes, "failed_at": 0.0, "ok": False, "name": name})
         tries += [(m, md) for md in modes]
+        if len(ranked) >= CC_MAX_TRIES:
+            break
     TRUNK["ranked"], TRUNK["ranked_at"] = ranked, time.time()
+    if ranked:
+        print("bridge: systems ranked: " + "; ".join(f"{r['mhz']:.4f} (+{r['lvl']:.0f} dB){' ' + r['name'] if r['name'] else ''}" for r in ranked), file=sys.stderr)
     if RR and RR.controls:
         # After what was heard: the list's control channels in its own order, in case the hunt's floor
         # judgement missed a weak one.
@@ -2909,9 +2931,9 @@ def start_pager(gen: int, mhz: float):
             proto, rest = m.group(1), m.group(2)
             am = PAGE_ADDR_RE.search(rest)
             mm = PAGE_MSG_RE.search(rest)
-            msg = ((mm.group(1) or mm.group(2)) if mm else rest).strip()
-            if not msg:
-                continue
+            msg = page_clean((mm.group(1) or mm.group(2)) if mm else rest)
+            if not msg or not re.search(r"[A-Za-z0-9]", msg):
+                continue                     # a page that was only control bytes or tone codes
             kind = "FLEX" if proto == "FLEX" else "POCSAG"
             if LISTEN["detected"] != kind:
                 LISTEN["detected"] = kind
