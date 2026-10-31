@@ -3021,6 +3021,8 @@ def _serve_listen(req: tuple, gen: int) -> None:
                                       f"{'QPSK' if mode == 'trunkq' else 'C4FM' if mode == 'trunk' else mode}) — waiting for a call")
             elif mode == "auto":
                 sync = getattr(p, "sync", "")
+                if sync and sync.upper().startswith(("DSTAR", "D-STAR", "NXDN")) and (764.0 <= mhz <= 776.0 or 851.0 <= mhz <= 869.0 or 935.0 <= mhz <= 941.0):
+                    sync = ""                    # no D-STAR or NXDN lives in these bands: a false sync on a data channel
                 if sync and now - p.sync_at < 5.0:
                     if LISTEN["detected"] != sync:
                         LISTEN["detected"] = sync
@@ -3490,8 +3492,22 @@ def run_peripheral(name: str) -> None:
                         tol = max(0.0, min(0.5, float(cmd.get("tol", 0.05))))
                     except (TypeError, ValueError):
                         tol = 0.05
-                    listen_start(mhz, str(cmd.get("mode") or "fm"),
-                                 max(0, min(1000, int(sq))) if sq is not None else LISTEN["sq"], tol)
+                    mode = str(cmd.get("mode") or "fm")
+                    # A tap on a channel the RadioReference list knows as part of a trunked system: follow the
+                    # system (P25 / EDACS / DMR with its control channel and channel map) instead of probing
+                    # the channel as if it were conventional — AUTO on an EDACS or P25 data stream yields a
+                    # false D-STAR / NXDN sync and noise.
+                    row = None
+                    if RR and mode in ("auto", "fm") and "listen" in CAPS and "trunk" in CAPS:
+                        cc = RR.control_at(mhz)
+                        row = cc[2] if cc else RR.site_at(mhz)
+                    if row is not None and trunk_kind(row.get("Mode") or row.get("System Type") or "") in TRUNK_KINDS:
+                        site = rr_site(row)
+                        TRUNK["tries"], TRUNK["cc_at"] = [], 0.0
+                        listen_status(f"{mhz:.4f} MHz is a channel of {site[0]} ({site[1]}, {site[2].upper()}): following the system")
+                        trunk_start(site)
+                    else:
+                        listen_start(mhz, mode, max(0, min(1000, int(sq))) if sq is not None else LISTEN["sq"], tol)
                 else:
                     emit({"t": "status", "msg": f"{mhz:g} MHz is outside the RTL-SDR's 24–1766 MHz; can't listen there",
                           "band": state["band"], "mode": state["mode"], "listen": "off"})
