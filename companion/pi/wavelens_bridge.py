@@ -206,8 +206,8 @@ def hw_inventory() -> dict:
     missing = []
     if want:
         missing.append(f"RTL-SDR {want[0]} (configured to listen) is not on the USB bus")
-    if HACKRF.get("ctl") is not None and hackrf != "ok":
-        missing.append("HackRF configured but not on the bus" + (" (in the PortaPack menu)" if hackrf == "portapack" else ""))
+    if HACKRF.get("ctl") is not None and hackrf == "portapack":
+        missing.append("HackRF is in the PortaPack menu")   # a configured HackRF that is simply absent is adapted to, not an error
     if not rtls:
         missing.append("no RTL-SDR: nothing to listen or sweep with")
     hw["missing"] = missing
@@ -223,8 +223,19 @@ def hw_inventory() -> dict:
 
 def hello() -> None:
     hw = hw_inventory()
-    emit({"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""),
-          "caps": sorted(set(CAPS)), "hw": hw})
+    # the spectrum reach the phone may ask for: the whole HackRF range while one is on the bus, else what
+    # the RTL-SDR sweeps cover (24–1766 MHz is the dongle's limit; the configured ranges are what is drawn)
+    if hw["hackrf"] == "ok" and HACKRF_ON:
+        spec = [1, 6000]
+    elif SWEEP_RANGES:
+        spec = [round(min(lo for lo, _ in SWEEP_RANGES)), round(max(hi for _, hi in SWEEP_RANGES))]
+    else:
+        spec = None
+    msg = {"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""),
+           "caps": sorted(set(CAPS)), "hw": hw}
+    if spec:
+        msg["spec"] = spec
+    emit(msg)
     if hw["line"] != state.get("hw_line"):          # hello repeats every 15 s (the app's ping): say it when it changes
         state["hw_line"] = hw["line"]
         print(f"bridge: hardware: {hw['line']}", file=sys.stderr)
@@ -1476,11 +1487,20 @@ def spawn(cmd: str):
     tail = deque(maxlen=4)
 
     tool = cmd.split()[0]
+    usage = False
+
     def drain():
+        nonlocal usage
         for ln in p.stderr:
-            if ln.strip():
-                tail.append(ln.strip())
-                log_line(f"{tool}: {ln.strip()}")
+            ln = ln.strip()
+            if not ln:
+                continue
+            if ln.startswith("Usage:"):
+                usage = True                 # a tool printing its help after an error: the error line is enough
+            if usage:
+                continue
+            tail.append(ln)
+            log_line(f"{tool}: {ln}")
     threading.Thread(target=drain, daemon=True).start()
     p.started_at, p.err_tail = time.time(), tail
     return p
@@ -1798,14 +1818,27 @@ def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20, mask:
         rtl_tcp. The sweep waits it out. (Set by the parent process over the control queue.)"""
         return HACKRF["paused"]
 
+    absent_said = False
     while True:
         if digital_listen():
             time.sleep(0.5)
             continue
+        ensure_hackrf_mode()
+        if not hackrf_on_usb():
+            # Unplugged, lost power, or sitting in the PortaPack menu: don't restart hackrf_sweep every 3 s
+            # (each failure printed its whole usage text into the journal). Wait for it on the bus.
+            if not absent_said:
+                print("bridge: hackrf_sweep: no HackRF on the USB bus — waiting for one (check its cable/power; "
+                      "a PortaPack must be in HackRF mode)", file=sys.stderr)
+                absent_said = True
+            time.sleep(5)
+            continue
+        if absent_said:
+            print("bridge: hackrf_sweep: HackRF is back on the bus", file=sys.stderr)
+            absent_said = False
         park = state.get("park", "off")
         rng = PARK_RANGES.get(park, range_mhz)
         cmd = f"hackrf_sweep -f {rng} -w {bin_hz} -l {lna} -g {vga}"
-        ensure_hackrf_mode()
         p = spawn(cmd)
         if p is None:
             return
@@ -1902,6 +1935,59 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm:
                             sw.row, planned=True, stop_when=busy, stall_s=RTL_STALL_S, on_stall=lambda: usb_reset(device)):
                 return
             time.sleep(0.5)         # let the dongle close before the next range opens it
+
+
+def usb_rtl_serials() -> "list[str]":
+    """Serials of the RTL-SDRs on the USB bus right now (sysfs; nothing is opened)."""
+    out = []
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        try:
+            with open(d + "/idVendor") as a, open(d + "/idProduct") as b:
+                if (a.read().strip(), b.read().strip()) not in (("0bda", "2838"), ("0bda", "2832")):
+                    continue
+            with open(d + "/serial") as f:
+                out.append(f.read().strip())
+        except OSError:
+            continue
+    return out
+
+
+def adapt_radios(groups: "dict[str, list[str]]", listen_dev: str, hackrf_wanted: bool) -> "tuple[dict, str]":
+    """Fit the configured plan to the radios actually present. The config names dongles by serial; when one
+    is missing (unplugged, swapped, a V4 that fell off the bus) its job moves to a dongle that is here —
+    a free one first, else the job shares a dongle that has one already (listening borrows the sweep
+    dongle; that is how a two-dongle setup works anyway). A HackRF that is configured but absent is just
+    not swept with (the hunt and Follow run on the RTL-SDR sweep); one plugged in later is picked up.
+    Only serial-addressed dongles are adapted; an index (-d 0) is left alone."""
+    present = usb_rtl_serials()
+    if not present:
+        return groups, listen_dev              # nothing to adapt to; the hardware status will say so
+    try:
+        held = subprocess.run(["pgrep", "-a", "-f", "rtl_433"], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        held = ""
+    busy = {sn for sn in present if re.search(rf"-d :?{re.escape(sn)}\b", held)}   # rtl_433's dongle
+    used = set()
+    out: "dict[str, list[str]]" = {}
+    for dev, specs in groups.items():
+        if not dev or not dev.isdigit() and dev in present:
+            out.setdefault(dev, []).extend(specs); used.add(dev); continue
+        if dev.isdigit():
+            out.setdefault(dev, []).extend(specs); continue
+        free = [sn for sn in present if sn not in busy and sn not in used]
+        new = free[0] if free else next((sn for sn in present if sn not in busy), present[0])
+        print(f"bridge: adapting: RTL-SDR {dev} (sweep) is not on the bus; sweeping {', '.join(specs)} on {new}", file=sys.stderr)
+        out.setdefault(new, []).extend(specs); used.add(new)
+    if listen_dev and not listen_dev.isdigit() and listen_dev not in present:
+        free = [sn for sn in present if sn not in busy and sn not in used]
+        new = free[0] if free else next((sn for sn in present if sn not in busy), present[0])
+        print(f"bridge: adapting: RTL-SDR {listen_dev} (listen) is not on the bus; listening on {new}"
+              + (" (it also sweeps; the sweep pauses while listening)" if new in used else ""), file=sys.stderr)
+        listen_dev = new
+    if hackrf_wanted and not hackrf_on_usb() and not portapack_tty():
+        print("bridge: adapting: no HackRF on the bus; the RTL-SDR sweep does the hunting and Follow (above 1.7 GHz "
+              "nothing is seen); a HackRF plugged in later is picked up", file=sys.stderr)
+    return out, listen_dev
 
 
 def group_sweeps(specs: "list[str]", default_device: str) -> "dict[str, list[str]]":
@@ -2285,6 +2371,8 @@ def trunk_next_system(now: float, force: bool = False) -> bool:
     if TRUNK.get("hold") and not force:
         return True                              # held: stay; "True" so the caller doesn't drop the listen
     ranked = TRUNK.get("ranked") or []
+    if HUNT["on"]:
+        return True                              # a hunt is running: wait for it (don't drop to conventional hits)
     if not ranked or now - TRUNK.get("ranked_at", 0.0) > TRUNK_RANK_TTL_S:
         if LISTEN["follow"] and not HUNT["on"]:
             listen_status("trunked: system quiet; looking again for the strongest systems nearby")
@@ -2776,6 +2864,8 @@ def follow_next(now: float) -> bool:
         del recent[k]
     for k in [k for k, left in played.items() if now - left > FOLLOW_COOLDOWN_S]:
         del played[k]
+    if HUNT["on"]:
+        return False                             # the hunt is reading the sweep; a listen now would pause it and stall the hunt
     cur = follow_key(LISTEN["mhz"]) if LISTEN["req"] is not None else None
     cands = [(seen, k, mhz, mode, tol) for k, (seen, mhz, mode, tol) in recent.items() if k not in played and k != cur]
     if not cands:
@@ -3041,6 +3131,8 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                     # streams LDUs for the rest of the call. ALG ID 0x80 / 0x00 = clear, anything else = encrypted.
                     if re.search(r"\bLDU[12]\b|Voice Frame|VC[12]|\bHDU\b", ln):
                         proc.voice_at = time.time()
+                    if re.search(r"\bTSBK\b|\bTDULC\b|duid:EE|\bTSDU\b|MAC_SIGNAL|CSBK|C_ALOHA|SYS_ID|Site ID", ln):
+                        proc.ctrl_at = time.time()           # control-channel traffic: what a CC and only a CC carries
                     ma = re.search(r"ALG(?: ID)?:\s*0x([0-9A-Fa-f]+)", ln)
                     if ma:
                         e = ma.group(1).upper() not in ("80", "0", "00")
@@ -3414,8 +3506,15 @@ def _serve_listen(req: tuple, gen: int) -> None:
                     break
                 sync = getattr(p, "sync", "")
                 if sync and now - p.sync_at < 5.0 and LISTEN["detected"] != sync:
+                    voice_only = (sync.upper().startswith("P25") and now - getattr(p, "voice_at", 0.0) < 5.0
+                                  and not getattr(p, "ctrl_at", 0.0))
+                    if TRUNK["cc_at"] and voice_only and now - p.sync_at < 3.0 and now - LISTEN["tuned_at"] < 6.0:
+                        time.sleep(0.5)
+                        continue                 # P25p1 with voice frames: give a TSBK three seconds to show before deciding
                     LISTEN["detected"] = sync
-                    if TRUNK["cc_at"] and not cc_sync_ok(sync, mode):
+                    if TRUNK["cc_at"] and (not cc_sync_ok(sync, mode) or voice_only):
+                        if voice_only:
+                            sync = f"{sync} voice (HDU/LDU, no TSBK)"
                         # A sync, but not a control channel's: P25 phase 2 is TDMA voice, so this is one of the
                         # system's voice channels. Its control channel is a phase 1 carrier nearby; keep looking.
                         TRUNK["cc_at"] = 0.0
@@ -3437,6 +3536,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
                         cc_save(mhz, mode, name)
                         TRUNK["system"] = name
                         TRUNK["tg_seen"] = []
+                        LISTEN["call_at"] = now          # the 5 s quiet clock starts at the lock, not at the tune
                         listen_status(f"trunked: locked onto the control channel {mhz:.4f} MHz ({sync}, "
                                       f"{'QPSK' if mode == 'trunkq' else 'C4FM' if mode == 'trunk' else mode}) — waiting for a call")
             elif mode == "auto":
@@ -4366,10 +4466,13 @@ def main() -> None:
         HACKRF_ON = True
         CAPS.append("sweep")
         CAPS.append("park")
+        if not a.rtl_power:
+            _, a.listen_device = adapt_radios({}, a.listen_device, True)
         hackrf_start(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask, a.hackrf_ppm)
     if a.rtl_power:
         CAPS.append("sweep")
         groups = group_sweeps(a.rtl_power, a.rtl_power_device)
+        groups, a.listen_device = adapt_radios(groups, a.listen_device, a.hackrf_sweep)
         # The control-channel hunt reads the sweep: make sure the listening dongle's sweep passes the 800 MHz
         # trunking band (851–869, where most US public-safety control channels are) even if the config
         # only lists the 806–824 input side.
