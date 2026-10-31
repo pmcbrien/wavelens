@@ -469,7 +469,9 @@ def rr_system_kind(system: str) -> str:
         return "dmr"
     if "nxdn" in s:
         return "nxdn"
-    if "ltr" in s or "type ii" in s or "smartnet" in s:
+    if "type ii" in s or "smartnet" in s or "smartzone" in s or "motorola" in s:
+        return "moto"
+    if "ltr" in s:
         return "ltr"
     return ""
 
@@ -1848,8 +1850,12 @@ DIGITAL_MODES = {"dmr": ("-fs", 2), "p25": ("-f1", 1), "nxdn": ("-fi", 1), "dsta
                  # built from the RadioReference site's frequencies, LCN/LSN in ascending-frequency order (the usual
                  # convention; dsd-fme shows in its log whether calls follow). Motorola Type II / SmartNet and LTR
                  # are not decodable by dsd-fme at all.
-                 "trunke": ("-fE -T", 1), "trunkd": ("-fs -T", 2)}
-TRUNK_MODES = ("trunk", "trunkq", "trunke", "trunkd")
+                 "trunke": ("-fE -T", 1), "trunkd": ("-fs -T", 2),
+                 # Motorola Type II (SmartNet / SmartZone): analog voice, digital control channel. Not dsd-fme:
+                 # the bridge's own decoder (smartnet.py) reads the control channel from rtl_fm and a second
+                 # rtl_fm plays the voice channel of each grant. See serve_smartnet().
+                 "trunkm": ("", 1)}
+TRUNK_MODES = ("trunk", "trunkq", "trunke", "trunkd", "trunkm")
 ENC_RE = re.compile(r"\b(ENC|Encrypted|ALG(?:ID)?\s*[:=]?\s*(?:0x)?[0-9A-Fa-f]+)\b", re.I)
 CALL_RE = re.compile(r"\bTG[:= ]\s*(\d+)")
 # Mode "auto": start in dsd-fme's auto-detect; it says on stderr what sync it finds ("Sync: +P25p1"), which
@@ -2045,7 +2051,7 @@ def follow_key(mhz: float) -> int:
 # site's most constant frequency first and the next if dsd-fme finds no control-channel sync.
 TRUNK = {"auto": True, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc_at": 0.0, "map": ""}
 HUNT = {"on": False, "cancel": False, "sweeping": False}
-TRUNK_KINDS = ("p25", "dmr", "nxdn", "edacs")
+TRUNK_KINDS = ("p25", "dmr", "nxdn", "edacs", "moto")
 # Where control channels live: the base-station (output) side of the trunking bands, 800 MHz first
 # (most US public-safety P25 systems), then 700 MHz, 900 MHz, UHF and VHF.
 CC_BANDS = [("851M:869M:12.5k", 851.0, 869.0, "800 MHz"), ("769M:775M:12.5k", 769.0, 775.0, "700 MHz"),
@@ -2061,6 +2067,8 @@ def trunk_kind(mode: str) -> str:
     m = (mode or "").lower().replace("-", " ").strip()
     if m.startswith("p25") or "project 25" in m or "apco" in m or m in ("tdma", "p25 phase ii", "phase ii"):
         return "p25"
+    if "type ii" in m or "smartnet" in m or "smartzone" in m or m == "moto":
+        return "moto"
     if m.startswith("dmr") or "trbo" in m:
         return "dmr"
     if m.startswith("nxdn"):
@@ -2082,6 +2090,8 @@ def trunk_modes(kind: str, row=None) -> list:
         return ["trunke"]
     if kind == "dmr":
         return ["trunkd"]
+    if kind == "moto":
+        return ["trunkm"]
     qpsk_first = TRUNK["qpsk"]
     if row is not None and not qpsk_first:
         text = " ".join(str(v) for v in row.values() if v)
@@ -2110,6 +2120,8 @@ def cc_sync_ok(sync: str, mode: str) -> bool:
     a P25p2 sync is a TDMA voice channel of the system. DMR Tier III / Cap+ control channels show as DMR,
     EDACS as EDACS. Anything else (NXDN, D-STAR, ProVoice…) is not something -ft follows."""
     u = sync.upper()
+    if mode == "trunkm":
+        return u.startswith("MOTO")
     if mode == "trunke":
         return u.startswith("EDACS")
     if mode == "trunkd":
@@ -2284,7 +2296,7 @@ def trunk_try(tries: list, what: str) -> None:
     (m, md), TRUNK["tries"] = uniq[0], uniq[1:]
     TRUNK["cc_at"] = time.time()
     trunk_prep(m, md)
-    listen_status(f"trunked: trying {m:.4f} MHz ({'QPSK' if md == 'trunkq' else 'C4FM' if md == 'trunk' else md}) as the control channel of {what}")
+    listen_status(f"trunked: trying {m:.4f} MHz ({'QPSK' if md == 'trunkq' else 'C4FM' if md == 'trunk' else 'Type II' if md == 'trunkm' else md}) as the control channel of {what}")
     listen_start(m, md, LISTEN["sq"], 0.0)
 
 
@@ -2944,6 +2956,137 @@ def start_pager(gen: int, mhz: float):
     return pm
 
 
+SMARTNET_RATE = 24000       # rtl_fm output on the control channel; 6.7 samples per 3600-baud bit
+SMARTNET_CC_WAIT_S = 10.0   # no decodable OSW within this → not a Type II control channel
+SMARTNET_CALL_S = 6.0       # a voice channel is played this long after its grant / last update (off the control
+                            # channel nothing renews it; Type II calls are short and the next grant re-tunes)
+MOTO_BAND = "800"           # --moto-band: 800 | 800r | 800s | 900 | obt:base:spacing:offset
+
+
+def serve_smartnet(cc_mhz: float, sq: int, gen: int) -> None:
+    """Follow a Motorola Type II system. rtl_fm demodulates the control channel (narrow FM, discriminator
+    out) into smartnet.py, which prints grants as JSON lines. On a group grant the control-channel rtl_fm
+    is stopped, a second rtl_fm plays the voice channel (analog FM, squelch) for SMARTNET_CALL_S (or until
+    its squelch closes), then the control channel is resumed. One dongle does both, in turn — the way a
+    single-receiver scanner does it. Encrypted-flagged calls are skipped. Receive only."""
+    import select
+    dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
+    ppm = f" -p {LISTEN['ppm']}" if LISTEN["ppm"] else ""
+    dec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smartnet.py")
+    if not os.path.exists(dec_path):
+        listen_stop("smartnet.py missing"); listen_status("Motorola Type II needs companion/pi/smartnet.py next to the bridge"); return
+    cc_cmd = f"rtl_fm -f {cc_mhz:.4f}M -M fm -s {SMARTNET_RATE} -l 0 -g 40{ppm}{dev} -"
+
+    class Holder:                           # what the status loop reads (p.sync / p.call like a dsd-fme process)
+        sync, sync_at, call, call_at = "", 0.0, "", 0.0
+        err_tail = deque(maxlen=3)
+        def poll(self): return None
+    p = Holder()
+    LISTEN["proc"] = p
+    LISTEN["starting"] = False
+    LISTEN["tuned_at"] = LISTEN["last_audio"] = time.time()
+    print(f"bridge: listen: {cc_mhz:.4f} MHz trunkm (Motorola Type II, band {MOTO_BAND})", file=sys.stderr)
+    listen_status(f"listening on {cc_mhz:.4f} MHz (TRUNKM): decoding the Type II control channel")
+    enc = Ima()
+    cur = {"tg": 0, "mhz": 0.0, "since": 0.0, "voice": None, "cc": None, "dec": None}
+
+    def start_cc() -> bool:
+        cur["cc"] = start_tool(cc_cmd, gen, stdout=subprocess.PIPE)
+        if not cur["cc"]:
+            return False
+        cur["dec"] = subprocess.Popen([sys.executable, "-I", dec_path, "--rate", str(SMARTNET_RATE), "--band", MOTO_BAND],
+                                      stdin=cur["cc"].stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return True
+
+    def stop_cc() -> None:
+        stop_tools([q for q in (cur["dec"], cur["cc"]) if q is not None])
+        cur["cc"] = cur["dec"] = None
+
+    def start_voice(mhz: float) -> bool:
+        cmd = f"rtl_fm -f {mhz:.4f}M -M fm -s 16000 -r {LISTEN_RATE} -l {sq} -E dc -g 40{ppm}{dev} -"
+        v = start_tool(cmd, gen, stdout=subprocess.PIPE, attempts=6)
+        cur["voice"] = v if v else None
+        return cur["voice"] is not None
+
+    def stop_voice() -> None:
+        if cur["voice"] is not None:
+            stop_tools([cur["voice"]])
+        cur["voice"] = None
+
+    if not start_cc():
+        listen_stop("no dongle"); no_dongle_status(); return
+    n_osw = 0
+    try:
+        while LISTEN["gen"] == gen:
+            now = time.time()
+            if now > LISTEN["until"]:
+                listen_stop("timed out (5 min); tap Listen again to continue")
+                break
+            if cur["voice"] is not None:
+                r, _, _ = select.select([cur["voice"].stdout], [], [], 0.5)
+                chunk = cur["voice"].stdout.read(LISTEN_FRAME * 2) if r else b""
+                if len(chunk) == LISTEN_FRAME * 2:
+                    LISTEN["last_audio"] = now
+                    LISTEN["seq"] = (LISTEN["seq"] + 1) & 0xFF
+                    try:
+                        aout.put_nowait(enc.frame(LISTEN["seq"], chunk))
+                    except Exception:
+                        pass
+                # back to the control channel when the call's time is up, or the squelch has been shut 1.5 s
+                done = now - cur["since"] > SMARTNET_CALL_S or (now - cur["since"] > 1.0 and now - LISTEN["last_audio"] > 1.5)
+                if done or (r and not chunk):
+                    stop_voice()
+                    p.call, cur["tg"] = "", 0
+                    if not start_cc():
+                        listen_stop("no dongle"); no_dongle_status(); break
+                continue
+            r, _, _ = select.select([cur["dec"].stdout], [], [], 0.25)
+            if not r:
+                if n_osw == 0 and now - LISTEN["tuned_at"] > SMARTNET_CC_WAIT_S and TRUNK["cc_at"]:
+                    TRUNK["cc_at"] = 0.0
+                    cc_forget(cc_mhz)
+                    stop_cc()
+                    trunk_next(f"no Type II control channel on {cc_mhz:.4f} MHz")
+                    return
+                continue
+            line = cur["dec"].stdout.readline()
+            if not line:
+                break
+            try:
+                ev = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            kind = ev.get("ev")
+            if n_osw == 0 and kind in ("grant", "update", "idle", "cc", "sysid", "stats"):
+                n_osw = 1
+                p.sync, p.sync_at = "MOTO", now
+                LISTEN["detected"] = "MOTO"
+            if kind == "sysid":
+                log_line(f"smartnet: system {int(ev.get('sysid') or 0):04X}, control channel {ev.get('mhz')} MHz")
+                continue
+            if kind not in ("grant", "update") or not ev.get("mhz"):
+                continue
+            tg = int(ev.get("tg") or 0)
+            if ev.get("enc"):
+                p.call, p.call_at = f"TG {tg} · encrypted", now
+                continue
+            if not tg or locked_out(float(ev["mhz"])):
+                continue
+            # Talkgroup only; the source radio ID in a grant is never kept or shown.
+            p.call, p.call_at = f"TG {tg}", now
+            cur["tg"], cur["mhz"], cur["since"] = tg, float(ev["mhz"]), now
+            stop_cc()
+            if start_voice(cur["mhz"]):
+                LISTEN["last_audio"] = now
+                log_line(f"smartnet: TG {tg} on {cur['mhz']:.4f} MHz")
+            elif not start_cc():
+                listen_stop("no dongle"); no_dongle_status(); break
+    finally:
+        stop_voice()
+        stop_cc()
+        LISTEN["proc"] = None
+
+
 def serve_listen(req: tuple, gen: int) -> None:
     LISTEN["starting"] = True
     try:
@@ -2954,6 +3097,8 @@ def serve_listen(req: tuple, gen: int) -> None:
 
 def _serve_listen(req: tuple, gen: int) -> None:
     mhz, mode, sq = req
+    if mode == "trunkm":
+        return serve_smartnet(mhz, sq, gen)
     dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
     procs = []
     sock = None
@@ -3774,6 +3919,9 @@ def main() -> None:
     ap.add_argument("--hackrf-ppm", type=float, default=0.0,
                     help="HackRF crystal correction: reported MHz are scaled by (1 + ppm/1e6). Key a radio on a known "
                          "frequency, read exact_mhz, then ppm = (known - read) / read * 1e6 (typically -20..20)")
+    ap.add_argument("--moto-band", default="800",
+                    help="Motorola Type II channel plan: 800 (standard), 800r (rebanded), 800s (splinter), 900, or obt:BASE:SPACING:OFFSET "
+                         "for UHF/VHF systems (default 800)")
     ap.add_argument("--hackrf-keep-sweeping", action="store_true",
                     help="keep hackrf_sweep running during digital voice (default: pause it — its USB stream and the parsing of "
                          "60,000 bins a pass cost dsd-fme audio frames on a Pi)")
@@ -3836,6 +3984,7 @@ def main() -> None:
         PARK_RANGES["le"] = a.hackrf_park_range
     if a.hackrf_keep_sweeping:
         globals()["HACKRF_PAUSE_ON_LISTEN"] = False
+    globals()["MOTO_BAND"] = a.moto_band
     if a.hackrf_sweep or a.rtl_power:
         threading.Thread(target=spec_pump, daemon=True).start()
     if a.hackrf_sweep:

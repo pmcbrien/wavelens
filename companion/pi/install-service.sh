@@ -17,7 +17,7 @@ if [ "${1:-}" = "--remove" ]; then
 fi
 
 install -d /usr/local/lib/wavelens
-install -m 0755 wavelens_bridge.py run-bridge.sh /usr/local/lib/wavelens/
+install -m 0755 wavelens_bridge.py smartnet.py run-bridge.sh /usr/local/lib/wavelens/
 install -m 0644 wavelens-bridge.service /etc/systemd/system/
 # Keep an existing settings file; only install the example the first time.
 [ -f /etc/default/wavelens-bridge ] || install -m 0644 wavelens-bridge.default /etc/default/wavelens-bridge
