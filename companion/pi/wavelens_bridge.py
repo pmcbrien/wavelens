@@ -865,6 +865,7 @@ FLOOR_WARM_S = 60.0        # a bin's floor follows at the normal rate for this l
 # nearby", never who or what was said. Set another slice with --hackrf-park-range.
 PARK_RANGES = {"le": "796:816"}
 HACKRF_STALL_S = 10.0   # a full 1 MHz–6 GHz pass takes about a second; this long with no rows means it hung
+RTL_STALL_S = 20.0      # rtl_power reports every second or two; this long with no rows means the dongle is hung → USB reset
 
 
 _band_cache = {}
@@ -1378,24 +1379,81 @@ def reap(p, cmd: str, planned: bool = False) -> None:
               file=sys.stderr)
 
 
-def run_once(cmd: str, handler, planned: bool = False, stop_when=None) -> bool:
+def run_once(cmd: str, handler, planned: bool = False, stop_when=None, stall_s: float = 0.0, on_stall=None) -> bool:
     """Run a tool until it exits, handing it each stdout line. False if it isn't installed.
-    stop_when: polled five times a second; when it turns true the tool is stopped (the dongle is wanted)."""
+    stop_when: polled five times a second; when it turns true the tool is stopped (the dongle is wanted).
+    stall_s: no stdout for this long after start means the radio is hung; the tool is killed and on_stall() runs."""
     p = spawn(cmd)
     if p is None:
         return False
-    if stop_when is not None:
+    p.last_line = time.time()
+    state = {"stalled": False}
+    if stop_when is not None or stall_s:
         def watch():
             while p.poll() is None:
-                if stop_when():
+                if stop_when is not None and stop_when():
                     p.terminate()
+                    return
+                if stall_s and time.time() - p.last_line > stall_s:
+                    state["stalled"] = True
+                    p.kill()
                     return
                 time.sleep(0.2)
         threading.Thread(target=watch, daemon=True).start()
     for line in p.stdout:
+        p.last_line = time.time()
         handler(line)
-    reap(p, cmd, planned or (stop_when is not None and stop_when()))
+    reap(p, cmd, planned or (stop_when is not None and stop_when()) or state["stalled"])
+    if state["stalled"]:
+        print(f"bridge: {cmd.split()[0]} produced nothing for {stall_s:.0f} s: the dongle is hung", file=sys.stderr)
+        if on_stall is not None:
+            on_stall()
     return True
+
+
+def usb_reset(serial_or_index: str) -> bool:
+    """Power-cycle a USB device from software: /sys/bus/usb/devices/<dev>/authorized 0 then 1 re-enumerates
+    it, which is what unplugging does. Finds the RTL-SDR by its serial (or, for an index, the Nth RTL-SDR).
+    Needs root (the service has it). A hung RTL2832U — a process killed mid-stream leaves it that way — gives
+    every later open a device that answers but never streams; this is the only fix short of a replug."""
+    rtls = []
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        try:
+            with open(d + "/idVendor") as f:
+                vid = f.read().strip()
+            with open(d + "/idProduct") as f:
+                pid = f.read().strip()
+        except OSError:
+            continue
+        if (vid, pid) not in (("0bda", "2838"), ("0bda", "2832")):
+            continue
+        try:
+            with open(d + "/serial") as f:
+                sn = f.read().strip()
+        except OSError:
+            sn = ""
+        rtls.append((d, sn))
+    target = None
+    for d, sn in rtls:
+        if sn == serial_or_index:
+            target = d
+    if target is None and serial_or_index.isdigit() and int(serial_or_index) < len(rtls):
+        target = rtls[int(serial_or_index)][0]
+    if target is None:
+        print(f"bridge: usb reset: no RTL-SDR {serial_or_index!r} under /sys/bus/usb", file=sys.stderr)
+        return False
+    try:
+        with open(target + "/authorized", "w") as f:
+            f.write("0")
+        time.sleep(1.5)
+        with open(target + "/authorized", "w") as f:
+            f.write("1")
+        time.sleep(2.5)                          # re-enumeration
+        print(f"bridge: usb reset of RTL-SDR {serial_or_index} ({os.path.basename(target)}) done", file=sys.stderr)
+        return True
+    except OSError as e:
+        print(f"bridge: usb reset of RTL-SDR {serial_or_index} failed: {e} (not root?) — replug it", file=sys.stderr)
+        return False
 
 
 def feed_process(cmd: str, handler) -> None:
@@ -1574,7 +1632,7 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm:
         while True:
             wait_free()
             sw.settle_until = time.time() + SETTLE_S + sweep_interval_s(specs[0])
-            if not run_once(cmd, sw.row, stop_when=busy):
+            if not run_once(cmd, sw.row, stop_when=busy, stall_s=RTL_STALL_S, on_stall=lambda: usb_reset(device)):
                 return
             time.sleep(2)
         return
@@ -1595,7 +1653,8 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm:
             # While a hunt counts passes: long enough for the settle window plus five integrations, so one
             # pass already gives the three readings per bin that sweep_steady needs.
             dwell = int(SETTLE_S + i * 5) if hunting else max(dwell_s, 2 * i)
-            if not run_once(f"rtl_power -f {spec}{dev} -i {i} {(' -g ' + str(gain)) if gain else ''}{(' -p ' + str(ppm)) if ppm else ''} -e {dwell}s -", sw.row, planned=True, stop_when=busy):
+            if not run_once(f"rtl_power -f {spec}{dev} -i {i} {(' -g ' + str(gain)) if gain else ''}{(' -p ' + str(ppm)) if ppm else ''} -e {dwell}s -",
+                            sw.row, planned=True, stop_when=busy, stall_s=RTL_STALL_S, on_stall=lambda: usb_reset(device)):
                 return
             time.sleep(0.5)         # let the dongle close before the next range opens it
 
@@ -2630,6 +2689,9 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
             # Twice refused: the sweep's rtl_power is sitting on the dongle past its SIGTERM. Take it.
             print(f"bridge: listen: {LISTEN['dev'] or 'dongle'} still held; stopping whatever has it", file=sys.stderr)
             free_dongle(LISTEN["dev"])
+        elif attempt == 5 and LISTEN["dev"]:
+            # Still not opening after the holder is gone: the dongle itself is hung. Re-enumerate it.
+            usb_reset(LISTEN["dev"])
     return None
 
 
