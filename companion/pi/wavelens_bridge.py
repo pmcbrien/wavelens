@@ -33,6 +33,7 @@ import bisect
 import glob
 import json
 import math
+import multiprocessing
 import os
 import re
 import shlex
@@ -865,6 +866,7 @@ FLOOR_WARM_S = 60.0        # a bin's floor follows at the normal rate for this l
 # nearby", never who or what was said. Set another slice with --hackrf-park-range.
 PARK_RANGES = {"le": "796:816"}
 HACKRF_STALL_S = 10.0   # a full 1 MHz–6 GHz pass takes about a second; this long with no rows means it hung
+HACKRF_PAUSE_ON_LISTEN = True   # stop the HackRF sweep while dsd-fme decodes (--hackrf-keep-sweeping to leave it running)
 RTL_STALL_S = 20.0      # rtl_power reports every second or two; this long with no rows means the dongle is hung → USB reset
 
 
@@ -1554,13 +1556,127 @@ def ensure_hackrf_mode(wait_s: float = 10.0) -> bool:
     return False
 
 
+# ---------------------------------------------------------------- the HackRF sweep in its own process
+#
+# Parsing hackrf_sweep's output is the bridge's biggest job: 60,000 bins a pass at 100 kHz, 0.6–0.8 passes
+# a second, every bin through the floor / hot / run bookkeeping in Python. On a Pi 4 that alone is ~90 %
+# of one core, and Python runs on one core, so the audio encoder behind it stalled and words went missing.
+# The sweep therefore runs in a forked child: it inherits the loaded packs, parses on a core of its own,
+# and sends what it would have emitted (hits, spectrum frames, journal lines) back over a queue. The parent
+# tells it about park changes, when to pause for a digital decode, and which spectrum window it owns.
+HACKRF = {"paused": False, "ctl": None, "out": None}
+
+
+def hackrf_child(range_mhz, bin_hz, lna, vga, mask, ppm, out_q, ctl_q) -> None:
+    """Entry point of the forked sweep process."""
+    def emit_child(obj: dict) -> None:
+        try:
+            out_q.put(obj)
+        except Exception:
+            pass
+    globals()["emit"] = emit_child
+    globals()["log_line"] = lambda text: emit_child({"t": "_log", "l": str(text).rstrip()}) if str(text).strip() and not str(text).startswith("sent ") else None
+    sys.stderr = _StderrTee(sys.__stderr__)   # a fresh tee in this process; its lines go up the queue as _log
+    SPEC["on"] = False
+    SWEEPS.clear()
+
+    def control():
+        while True:
+            m = ctl_q.get()
+            if m is None:
+                os._exit(0)
+            if "park" in m:
+                state["park"] = m["park"]
+            if "pause" in m:
+                HACKRF["paused"] = bool(m["pause"])
+            if "spec" in m:
+                sp = m["spec"]
+                if sp.get("on"):
+                    SPEC.update(on=True, lo=float(sp["lo"]), hi=float(sp["hi"]), until=time.time() + SPEC_TTL_S)
+                else:
+                    SPEC["on"] = False
+    threading.Thread(target=control, daemon=True).start()
+    threading.Thread(target=spec_pump, daemon=True).start()
+    feed_hackrf(range_mhz, bin_hz, lna, vga, mask, ppm)
+
+
+def hackrf_start(range_mhz, bin_hz, lna, vga, mask, ppm) -> None:
+    """Parent: fork the sweep process and relay its output into the real emit()."""
+    ctx = multiprocessing.get_context("fork")
+    out_q, ctl_q = ctx.Queue(maxsize=2000), ctx.Queue()
+    HACKRF["ctl"], HACKRF["out"] = ctl_q, out_q
+    proc = ctx.Process(target=hackrf_child, args=(range_mhz, bin_hz, lna, vga, mask, ppm, out_q, ctl_q), daemon=True)
+    proc.start()
+    print(f"bridge: hackrf sweep running in its own process (pid {proc.pid})", file=sys.stderr)
+
+    def relay():
+        while True:
+            try:
+                obj = out_q.get(timeout=1.0)
+            except Empty:
+                if not proc.is_alive():
+                    print("bridge: hackrf sweep process exited; restarting it", file=sys.stderr)
+                    time.sleep(2)
+                    hackrf_start(range_mhz, bin_hz, lna, vga, mask, ppm)
+                    return
+                continue
+            if obj.get("t") == "_log":
+                log_line(obj.get("l", ""))
+            else:
+                emit(obj)
+    threading.Thread(target=relay, daemon=True).start()
+
+    def pauser():
+        """Tell the child to stop sweeping while a digital decode runs, and to resume after."""
+        last = None
+        while True:
+            want = HACKRF_PAUSE_ON_LISTEN and LISTEN["proc"] is not None and LISTEN["mode"] in DIGITAL_MODES
+            if want != last:
+                last = want
+                hackrf_ctl({"pause": want})
+            time.sleep(0.5)
+    threading.Thread(target=pauser, daemon=True).start()
+
+
+def hackrf_ctl(msg: dict) -> None:
+    q = HACKRF.get("ctl")
+    if q is not None:
+        try:
+            q.put(msg)
+        except Exception:
+            pass
+
+
+def spec_route(on: bool, lo: float = 1.0, hi: float = 6000.0) -> None:
+    """Who draws this spectrum window: the parent's rtl_power sweep when one of its ranges covers the whole
+    window (finer bins), else the HackRF child. Never both."""
+    if not on:
+        SPEC["on"] = False
+        hackrf_ctl({"spec": {"on": False}})
+        return
+    if sweep_covers(lo, hi) and any(sw.src == "rtlpower" for sw in SWEEPS):
+        SPEC.update(on=True, lo=lo, hi=hi, until=time.time() + SPEC_TTL_S)
+        hackrf_ctl({"spec": {"on": False}})
+    else:
+        SPEC["on"] = False
+        hackrf_ctl({"spec": {"on": True, "lo": lo, "hi": hi}})
+
+
 def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20, mask: str = "", ppm: float = 0.0) -> None:
     """hackrf_sweep over range_mhz, or over the parked slice while the phone has asked to park.
     A park change stops the running sweep and starts the other one."""
     sw = Sweep("hackrf", mask=parse_mask(mask), ppm=ppm)
     if sw.mask:
         print("bridge: hackrf: masking " + ", ".join(f"{lo/1e6:g}-{hi/1e6:g} MHz" for lo, hi in sw.mask), file=sys.stderr)
+    def digital_listen() -> bool:
+        """A digital decode is running on an RTL-SDR: the HackRF stream shares its USB bandwidth with
+        rtl_tcp. The sweep waits it out. (Set by the parent process over the control queue.)"""
+        return HACKRF["paused"]
+
     while True:
+        if digital_listen():
+            time.sleep(0.5)
+            continue
         park = state.get("park", "off")
         rng = PARK_RANGES.get(park, range_mhz)
         cmd = f"hackrf_sweep -f {rng} -w {bin_hz} -l {lna} -g {vga}"
@@ -1581,6 +1697,10 @@ def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20, mask:
                 if state.get("park", "off") != was:
                     proc.terminate()
                     return
+                if digital_listen():
+                    print("bridge: hackrf_sweep paused while digital voice is decoding (USB and CPU for dsd-fme)", file=sys.stderr)
+                    proc.terminate()
+                    return
                 # A HackRF behind a busy USB hub can stop streaming without hackrf_sweep exiting: the radio
                 # sits on one frequency and nothing is reported. Kill it and start over.
                 if time.time() - proc.last_line > HACKRF_STALL_S:
@@ -1593,8 +1713,8 @@ def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20, mask:
         for line in p.stdout:
             p.last_line = time.time()
             sw.row(line)
-        reap(p, cmd)
-        if state.get("park", "off") == park:
+        reap(p, cmd, planned=digital_listen())
+        if state.get("park", "off") == park and not digital_listen():
             time.sleep(2)                    # it exited by itself (unplugged, error): retry like feed_process
 
 
@@ -1908,14 +2028,23 @@ def trunk_kind(mode: str) -> str:
     return m
 
 
-def trunk_modes(kind: str) -> list:
-    """dsd-fme modes to try on one control-channel candidate. -ft covers P25 phase 1/2 and DMR trunking;
-    P25 simulcast (LSM) sites need CQPSK demodulation, so try plain C4FM first and QPSK second."""
+SIMULCAST_RE = re.compile(r"(?i)simulcast|\bLSM\b|phase\s*(?:2|II)\b|P25p2|\bTDMA\b|CQPSK")
+
+
+def trunk_modes(kind: str, row=None) -> list:
+    """dsd-fme modes to try on one control-channel candidate. -ft covers P25 phase 1/2 and DMR trunking.
+    P25 simulcast (LSM) sites need the CQPSK demodulator: C4FM still syncs their control channel, but voice
+    comes out chopped. So QPSK goes first when the phone asked for it, or when the RadioReference row for the
+    site says simulcast / Phase II; otherwise C4FM first, QPSK second."""
     if kind == "edacs":
         return ["trunke"]
     if kind == "dmr":
         return ["trunkd"]
-    return ["trunkq", "trunk"] if TRUNK["qpsk"] else ["trunk", "trunkq"]
+    qpsk_first = TRUNK["qpsk"]
+    if row is not None and not qpsk_first:
+        text = " ".join(str(v) for v in row.values() if v)
+        qpsk_first = bool(SIMULCAST_RE.search(text))
+    return ["trunkq", "trunk"] if qpsk_first else ["trunk", "trunkq"]
 
 
 def cc_load():
@@ -2070,7 +2199,7 @@ def trunk_start(site=None, qpsk=None) -> bool:
         # The system the sweep heard: its own control channels from the export go first.
         own = [c for c in rr_controls_ranked(50) if rr_site(c[2])[:2] == site[:2]]
         for f, _, row in own[:4]:
-            tries += [(f, md) for md in trunk_modes(rr_site(row)[2])]
+            tries += [(f, md) for md in trunk_modes(rr_site(row)[2], row)]
     if site is None and RR and RR.controls:
         # Nearest system, and the sweep hasn't matched a site: hunt first. A 30-60 s rtl_power pass over the
         # trunking bands finds the carriers that never stop and that this dongle can actually hear, with the
@@ -2206,7 +2335,7 @@ def cc_hunt(first: list) -> None:
             m = cc[0]                        # the listed frequency is exact; the scan's is within a channel
         if row is not None and row.get("Mode") == "ltr":
             continue
-        modes = trunk_modes(rr_site(row)[2] if row is not None else "p25")
+        modes = trunk_modes(rr_site(row)[2] if row is not None else "p25", row)
         ranked.append({"mhz": m, "lvl": lvl, "modes": modes, "failed_at": 0.0, "ok": False})
         tries += [(m, md) for md in modes]
     TRUNK["ranked"], TRUNK["ranked_at"] = ranked, time.time()
@@ -2214,7 +2343,7 @@ def cc_hunt(first: list) -> None:
         # After what was heard: the list's control channels in its own order, in case the hunt's floor
         # judgement missed a weak one.
         for f, _, row in rr_controls_ranked(CC_MAX_TRIES):
-            tries += [(f, md) for md in trunk_modes(rr_site(row)[2])]
+            tries += [(f, md) for md in trunk_modes(rr_site(row)[2], row)]
     trunk_try(tries, "the nearest system" + (f" ({len(found)} steady carriers heard)" if found else " (nothing steady heard; trying your list)"))
 
 
@@ -2665,7 +2794,7 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                 if not ln:
                     continue
                 proc.err_tail.append(ln)
-                if re.search(r"(?i)sync:|\bTG\b|ENC|ALG|error|fail|cannot|unable|exit|frequency", ln):
+                if re.search(r"(?i)sync:|\bTG\b|ENC|ALG|error|fail|cannot|unable|exit|frequency|ll\+|dropped", ln):
                     log_line(f"{tool}: {ln}")
                 if kw.get("watch_sync"):
                     m = SYNC_RE.search(ln)
@@ -3267,7 +3396,7 @@ def run_peripheral(name: str) -> None:
                 emit({"t": "status", "msg": "no sweep running to draw a spectrum from (add --hackrf-sweep or --rtl-power)",
                       "band": state["band"], "mode": state["mode"]})
             elif not cmd.get("on", True):
-                SPEC["on"] = False
+                spec_route(False)
             else:
                 try:
                     lo, hi = float(cmd.get("lo", 1.0)), float(cmd.get("hi", 6000.0))
@@ -3275,10 +3404,11 @@ def run_peripheral(name: str) -> None:
                     lo, hi = 1.0, 6000.0
                 if hi - lo < 0.1:
                     lo, hi = 1.0, 6000.0
-                SPEC.update(on=True, lo=lo, hi=hi, until=time.time() + SPEC_TTL_S)
+                spec_route(True, lo, hi)
         elif c == "park":
             v = str(cmd.get("v") or "off")
             state["park"] = v if v in PARK_RANGES else "off"
+            hackrf_ctl({"park": state["park"]})
             if state["park"] != "off" and not HACKRF_ON:
                 msg = "park noted; no HackRF on this bridge (add --hackrf-sweep)"
             elif state["park"] != "off":
@@ -3312,8 +3442,14 @@ def run_peripheral(name: str) -> None:
                       "mode": state["mode"], "lockout": lst})
             elif str(cmd.get("v") or "") == "trunkauto":
                 TRUNK["auto"] = bool(cmd.get("on", True))
+                was = TRUNK["qpsk"]
                 TRUNK["qpsk"] = bool(cmd.get("qpsk", TRUNK["qpsk"]))
-                listen_status("trunked systems: Follow takes them automatically" if TRUNK["auto"] else "trunked systems: manual only")
+                listen_status(("trunked systems: Follow takes them automatically" if TRUNK["auto"] else "trunked systems: manual only")
+                              + (" · simulcast (QPSK) first" if TRUNK["qpsk"] else ""))
+                if TRUNK["qpsk"] != was and LISTEN["req"] is not None and LISTEN["mode"] in ("trunk", "trunkq"):
+                    # re-lock the current system with the other demodulator
+                    TRUNK["tries"], TRUNK["cc_at"] = [], time.time()
+                    listen_start(LISTEN["mhz"], "trunkq" if TRUNK["qpsk"] else "trunk", LISTEN["sq"], 0.0)
             elif str(cmd.get("v") or "") == "trunk":
                 TRUNK["qpsk"] = bool(cmd.get("qpsk", TRUNK["qpsk"]))
                 try:
@@ -3562,6 +3698,9 @@ def main() -> None:
     ap.add_argument("--hackrf-ppm", type=float, default=0.0,
                     help="HackRF crystal correction: reported MHz are scaled by (1 + ppm/1e6). Key a radio on a known "
                          "frequency, read exact_mhz, then ppm = (known - read) / read * 1e6 (typically -20..20)")
+    ap.add_argument("--hackrf-keep-sweeping", action="store_true",
+                    help="keep hackrf_sweep running during digital voice (default: pause it — its USB stream and the parsing of "
+                         "60,000 bins a pass cost dsd-fme audio frames on a Pi)")
     ap.add_argument("--hackrf-park-range", metavar="LO:HI", default="",
                     help="MHz slice the HackRF parks on when the phone asks (default 796:816, public-safety radios)")
     ap.add_argument("--rtl-power", metavar="SPEC", action="append", default=[],
@@ -3619,13 +3758,15 @@ def main() -> None:
         threading.Thread(target=feed_kismet_json, args=(a.kismet_json,), daemon=True).start()
     if a.hackrf_park_range:
         PARK_RANGES["le"] = a.hackrf_park_range
+    if a.hackrf_keep_sweeping:
+        globals()["HACKRF_PAUSE_ON_LISTEN"] = False
     if a.hackrf_sweep or a.rtl_power:
         threading.Thread(target=spec_pump, daemon=True).start()
     if a.hackrf_sweep:
         HACKRF_ON = True
         CAPS.append("sweep")
         CAPS.append("park")
-        threading.Thread(target=feed_hackrf, args=(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask, a.hackrf_ppm), daemon=True).start()
+        hackrf_start(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask, a.hackrf_ppm)
     if a.rtl_power:
         CAPS.append("sweep")
         groups = group_sweeps(a.rtl_power, a.rtl_power_device)
