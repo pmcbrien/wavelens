@@ -2064,7 +2064,33 @@ def follow_key(mhz: float) -> int:
 # stops transmitting; the sweep sees it on every pass while voice channels come and go. Every hit on a
 # RadioReference "TRS" row is counted here per site; asked to follow a system, the bridge tries the
 # site's most constant frequency first and the next if dsd-fme finds no control-channel sync.
-TRUNK = {"auto": True, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc_at": 0.0, "map": ""}
+TRUNK = {"auto": True, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc_at": 0.0, "map": "",
+         "hold": False,          # system lock: stay on this system, no rotation
+         "tg_lock": 0,           # talkgroup lock: only this TG is heard (others on the system are muted)
+         "tg_avoid": set(),      # talkgroups muted (the app's TG lockout; resent on connect)
+         "tg_seen": [],          # recent (ts, tg, name, encrypted) on this system, for the app's call list
+         "cats": set(),          # category filter: only these kinds of talkgroup are heard (empty = all)
+         "system": ""}
+# Category of a talkgroup from the RadioReference Tag column ("Law Dispatch", "Fire-Tac", "EMS Dispatch",
+# "Multi-Dispatch", "Public Works", "Schools", "Interop", "Hospital"…). The phone's POLICE / FIRE / EMS / OTHER
+# buttons map onto these.
+TG_CATS = [(("law", "corrections", "police", "sheriff"), "police"), (("fire",), "fire"), (("ems", "medical", "hospital"), "ems"),
+           (("multi", "interop", "emergency ops", "public safety"), "police"), ]
+
+
+def tg_category(tg: int) -> str:
+    """police | fire | ems | other for a talkgroup, from its Tag (then its description) in the talkgroups export."""
+    if not RR or not tg:
+        return "other"
+    hit = RR.talkgroup(tg, TRUNK.get("system", ""))
+    if not hit:
+        return "other"
+    alpha, desc, mode, tag = hit
+    text = f"{tag} {desc} {alpha}".lower()
+    for words, cat in TG_CATS:
+        if any(w in text for w in words):
+            return cat
+    return "other"
 HUNT = {"on": False, "cancel": False, "sweeping": False}
 TRUNK_KINDS = ("p25", "dmr", "nxdn", "edacs", "moto")
 # Where control channels live: the base-station (output) side of the trunking bands, 800 MHz first
@@ -2166,10 +2192,13 @@ TRUNK_RANK_TTL_S = 15 * 60.0  # the hunt's ranking of nearby systems is re-done 
 TRUNK_FAIL_SKIP_S = 10 * 60.0 # a carrier that gave no sync is not retried for this long
 
 
-def trunk_next_system(now: float) -> bool:
+def trunk_next_system(now: float, force: bool = False) -> bool:
     """Scanner behaviour on a quiet system: the next strongest steady carrier from the last hunt that
     isn't the one we're on and hasn't just failed to sync. Round-robin back to the strongest when the
-    list is exhausted; a fresh hunt when the ranking is stale. False if there is nothing else to try."""
+    list is exhausted; a fresh hunt when the ranking is stale. False if there is nothing else to try.
+    force: the phone's Skip — go even if the system is held or busy."""
+    if TRUNK.get("hold") and not force:
+        return True                              # held: stay; "True" so the caller doesn't drop the listen
     ranked = TRUNK.get("ranked") or []
     if not ranked or now - TRUNK.get("ranked_at", 0.0) > TRUNK_RANK_TTL_S:
         if LISTEN["follow"] and not HUNT["on"]:
@@ -2753,7 +2782,16 @@ def listen_status(msg: str) -> None:
                      "asked": LISTEN["asked"] if on else "", "detected": LISTEN["detected"] if on else "",
                      "call": LISTEN["call"] if on else "",
                      "sq": LISTEN["sq"], "follow": bool(LISTEN["follow"]),
-                     "lockout": LISTEN["lockout"]} if (on or LISTEN["follow"]) else "off"})
+                     "lockout": LISTEN["lockout"],
+                     "system": (TRUNK.get("system") or "") if on and LISTEN["mode"] in TRUNK_MODES else "",
+                     "hold": bool(TRUNK.get("hold")), "tglock": int(TRUNK.get("tg_lock") or 0),
+                     "tgavoid": sorted(TRUNK.get("tg_avoid") or []),
+                     "systems": [{"mhz": r["mhz"], "db": round(r["lvl"]), "name": r.get("name", ""),
+                                  "skip": time.time() - r["failed_at"] < TRUNK_FAIL_SKIP_S}
+                                 for r in (TRUNK.get("ranked") or [])[:8]],
+                     "cats": sorted(TRUNK.get("cats") or []),
+                     "tgs": [{"ts": int(ts), "tg": tg, "name": nm, "enc": e, "cat": c} for ts, tg, nm, e, c in TRUNK.get("tg_seen") or []][-12:]
+                     } if (on or LISTEN["follow"]) else "off"})
 
 
 def listen_stop(why: str = "stopped", cancel_hunt: bool = False) -> None:
@@ -3180,7 +3218,10 @@ def _serve_listen(req: tuple, gen: int) -> None:
         cmap = f" -C {shlex.quote(TRUNK['map'])}" if mode in ("trunke", "trunkd") and TRUNK.get("map") else ""
         # Squelch 0 for dsd-fme: its "sq" is an RMS threshold in its own scale, not rtl_fm's, and a digital
         # decode gates itself on frame sync anyway — a high value here silences voice that is decoding fine.
-        d = start_tool(f"dsd-fme {flag}{cmap} -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:{bw}:0:2 "
+        # -v D: dsd-fme's digital high-pass, low-pass and pass-band filters on (default leaves the low-pass off;
+        # it takes the vocoder's high-frequency hash out). -g 0: automatic digital output gain, so a quiet
+        # talkgroup and a loud one come out at the same level. The :vol field is the analog monitor, not this.
+        d = start_tool(f"dsd-fme {flag}{cmap} -v D -g 0 -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:{bw}:0:2 "
                        f"-o udp:127.0.0.1:{DSD_UDP_PORT}", gen, attempts=4, watch_sync=True)
         if d is False or d is None:
             stop_tools(procs)
@@ -3247,12 +3288,28 @@ def _serve_listen(req: tuple, gen: int) -> None:
                     call = tg_named(raw) if raw else "call in progress"
                     if enc and "encrypted" not in call:
                         call += " · encrypted"
+                    mt = re.match(r"TG (\d+)", raw or "")
+                    tg = int(mt.group(1)) if mt else 0
+                    # TG lock / avoid: the call still shows, its audio is muted (dsd-fme keeps following
+                    # the system; the mute is on the bridge's audio frames)
+                    cat = tg_category(tg) if tg else ""
+                    muted = (TRUNK.get("tg_lock") and tg and tg != TRUNK["tg_lock"]) or (tg in TRUNK.get("tg_avoid") or set()) \
+                        or (TRUNK.get("cats") and tg and cat not in TRUNK["cats"])
+                    LISTEN["mute"] = bool(muted)
+                    if muted and "· muted" not in call:
+                        call += " · muted"
                     if LISTEN["call"] != call:                  # a new call: say so once, not every frame
                         LISTEN["call"] = call
+                        if tg:
+                            seen = TRUNK.setdefault("tg_seen", [])
+                            if not seen or seen[-1][1] != tg or now - seen[-1][0] > 30:
+                                seen.append((now, tg, tg_named(f"TG {tg}").replace(f"TG {tg} · ", "").replace(f"TG {tg}", ""), enc, cat))
+                                del seen[:-40]
                         listen_status(f"trunked call: {call}")
                     LISTEN["call_at"] = now                     # the system is busy: the idle timer restarts
                 elif LISTEN["call"]:                            # the call ended
                     LISTEN["call"] = ""
+                    LISTEN["mute"] = False
                     listen_status(f"on the control channel {mhz:.4f} MHz, waiting for a call")
                 if not LISTEN["detected"] and not active and now - LISTEN["tuned_at"] >= TRUNK_CC_WAIT_S and TRUNK["cc_at"]:
                     TRUNK["cc_at"] = 0.0         # once per candidate
@@ -3278,6 +3335,8 @@ def _serve_listen(req: tuple, gen: int) -> None:
                             a, s, _ = rr_site(cc[2])
                             name = f"{a} ({s})" if s != "?" else a
                         cc_save(mhz, mode, name)
+                        TRUNK["system"] = name
+                        TRUNK["tg_seen"] = []
                         listen_status(f"trunked: locked onto the control channel {mhz:.4f} MHz ({sync}, "
                                       f"{'QPSK' if mode == 'trunkq' else 'C4FM' if mode == 'trunk' else mode}) — waiting for a call")
             elif mode == "auto":
@@ -3377,6 +3436,8 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 LISTEN["last_audio"] = time.time()
                 if LISTEN["detected"] in ("POCSAG", "FLEX"):
                     continue                 # pager data: nothing to hear; the pages go as lines
+                if LISTEN.get("mute"):
+                    continue                 # TG lock / avoid: the call is shown but not heard
                 LISTEN["seq"] = (LISTEN["seq"] + 1) & 0xFF
                 try:
                     aout.put_nowait(enc.frame(LISTEN["seq"], pcm))
@@ -3712,6 +3773,53 @@ def run_peripheral(name: str) -> None:
                     follow_leave(time.time(), f"{LISTEN['mhz']:.4f} MHz locked out")
                 emit({"t": "status", "msg": f"lockout: {len(lst)} frequencies Follow will skip", "band": state["band"],
                       "mode": state["mode"], "lockout": lst})
+            elif str(cmd.get("v") or "") == "hold":
+                TRUNK["hold"] = bool(cmd.get("on", True))
+                listen_status("system held: staying on this system" if TRUNK["hold"] else "system released: scanning again")
+            elif str(cmd.get("v") or "") == "skip":
+                # leave this system now, and don't come back to it for a while
+                if LISTEN["req"] is not None and LISTEN["mode"] in TRUNK_MODES:
+                    for r in TRUNK.get("ranked") or []:
+                        if abs(r["mhz"] - LISTEN["mhz"]) <= 0.001:
+                            r["failed_at"] = time.time()
+                    if not trunk_next_system(time.time(), force=True):
+                        listen_status("skip: no other system in the ranking right now")
+                else:
+                    follow_leave(time.time(), "skipped")
+            elif str(cmd.get("v") or "") == "tglock":
+                try:
+                    TRUNK["tg_lock"] = int(cmd.get("tg") or 0)
+                except (TypeError, ValueError):
+                    TRUNK["tg_lock"] = 0
+                listen_status(f"talkgroup lock: {tg_named('TG %d' % TRUNK['tg_lock'])} only" if TRUNK["tg_lock"] else "talkgroup lock off")
+            elif str(cmd.get("v") or "") == "cats":
+                # category filter from the phone's POLICE / FIRE / EMS / OTHER buttons; [] = everything
+                cats = {str(c).lower() for c in (cmd.get("cats") or []) if str(c).lower() in ("police", "fire", "ems", "other")}
+                TRUNK["cats"] = cats
+                listen_status(("hearing " + " + ".join(sorted(cats))) if cats else "hearing every talkgroup")
+            elif str(cmd.get("v") or "") == "tgavoid":
+                try:
+                    TRUNK["tg_avoid"] = {int(t) for t in (cmd.get("tgs") or [])}
+                except (TypeError, ValueError):
+                    TRUNK["tg_avoid"] = set()
+                listen_status(f"{len(TRUNK['tg_avoid'])} talkgroup(s) muted" if TRUNK["tg_avoid"] else "no talkgroups muted")
+            elif str(cmd.get("v") or "") == "system":
+                # the phone tapped a system in the ranking: lock onto it now
+                try:
+                    want = float(cmd.get("mhz") or 0)
+                except (TypeError, ValueError):
+                    want = 0.0
+                r = next((r for r in TRUNK.get("ranked") or [] if abs(r["mhz"] - want) <= 0.001), None)
+                if r is not None:
+                    r["failed_at"] = 0.0
+                    TRUNK["tries"], TRUNK["cc_at"] = [(r["mhz"], md) for md in r["modes"][1:]], time.time()
+                    trunk_prep(r["mhz"], r["modes"][0])
+                    LISTEN["follow"] = True
+                    listen_status(f"trunked: tuning {r['mhz']:.4f} MHz {r.get('name', '')}")
+                    listen_start(r["mhz"], r["modes"][0], LISTEN["sq"], 0.0)
+                elif want:
+                    TRUNK["tries"], TRUNK["cc_at"] = [], time.time()
+                    listen_start(want, "trunkq" if TRUNK["qpsk"] else "trunk", LISTEN["sq"], 0.0)
             elif str(cmd.get("v") or "") == "trunkauto":
                 TRUNK["auto"] = bool(cmd.get("on", True))
                 was = TRUNK["qpsk"]
