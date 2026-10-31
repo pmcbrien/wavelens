@@ -585,6 +585,18 @@ def rr_says_control(row: dict) -> bool:
     return bool(re.search(r"\bcontrol( channel)?\b|\bcntl\b|\bctrl\b", d))
 
 
+def rr_doubtful_site(row: dict) -> bool:
+    """The list's site for a frequency is a guess when it is far from the phone, or — with no position
+    shared — not in the configured county: several sites of a statewide system reuse a frequency, and
+    naming the wrong one ("Holmes (North)" for a carrier heard in Pinellas) is worse than naming none."""
+    if not RR:
+        return False
+    km = RR._near(row)
+    if km < 9e9:
+        return km > RR_NEAR_KM
+    return row.get("_rank", 9) >= 9
+
+
 def rr_site(row: dict):
     """(agency, site, kind) for a control-channel row, named the way the rest of the bridge names it."""
     agency = abbrev(row.get("Agency/Category") or row.get("System Name") or row.get("System") or "?")
@@ -2385,6 +2397,10 @@ def trunk_next_system(now: float, force: bool = False) -> bool:
             r["ok"] = True
     others = [r for r in ranked if abs(r["mhz"] - cur) > 0.001 and now - r["failed_at"] > TRUNK_FAIL_SKIP_S
               and r["lvl"] >= TRUNK_MIN_DB]              # weak carriers are not worth leaving a system for
+    if TRUNK.get("cats") and any(r.get("public", True) for r in others):
+        # POLICE / FIRE / EMS asked for: a utility, airport or business system has no such talkgroups —
+        # don't spend 5 s on each of them every rotation
+        others = [r for r in others if r.get("public", True)]
     if not others:
         return False
     # the next one down the power ranking after the current; wrap to the top
@@ -2623,10 +2639,19 @@ def cc_hunt(first: list) -> None:
             sites_seen.add(key)
         modes = trunk_modes(rr_site(row)[2] if row is not None else "p25", row)
         name = f"{key[0]} ({key[1]})" if key and key[0] else ""
-        ranked.append({"mhz": m, "lvl": lvl, "modes": modes, "failed_at": 0.0, "ok": False, "name": name})
-        tries += [(m, md) for md in modes]
+        if key and key[0] and row is not None and rr_doubtful_site(row):
+            name = key[0]                    # the system is right (it owns the frequency); the site is a guess
+        who = (row.get("Agency/Category") or row.get("System Name") or "") if row is not None else ""
+        public = row is None or (is_public_system(who) and not is_federal(who)
+                                 and not any(w in who.lower() for w in ("utility", "energy", "power", "electric", "gas", "water",
+                                                                         "business", "security", "transit", "railroad", "airport", "aviation")))
+        ranked.append({"mhz": m, "lvl": lvl, "modes": modes, "failed_at": 0.0, "ok": False, "name": name, "public": public})
         if len(ranked) >= CC_MAX_TRIES:
             break
+    if TRUNK.get("cats"):
+        ranked.sort(key=lambda r: not r.get("public", True))   # POLICE/FIRE/EMS asked for: public-safety systems first
+    for r in ranked:
+        tries += [(r["mhz"], md) for md in r["modes"]]
     TRUNK["ranked"], TRUNK["ranked_at"] = ranked, time.time()
     if ranked:
         print("bridge: systems ranked: " + "; ".join(f"{r['mhz']:.4f} (+{r['lvl']:.0f} dB){' ' + r['name'] if r['name'] else ''}" for r in ranked), file=sys.stderr)
@@ -3528,7 +3553,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
                         cc = RR.control_at(mhz) if RR else None
                         if cc:
                             a, s, _ = rr_site(cc[2])
-                            name = f"{a} ({s})" if s != "?" else a
+                            name = f"{a} ({s})" if s != "?" and not rr_doubtful_site(cc[2]) else a
                         nac = getattr(p, "nac", "")
                         if name == "nearest system" and nac:
                             name = f"unlisted P25 system (NAC {nac})"   # not in the RadioReference pack: named by its NAC
