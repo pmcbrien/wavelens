@@ -1667,7 +1667,12 @@ def hackrf_start(range_mhz, bin_hz, lna, vga, mask, ppm) -> None:
         """Tell the child to stop sweeping while a digital decode runs, and to resume after."""
         last = None
         while True:
-            want = HACKRF_PAUSE_ON_LISTEN and LISTEN["proc"] is not None and LISTEN["mode"] in DIGITAL_MODES
+            # paused while a digital decode runs, and for the whole of a Follow session that has used one
+            # (the hops between systems are seconds apart; restarting the sweep each time just resets its floor)
+            digital = LISTEN["proc"] is not None and LISTEN["mode"] in DIGITAL_MODES
+            if digital:
+                HACKRF["follow_digital_at"] = time.time()
+            want = HACKRF_PAUSE_ON_LISTEN and (digital or (LISTEN["follow"] and time.time() - HACKRF.get("follow_digital_at", 0.0) < 120.0))
             if want != last:
                 last = want
                 hackrf_ctl({"pause": want})
@@ -2145,7 +2150,7 @@ def cc_forget(mhz: float) -> None:
 
 
 TRUNK_SEEN_S = 180.0        # a site frequency counts as a candidate for this long after its last hit
-TRUNK_CC_WAIT_S = 12.0      # dsd-fme must show a sync on a candidate within this, else the next is tried (rtl_tcp start + sync)
+TRUNK_CC_WAIT_S = 18.0      # dsd-fme must show a sync on a candidate within this, else the next is tried (rtl_tcp start + sync)
 TRUNK_IDLE_S = 45.0         # a locked system with no call for this long: on to the next strongest system
 TRUNK_RANK_TTL_S = 15 * 60.0  # the hunt's ranking of nearby systems is re-done after this
 TRUNK_FAIL_SKIP_S = 10 * 60.0 # a carrier that gave no sync is not retried for this long
@@ -2698,6 +2703,17 @@ def follow_watch() -> None:
         if LISTEN["proc"] is None:
             continue
         if LISTEN["mode"] in TRUNK_MODES:
+            proc = LISTEN["proc"]
+            if LISTEN["detected"] and not LISTEN.get("call") and getattr(proc, "enc_cmds", 0) >= 3 \
+                    and now - LISTEN["chan_at"] >= 15.0:
+                # The control channel keeps issuing encryption commands and no clear call has come: an
+                # encrypted system (a Harris-encrypted agency, say). Nothing to hear; on to the next, and
+                # don't come back to it for a while.
+                cc_forget(LISTEN["mhz"])
+                listen_status(f"trunked: {LISTEN['mhz']:.4f} MHz is an encrypted system; skipping it")
+                if not trunk_next_system(now):
+                    follow_leave(now, "encrypted system")
+                continue
             if LISTEN["detected"] and now - max(LISTEN["chan_at"], LISTEN.get("call_at", 0.0)) >= TRUNK_IDLE_S:
                 if not trunk_next_system(now):
                     follow_leave(now, f"no call on the trunked system for {TRUNK_IDLE_S:.0f} s")
@@ -2817,6 +2833,7 @@ def listen_worker() -> None:
 
 
 SYNC_RE = re.compile(r"Sync:\s*[+-]?\s*([A-Za-z0-9]+)")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 def stop_tools(procs: list) -> None:
@@ -2866,9 +2883,13 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                 ln = ln.decode("utf-8", "replace").strip()
                 if not ln:
                     continue
+                ln = ANSI_RE.sub("", ln)
                 proc.err_tail.append(ln)
-                if re.search(r"(?i)sync:|\bTG\b|ENC|ALG|error|fail|cannot|unable|exit|frequency|ll\+|dropped", ln):
-                    log_line(f"{tool}: {ln}")
+                if "Explicit Encryption Command" in ln or "ENC LO" in ln:
+                    proc.enc_cmds = getattr(proc, "enc_cmds", 0) + 1
+                if re.search(r"(?i)sync:|\bTG\b|ENC|ALG|error|fail|cannot|unable|exit|frequency|ll\+|dropped", ln) \
+                        and not re.search(r"Sync: \+P25p1 .*(TSBK|duid:EE|TDULC)\s*$", ln) and ln != "Sync: no sync":
+                    log_line(f"{tool}: {ln}")     # the per-frame control-channel chatter stays out of the phone journal
                 if kw.get("watch_sync"):
                     m = SYNC_RE.search(ln)
                     if m and m.group(1).lower() not in ("no", "none", "lost"):
