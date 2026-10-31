@@ -2490,6 +2490,7 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
         p.err_tail = deque(maxlen=3)
         p.sync, p.sync_at = "", 0.0
         p.call, p.call_at = "", 0.0
+        tool = os.path.basename(cmd.split()[0])
 
         def drain(proc=p):                   # dsd-fme chatters on stderr; an undrained pipe would stall it
             for ln in proc.stderr:
@@ -2497,8 +2498,8 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                 if not ln:
                     continue
                 proc.err_tail.append(ln)
-                if re.search(r"(?i)sync:|\bTG\b|ENC|ALG|error|fail|cannot|unable|exit", ln):
-                    log_line(f"dsd-fme: {ln}")
+                if re.search(r"(?i)sync:|\bTG\b|ENC|ALG|error|fail|cannot|unable|exit|frequency", ln):
+                    log_line(f"{tool}: {ln}")
                 if kw.get("watch_sync"):
                     m = SYNC_RE.search(ln)
                     if m and m.group(1).lower() not in ("no", "none", "lost"):
