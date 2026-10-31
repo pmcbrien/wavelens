@@ -33,8 +33,8 @@ import time
 
 try:
     from bleak import BleakClient, BleakScanner
-except ImportError:
-    sys.exit("pip install bleak")
+except ImportError:                       # wavelens_scanner.py imports the decoder from here without needing bleak
+    BleakClient = BleakScanner = None
 
 SVC = "57617665-6c65-6e73-0100-000000000001"
 TX = "57617665-6c65-6e73-0100-000000000002"     # device → us, notify
@@ -116,6 +116,8 @@ def describe(o: dict) -> str:
 
 
 async def main() -> None:
+    if BleakClient is None:
+        sys.exit("pip install bleak")
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--name", default="", help="companion name, e.g. Wavelens-3F2A (default: the nearest one)")
     ap.add_argument("--address", default="", help="Bluetooth address instead of a name")
