@@ -193,6 +193,7 @@ RR_LISTEN = {"fm": "fm", "fmn": "fm", "am": "am", "dmr": "dmr", "dmre": "dmr", "
              "nxdn48": "nxdn", "nxdn96": "nxdn", "nxdn": "nxdn", "project 25": "p25", "telm": "fm",   # telemetry/paging: FM, the pager decoder reads it
              "edacs": "trunked", "ltr": "trunked"}
 RR_PUBLIC = ("county", "city", "sheriff", "police", "law", "state", "fire", "ems", "town", "village", "government")
+RR_NEAR_KM = 80.0      # a trunked site this close to the phone counts as local when several systems share a frequency
 
 
 class RrPack:
@@ -314,20 +315,43 @@ class RrPack:
             return own[0][1:]
         return hits[0][1:] if len({h[0] for h in hits}) == 1 else None
 
+    def _near(self, row: dict) -> float:
+        """Distance (km) from the phone's last position to a site row with Lat/Lon, else a large number.
+        Sites within RR_NEAR_KM rank as local; a 'West Palm' or 'Fortville' site sharing a frequency does not."""
+        try:
+            if state.get("lat") is None or not row.get("Lat"):
+                return 9e9
+            return haversine_km(float(state["lat"]), float(state["lon"]), float(row["Lat"]), float(row["Lon"]))
+        except (TypeError, ValueError):
+            return 9e9
+
+    def _order(self, row: dict, d_mhz: float) -> tuple:
+        """Sort key for competing matches: a nearby site first (when the phone shares its position), then
+        the --rr-county / county-file rank, then the closest frequency."""
+        km = self._near(row)
+        return (0 if km <= RR_NEAR_KM else 1 if km < 9e9 else 2, row.get("_rank", 9), d_mhz)
+
     def site_at(self, mhz: float, tol_mhz: float = 0.0065):
-        """The site-export row that lists this frequency (any channel, control or not), or None."""
+        """The site-export row that lists this frequency (any channel, control or not): the local one when
+        several systems share it, else None."""
+        best = None
         for row in self.sites:
-            if any(abs(fq - mhz) <= tol_mhz for fq, _ in row["_freqs"]):
-                return row
-        return None
+            d = min((abs(fq - mhz) for fq, _ in row["_freqs"]), default=9.0)
+            if d <= tol_mhz:
+                k = self._order(row, d)
+                if best is None or k < best[0]:
+                    best = (k, row)
+        return best[1] if best else None
 
     def control_at(self, mhz: float, tol_mhz: float = 0.0065):
-        """The control-channel entry at this frequency, or None."""
+        """The control-channel entry at this frequency (the local system's when several share it), or None."""
         best = None
         for f, primary, row in self.controls:
             d = abs(f - mhz)
-            if d <= tol_mhz and (best is None or d < best[0]):
-                best = (d, (f, primary, row))
+            if d <= tol_mhz:
+                k = self._order(row, d) + (not primary,)
+                if best is None or k < best[0]:
+                    best = (k, (f, primary, row))
         return best[1] if best else None
 
     @staticmethod
@@ -339,7 +363,10 @@ class RrPack:
         half = max(tol_khz, 12.5) / 1000.0 / 2 + 0.004   # + the dongle's own error (10 ppm at 400 MHz)
         lo = bisect.bisect_left(self.keys, mhz - half)
         hi = bisect.bisect_right(self.keys, mhz + half)
-        return [(abs(f - mhz), side, row) for f, side, row in self.rows[lo:hi]]
+        hits = [(abs(f - mhz), side, row) for f, side, row in self.rows[lo:hi]]
+        # local first: sites near the phone's position, then the preferred counties, then by distance in MHz
+        hits.sort(key=lambda h: self._order(h[2], h[0]))
+        return hits
 
     @staticmethod
     def agency(row: dict) -> str:
@@ -498,6 +525,13 @@ def trunk_auto_ok(x: dict) -> bool:
     if is_federal(who):
         return False
     if x.get("agency") == "Business" or not is_public_system(who) and x.get("agency") != "Public safety":
+        return False
+    # "Duke Energy P25" passes the name test ("state"? no — but is_public_system is loose); the utility tag
+    # and a far-away site both say no.
+    if row is not None and RR._near(row) < 9e9 and RR._near(row) > RR_NEAR_KM:
+        return False
+    tag = (x.get("rr_tag") or "").lower()
+    if any(w in (x.get("agency") or "").lower() for w in ("utility", "business", "security", "transit", "railroad")):
         return False
     return True
 
@@ -2157,6 +2191,10 @@ def trunk_note(obj: dict) -> None:
     if lic:
         mhz = round(lic, 5)
     site = (x.get("rr_agency") or "?", x.get("rr_description") or "?", trunk_kind(x.get("rr_mode") or ""))
+    if RR and lic:
+        row = RR.site_at(lic)
+        if row is not None and RR._near(row) < 9e9 and RR._near(row) > RR_NEAR_KM:
+            return                           # the list's site for this frequency is far away: not this carrier's system
     n, _, _, _ = TRUNK["seen"].get(mhz, (0, 0.0, -200, site))
     try:
         lvl = int(obj.get("r") or -200)
