@@ -57,7 +57,7 @@ AU = "57617665-6c65-6e73-0100-000000000004"      # device → phone, notify: aud
 FW = "wavelens-bridge 0.1"
 
 out: "Queue[str]" = Queue(maxsize=256)
-aout: "Queue[bytes]" = Queue(maxsize=50)        # two seconds of audio; if the link can't keep up, frames drop
+aout: "Queue[bytes]" = Queue(maxsize=100)       # four seconds of audio; the pump drops the oldest past 1.2 s of lag
 state = {"linked": False, "band": "all", "mode": "rf", "ch": "hop", "park": "off", "lat": None, "lon": None, "pos_at": 0.0}
 
 
@@ -3128,7 +3128,9 @@ def _serve_listen(req: tuple, gen: int) -> None:
     if mode in DIGITAL_MODES:
         flag, chans = DIGITAL_MODES[mode]
         kill_strays()
-        p = start_tool(f"rtl_tcp -a 127.0.0.1 -p {RTL_TCP_PORT}{dev}", gen)
+        # -b 32 / -n 64: more and bigger USB transfers than the defaults, so a busy moment on the Pi (the
+        # audio encoder, BLE) doesn't drop IQ samples before dsd-fme reads them (a drop is a chopped syllable).
+        p = start_tool(f"rtl_tcp -a 127.0.0.1 -p {RTL_TCP_PORT}{dev} -b 32 -n 64", gen)
         if p is False:
             listen_stop("rtl_tcp missing"); listen_status("rtl_tcp not found on the Pi (apt install rtl-sdr)"); return
         if p is None:
@@ -3774,36 +3776,85 @@ def run_peripheral(name: str) -> None:
     dev.add_characteristic(srv_id=1, chr_id=3, uuid=AU, value=[], notifying=False,
                            flags=["notify"], notify_callback=au_notify_cb)
 
+    # Audio pacing. Frames are 40 ms of audio each; the link carries them as BLE notifications, which the
+    # controller sends at the connection interval (7.5–30 ms on Android, usually 15). Sent as fast as they
+    # arrive they are fine in steady state, but after any stall (the Pi busy, the phone's BLE stack
+    # pausing) the backlog bursts out at hundreds a second, BlueZ queues what it can and drops the rest,
+    # and the phone hears a gap. So: a jitter buffer. Playback over the link starts once AUDIO_PREFILL
+    # frames are queued (or a frame has waited AUDIO_PREFILL_MAX_S), then one frame goes out every 40 ms on
+    # the Pi's clock, whatever the queue holds. The queue absorbs bursts; a frame older than AUDIO_DROP_S
+    # is dropped in bulk so the lag never grows beyond a second. JSON lines go out between audio frames —
+    # at most one every AUDIO_JSON_GAP frames — so status and journal keep flowing during a call.
+    FRAME_S = LISTEN_FRAME / LISTEN_RATE          # 0.040
+    AUDIO_PREFILL = 6                             # 240 ms before the first frame leaves
+    AUDIO_PREFILL_MAX_S = 0.5
+    AUDIO_DROP_S = 1.2                            # the queue never holds more than this much lag
+    AUDIO_JSON_GAP = 2
+    pace = {"next": 0.0, "primed": False, "first_at": 0.0, "since_json": 0}
+
+    def send_json_line(line: str) -> None:
+        tx = chars.get("tx")
+        if tx is None:
+            return
+        data = line.encode("utf-8")
+        for i in range(0, len(data), 180):      # under a 247-byte MTU; the app reassembles on newline
+            try:
+                tx.set_value(list(data[i:i + 180]))
+            except Exception:
+                break
+            time.sleep(0.005)
+
     def pump():
         while True:
             au = chars.get("au")
-            frame = None
-            if au is not None:
-                try:
-                    frame = aout.get_nowait()
-                except Empty:
-                    frame = None
-            if frame is not None:
-                try:
-                    au.set_value(list(frame))     # one 164-byte frame per notification, under a 247-byte MTU
-                except Exception:
-                    pass
-                time.sleep(0.004)
+            now = time.monotonic()
+            n = aout.qsize()
+            if au is not None and n:
+                if not pace["primed"]:
+                    if not pace["first_at"]:
+                        pace["first_at"] = now
+                    if n >= AUDIO_PREFILL or now - pace["first_at"] >= AUDIO_PREFILL_MAX_S:
+                        pace["primed"] = True
+                        pace["next"] = now
+                if pace["primed"] and now >= pace["next"]:
+                    # too far behind: drop the oldest frames so the lag stays under AUDIO_DROP_S
+                    while aout.qsize() > int(AUDIO_DROP_S / FRAME_S):
+                        try:
+                            aout.get_nowait()
+                        except Empty:
+                            break
+                    try:
+                        frame = aout.get_nowait()
+                    except Empty:
+                        frame = None
+                    if frame is not None:
+                        try:
+                            au.set_value(list(frame))     # one 164-byte frame per notification, under a 247-byte MTU
+                        except Exception:
+                            pass
+                        pace["next"] += FRAME_S
+                        if pace["next"] < now - FRAME_S:  # we fell behind the clock (a slow notify): resync
+                            pace["next"] = now
+                        pace["since_json"] += 1
+                # a JSON line between frames, when one is waiting and it's its turn
+                if pace["since_json"] >= AUDIO_JSON_GAP:
+                    try:
+                        line = out.get_nowait()
+                    except Empty:
+                        line = None
+                    if line is not None:
+                        pace["since_json"] = 0
+                        send_json_line(line)
+                time.sleep(0.002)
                 continue
+            if au is not None and not n and pace["primed"]:
+                # the queue ran dry (squelch closed, call ended): re-prime for the next burst
+                pace["primed"], pace["first_at"] = False, 0.0
             try:
                 line = out.get(timeout=0.02 if au is not None else 0.5)
             except Empty:
                 continue
-            tx = chars.get("tx")
-            if tx is None:
-                continue
-            data = line.encode("utf-8")
-            for i in range(0, len(data), 180):      # under a 247-byte MTU; the app reassembles on newline
-                try:
-                    tx.set_value(list(data[i:i + 180]))
-                except Exception:
-                    break
-                time.sleep(0.005)
+            send_json_line(line)
 
     threading.Thread(target=pump, daemon=True).start()
     print(f"{FW}: advertising as {name!r} on {dongle.address}  (pair code {code})", file=sys.stderr)
