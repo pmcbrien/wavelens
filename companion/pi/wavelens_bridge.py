@@ -2876,6 +2876,7 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
         p.err_tail = deque(maxlen=3)
         p.sync, p.sync_at = "", 0.0
         p.call, p.call_at = "", 0.0
+        p.voice_at, p.enc_now, p.enc_at = 0.0, False, 0.0
         tool = os.path.basename(cmd.split()[0])
 
         def drain(proc=p):                   # dsd-fme chatters on stderr; an undrained pipe would stall it
@@ -2894,6 +2895,15 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                     m = SYNC_RE.search(ln)
                     if m and m.group(1).lower() not in ("no", "none", "lost"):
                         proc.sync, proc.sync_at = m.group(1), time.time()
+                    # Voice frames (P25 LDU1/LDU2, DMR voice bursts) mean a call is playing right now, whether
+                    # or not a TG line came with them — dsd-fme names the talkgroup on the grant, then just
+                    # streams LDUs for the rest of the call. ALG ID 0x80 / 0x00 = clear, anything else = encrypted.
+                    if re.search(r"\bLDU[12]\b|Voice Frame|VC[12]|\bHDU\b", ln):
+                        proc.voice_at = time.time()
+                    ma = re.search(r"ALG(?: ID)?:\s*0x([0-9A-Fa-f]+)", ln)
+                    if ma:
+                        proc.enc_now = ma.group(1).upper() not in ("80", "0", "00")
+                        proc.enc_at = time.time()
                     m = CALL_RE.search(ln)
                     if m:
                         enc = ENC_RE.search(ln)
@@ -3212,13 +3222,17 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 break
             if mode in TRUNK_MODES:
                 raw = getattr(p, "call", "")
-                active = bool(raw) and now - p.call_at < 8.0     # dsd-fme's last grant / voice line was recent
+                voice = now - getattr(p, "voice_at", 0.0) < 3.0          # LDU frames in the last 3 s: a call is playing
+                active = (bool(raw) and now - p.call_at < 8.0) or voice   # dsd-fme's last grant, or voice right now
                 if active:
-                    call = tg_named(raw)
+                    enc = getattr(p, "enc_now", False) and now - getattr(p, "enc_at", 0.0) < 5.0
+                    call = tg_named(raw) if raw else "call in progress"
+                    if enc and "encrypted" not in call:
+                        call += " · encrypted"
                     if LISTEN["call"] != call:                  # a new call: say so once, not every frame
                         LISTEN["call"] = call
-                        LISTEN["call_at"] = now
                         listen_status(f"trunked call: {call}")
+                    LISTEN["call_at"] = now                     # the system is busy: the idle timer restarts
                 elif LISTEN["call"]:                            # the call ended
                     LISTEN["call"] = ""
                     listen_status(f"on the control channel {mhz:.4f} MHz, waiting for a call")
