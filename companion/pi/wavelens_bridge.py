@@ -101,6 +101,8 @@ def log_line(text: str) -> None:
     text = text.rstrip()
     if not text or text.startswith("sent ") or '"t":"log"' in text:
         return
+    if "total sweeps completed" in text or "Stop with Ctrl-C" in text:
+        return                               # hackrf_sweep's once-a-second progress line
     item = (time.time(), text[:300])
     with LOG["lock"]:
         LOG["lines"].append(item)
@@ -1707,6 +1709,7 @@ LISTEN_CV = threading.Condition()
 # the next hit takes it. Not digital trunked bands (P25/DMR: rtl_fm would play buzzing), not broadcast.
 FOLLOW_BANDS = [(26.96, 27.41, "am"), (29.6, 54.0, "auto"), (118.0, 137.0, "am"), (137.0, 174.0, "auto"),
                 (216.0, 225.0, "auto"), (400.0, 470.0, "auto")]
+FOLLOW_NAMED_ONLY = [(29.6, 54.0)]   # low band: full of a HackRF's own products; only tune a hit the licence lists name
 FOLLOW_HANG_S = 3.0
 FOLLOW_MIN_S = 4.0          # once tuned, give the squelch this long to open before another hit can take over
 FOLLOW_MAX_S = 30.0         # a channel gets at most this long, then the next waiting signal takes the dongle
@@ -2246,6 +2249,8 @@ def follow_hit(obj: dict) -> None:
     mode = follow_mode(mhz)
     if mode is None or locked_out(mhz):
         return
+    if any(lo <= mhz <= hi for lo, hi in FOLLOW_NAMED_ONLY) and not (x.get("lic_mhz") or x.get("rr_agency") or x.get("licensee")):
+        return                               # an unnamed low-band carrier is almost always the receiver itself
     known = str(x.get("listen") or "")      # the RadioReference overlay's mode for this channel
     if known in ("fm", "am", "dmr", "p25", "nxdn"):
         mode = known                         # no 8 s probe: tune it as what it is
@@ -2509,6 +2514,10 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
             return p
         time.sleep(0.1)
         LISTEN["why"] = " | ".join(p.err_tail)
+        if attempt == 1 and re.search(r"(?i)usb_claim_interface|busy|-6\b", LISTEN["why"]):
+            # Twice refused: the sweep's rtl_power is sitting on the dongle past its SIGTERM. Take it.
+            print(f"bridge: listen: {LISTEN['dev'] or 'dongle'} still held; stopping whatever has it", file=sys.stderr)
+            free_dongle(LISTEN["dev"])
     return None
 
 
