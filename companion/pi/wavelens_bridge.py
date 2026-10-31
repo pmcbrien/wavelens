@@ -984,6 +984,7 @@ class Sweep:
         self.bhot = {}        # 1 MHz bucket → [first hot, last hot]: a spur drifts across bins, the bucket holds
         self.latest = {}      # bin Hz → last dB read: the spectrum the phone's Scanner / Spectrum screens draw
         self.step_hz = 0.0
+        self.hist = {}        # rtl_power only: bin Hz → deque of (time, dB), the last few passes, for the control-channel hunt
         SWEEPS.append(self)
 
     def row(self, line: str) -> None:
@@ -1004,6 +1005,11 @@ class Sweep:
                 for i, db in enumerate(vals):
                     if db == db and db not in (float("inf"), float("-inf")):
                         self.latest[lo + i * step] = db
+        if self.src == "rtlpower" and any(b_lo * 1e6 <= lo < b_hi * 1e6 for _, b_lo, b_hi, _ in CC_BANDS):
+            with SPEC_LOCK:
+                for i, db in enumerate(vals):
+                    if db == db and db not in (float("inf"), float("-inf")):
+                        self.hist.setdefault(lo + i * step, deque(maxlen=8)).append((now, db))
         gnss_rows = {}      # GNSS window → [bins judged, hot bins]
         for i, db in enumerate(vals):
             if db != db or db in (float("inf"), float("-inf")):
@@ -1572,12 +1578,22 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm:
                 return
             time.sleep(2)
         return
+    def in_cc_band(spec: str) -> bool:
+        try:
+            lo, hi = _mhz(spec.split(":")[0]), _mhz(spec.split(":")[1].split("@")[0])
+        except (ValueError, IndexError):
+            return False
+        return any(lo <= b_hi and hi >= b_lo for _, b_lo, b_hi, _ in CC_BANDS)
     while True:
         for spec in specs:
             wait_free()
+            hunting = HUNT.get("sweeping") and any(in_cc_band(sp) for sp in specs)
+            if hunting and not in_cc_band(spec):
+                continue                 # a control-channel hunt is waiting on the trunking bands: skip the rest for now
             i = sweep_interval_s(spec)
             sw.settle_until = time.time() + SETTLE_S + i      # first integration after a retune is discarded
-            if not run_once(f"rtl_power -f {spec}{dev} -i {i} {(' -g ' + str(gain)) if gain else ''}{(' -p ' + str(ppm)) if ppm else ''} -e {max(dwell_s, 2 * i)}s -", sw.row, planned=True, stop_when=busy):
+            dwell = max(4, 2 * i) if hunting else max(dwell_s, 2 * i)   # short passes while the hunt counts them
+            if not run_once(f"rtl_power -f {spec}{dev} -i {i} {(' -g ' + str(gain)) if gain else ''}{(' -p ' + str(ppm)) if ppm else ''} -e {dwell}s -", sw.row, planned=True, stop_when=busy):
                 return
             time.sleep(0.5)         # let the dongle close before the next range opens it
 
@@ -1805,7 +1821,7 @@ def follow_key(mhz: float) -> int:
 # RadioReference "TRS" row is counted here per site; asked to follow a system, the bridge tries the
 # site's most constant frequency first and the next if dsd-fme finds no control-channel sync.
 TRUNK = {"auto": True, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc_at": 0.0, "map": ""}
-HUNT = {"on": False, "cancel": False}
+HUNT = {"on": False, "cancel": False, "sweeping": False}
 TRUNK_KINDS = ("p25", "dmr", "nxdn", "edacs")
 # Where control channels live: the base-station (output) side of the trunking bands, 800 MHz first
 # (most US public-safety P25 systems), then 700 MHz, 900 MHz, UHF and VHF.
@@ -2042,13 +2058,44 @@ def cc_hunt(first: list) -> None:
     TRUNK["hunted"] = True
     found = []
     try:
-        # The sweep on this dongle sees listen_busy and is told to stop, but rtl_power can sit in a USB read
-        # for many seconds after SIGTERM. Don't wait on its manners: terminate any rtl_power on this device
-        # now, SIGKILL after 3 s, and only then open the dongle. (The sweep thread waits while HUNT is on.)
-        free_dongle(LISTEN["dev"])
+        # First: the bands the running rtl_power sweep already covers. Its passes are the measurement —
+        # no second rtl_power, no fight over the dongle (two processes on one RTL-SDR left it wedged).
+        # Wait for three passes of each covered band, up to HUNT_FROM_SWEEP_S.
+        covered = [(spec, lo, hi, label) for spec, lo, hi, label in CC_BANDS if sweep_covers(lo, hi)]
+        if covered:
+            # the sweep must keep running for this: "sweeping" tells listen_busy not to hold the dongle, and
+            # tells the sweep to concentrate on the trunking bands with short dwells until the hunt is done
+            HUNT["sweeping"] = True
+            t0 = time.time()
+            listen_status("trunked: looking for a control channel in the sweep ("
+                          + ", ".join(label for _, _, _, label in covered) + ")…")
+            while time.time() - t0 < HUNT_FROM_SWEEP_S and not HUNT["cancel"]:
+                ready = True
+                for _, lo, hi, label in covered:
+                    _, n = sweep_steady(lo, hi, time.time())
+                    if n < 3:
+                        ready = False
+                if ready:
+                    break
+                time.sleep(2.0)
+            for _, lo, hi, label in covered:
+                here, n = sweep_steady(lo, hi, time.time())
+                here = [(m, lvl) for m, lvl in here if all(abs(m - f) > 0.02 for f, _ in found)]
+                print(f"bridge: control-channel hunt: {label} (sweep, {n} passes): {len(here)} steady"
+                      + (" — " + ", ".join(f"{m:.4f} (+{l:.0f} dB)" for m, l in sorted(here, key=lambda c: -c[1])[:4]) if here else ""),
+                      file=sys.stderr)
+                found += here
+            HUNT["sweeping"] = False
+        probe = [(spec, lo, hi, label) for spec, lo, hi, label in CC_BANDS if not sweep_covers(lo, hi)]
+        if probe and not found and not HUNT["cancel"]:
+            # Bands no sweep covers, and nothing steady yet: probe them with rtl_power. This is the path
+            # that has to take the dongle from the sweep, so it is the last resort.
+            free_dongle(LISTEN["dev"])
+        else:
+            probe = []
         dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
         ppm = f" -p {LISTEN['ppm']}" if LISTEN["ppm"] else ""
-        for spec, lo, hi, label in CC_BANDS:
+        for spec, lo, hi, label in probe:
             if HUNT["cancel"] or len(found) >= CC_MAX_TRIES:
                 break
             listen_status(f"trunked: looking for a control channel, {label} ({lo:g}–{hi:g} MHz)…")
@@ -2083,7 +2130,7 @@ def cc_hunt(first: list) -> None:
         print("bridge: control-channel hunt: " + (", ".join(f"{m:.4f} (+{l:.0f} dB)" for m, l in found[:CC_MAX_TRIES]) or "nothing steady"),
               file=sys.stderr)
     finally:
-        HUNT["on"] = False
+        HUNT["on"], HUNT["sweeping"] = False, False
     if HUNT["cancel"]:
         return
     tries = list(first)
@@ -2108,6 +2155,64 @@ def cc_hunt(first: list) -> None:
         for f, _, row in rr_controls_ranked(CC_MAX_TRIES):
             tries += [(f, md) for md in trunk_modes(rr_site(row)[2])]
     trunk_try(tries, "the nearest system" + (f" ({len(found)} steady carriers heard)" if found else " (nothing steady heard; trying your list)"))
+
+
+HUNT_FROM_SWEEP_S = 75.0    # how long the hunt waits for the sweep to have passed the trunking bands three times
+
+
+def sweep_steady(lo_mhz: float, hi_mhz: float, now: float):
+    """(carriers, readings) from the rtl_power sweep's own passes over [lo, hi): carriers that stayed over
+    CC_STEADY_DB above the band's median in every one of the last ≥3 readings (within 3 min), as
+    [(MHz, dB over)], one per channel at the local peak. readings is the smallest count any bin has, so
+    the caller knows whether the band has been passed often enough yet."""
+    per = {}
+    with SPEC_LOCK:
+        for sw in SWEEPS:
+            if sw.src != "rtlpower":
+                continue
+            for hz, dq in sw.hist.items():
+                if lo_mhz * 1e6 <= hz < hi_mhz * 1e6:
+                    vals = [db for t, db in dq if now - t <= 180.0]
+                    if vals:
+                        per[hz] = vals
+    if not per:
+        return [], 0
+    nread = min(len(v) for v in per.values())
+    if nread < 3:
+        return [], nread
+    keys = sorted(per)
+    step = (keys[1] - keys[0]) if len(keys) > 1 else 12500.0
+    mins = {hz: min(v) for hz, v in per.items()}
+    med = sorted(sum(v) / len(v) for v in per.values())[len(per) // 2]
+    out = []
+    for j, hz in enumerate(keys):
+        over = mins[hz] - med
+        if over < CC_STEADY_DB:
+            continue
+        l = mins.get(keys[j - 1]) if j > 0 else None
+        r = mins.get(keys[j + 1]) if j + 1 < len(keys) else None
+        if (l is not None and l > mins[hz]) or (r is not None and r >= mins[hz]):
+            continue
+        off = 0.0
+        if l is not None and r is not None:
+            den = l - 2 * mins[hz] + r
+            if den < 0:
+                off = max(-0.5, min(0.5, 0.5 * (l - r) / den))
+        mhz = (hz + step / 2 + off * step) / 1e6
+        raster = 0.0025 if mhz < 300 else 0.00625
+        out.append((round(round(mhz / raster) * raster, 5), over))
+    return out, nread
+
+
+def sweep_covers(lo_mhz: float, hi_mhz: float) -> bool:
+    """Does an rtl_power range include this band? (Checked against the specs the sweeps were started with.)"""
+    for a, b in SWEEP_RANGES:
+        if a <= lo_mhz and b >= hi_mhz:
+            return True
+    return False
+
+
+SWEEP_RANGES = []           # (lo, hi) MHz of every --rtl-power range running, filled in main()
 
 
 def free_dongle(dev: str, wait_s: float = 3.0) -> None:
@@ -2347,7 +2452,8 @@ def follow_watch() -> None:
 def listen_busy(dev: str) -> bool:
     """The dongle is spoken for from the moment a listen is asked for until it ends — not just while
     rtl_fm runs. Otherwise the sweep restarts in the gap and grabs it back (usb_claim_interface -6)."""
-    return (LISTEN["req"] is not None or LISTEN["proc"] is not None or LISTEN["starting"] or HUNT["on"]) and LISTEN["dev"] == dev
+    return (LISTEN["req"] is not None or LISTEN["proc"] is not None or LISTEN["starting"]
+            or (HUNT["on"] and not HUNT.get("sweeping"))) and LISTEN["dev"] == dev
 
 
 def listen_status(msg: str) -> None:
@@ -3459,6 +3565,19 @@ def main() -> None:
     if a.rtl_power:
         CAPS.append("sweep")
         groups = group_sweeps(a.rtl_power, a.rtl_power_device)
+        # The control-channel hunt reads the sweep: make sure the listening dongle's sweep passes the 800 MHz
+        # trunking band (851–869, where most US public-safety control channels are) even if the config
+        # only lists the 806–824 input side.
+        ldev = a.listen_device or next((d for d in groups if d), "")
+        if ldev in groups and not any(_mhz(sp.split(":")[0]) <= 851.0 and _mhz(sp.split(":")[1].split("@")[0]) >= 869.0 for sp in groups[ldev]):
+            groups[ldev].append("851M:869M:12.5k")
+            print(f"bridge: sweep on {ldev}: added 851–869 MHz for the control-channel hunt", file=sys.stderr)
+        for specs in groups.values():
+            for sp in specs:
+                try:
+                    SWEEP_RANGES.append((_mhz(sp.split(":")[0]), _mhz(sp.split(":")[1].split("@")[0])))
+                except (ValueError, IndexError):
+                    pass
         for dev, specs in groups.items():
             threading.Thread(target=feed_rtl_power, args=(specs, dev, max(3, a.rtl_power_dwell), a.rtl_ppm, a.rtl_gain), daemon=True).start()
         if not a.listen_device:
