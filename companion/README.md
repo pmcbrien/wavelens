@@ -441,7 +441,9 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // squelch, changeable any time. Renew within 5 min or it stops itself.
 {"c":"listen","v":"trunk","mhz":856.9625,"qpsk":true}   // follow a trunked system from this control channel
 {"c":"listen","v":"trunk"}           // …or find the nearest system (hunt); see "Trunked systems" below
-{"c":"listen","v":"trunkauto","on":true,"qpsk":false}   // may Follow take trunked systems by itself; QPSK first?
+{"c":"listen","v":"trunkauto","on":true,"qpsk":false,"idle":5}   // may Follow take trunked systems by itself; QPSK
+                                     // first?; "idle": seconds of silence before the scanner hands off (2–120, default 5;
+                                     // the status echoes it as "idle")
 {"c":"listen","v":"hold","on":true}      // stay on this trunked system (no 5 s rotation); "on":false releases
 {"c":"listen","v":"skip"}                // leave this system now, go to the next strongest
 {"c":"listen","v":"tglock","tg":1234}    // hear only this talkgroup (0 unlocks); "tgavoid" with "tgs":[...] mutes a list

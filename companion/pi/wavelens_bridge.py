@@ -3004,7 +3004,7 @@ def listen_status(msg: str) -> None:
                      "sq": LISTEN["sq"], "follow": bool(LISTEN["follow"]),
                      "lockout": LISTEN["lockout"],
                      "system": (TRUNK.get("system") or "") if on and LISTEN["mode"] in TRUNK_MODES else "",
-                     "hold": bool(TRUNK.get("hold")), "tglock": int(TRUNK.get("tg_lock") or 0),
+                     "hold": bool(TRUNK.get("hold")), "tglock": int(TRUNK.get("tg_lock") or 0), "idle": TRUNK_IDLE_S,
                      "tgavoid": sorted(TRUNK.get("tg_avoid") or []),
                      "systems": [{"mhz": r["mhz"], "db": round(r["lvl"]),
                                   "name": r.get("name", "") or TRUNK.get("learned", {}).get(round(r["mhz"], 4), ""),
@@ -3190,6 +3190,11 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                         elif proc.clr_run >= 2:
                             proc.enc_now, proc.enc_at = False, time.time()
                     m = CALL_RE.search(ln)
+                    if m and "Channel Update" in ln and proc.call and f"TG {m.group(1)}" not in proc.call:
+                        # an update LCW naming other calls on the system: activity, not a change of call
+                        m2 = re.search(rf"\bTG[:= ]\s*{re.escape(proc.call.split()[1]) if len(proc.call.split()) > 1 else 'x'}\b", ln)
+                        proc.call_at = time.time()
+                        m = m2
                     if m:
                         enc = ENC_RE.search(ln)
                         tok = enc.group(1).strip() if enc else ""
@@ -4113,6 +4118,12 @@ def run_peripheral(name: str) -> None:
                     listen_start(want, "trunkq" if TRUNK["qpsk"] else "trunk", LISTEN["sq"], 0.0)
             elif str(cmd.get("v") or "") == "trunkauto":
                 TRUNK["auto"] = bool(cmd.get("on", True))
+                if cmd.get("idle") is not None:
+                    try:                     # the phone's "hand off after N s of silence" setting
+                        globals()["TRUNK_IDLE_S"] = float(min(120.0, max(2.0, float(cmd.get("idle")))))
+                        globals()["TRUNK_HOLD_S"] = TRUNK_IDLE_S
+                    except (TypeError, ValueError):
+                        pass
                 was = TRUNK["qpsk"]
                 TRUNK["qpsk"] = bool(cmd.get("qpsk", TRUNK["qpsk"]))
                 listen_status(("trunked systems: Follow takes them automatically" if TRUNK["auto"] else "trunked systems: manual only")
