@@ -505,6 +505,8 @@ Ranking for lock-on with a sites export: control channels the sweep has heard fi
 coverage (Range, miles) includes the phone's shared position; among those, public-safety systems before
 utilities and businesses, P25 before DMR before EDACS; two candidates per site so several sites get a turn.
 
+**Digital carriers on conventional channels.** A Follow hit in a land-mobile or amateur band is tuned in `auto` mode: dsd-fme's auto-detect (P25, DMR, YSF, D-STAR) first, and only if it reports no sync for 5 s after it starts demodulating does the bridge fall back to narrow FM. If the FM audio then turns out to be a digital carrier (broadband noise at a steady level for 2 s — a DMR or Fusion repeater that was idle during the first probe), the bridge hands the channel back to dsd-fme once, for 10 s. No sync the second time means a mode nobody here decodes (NXDN, dPMR, P25 data, telemetry): the readout says "digital carrier … nothing to hear", audio stays muted and Follow moves on.
+
 **Trunked systems — the scanner.** The app's **Scanner** tab runs this: SCAN sends `follow`, and with
 `trunkauto` on (the default) the bridge behaves like a trunking scanner.
 
