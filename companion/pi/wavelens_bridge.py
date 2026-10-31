@@ -585,6 +585,19 @@ def rr_says_control(row: dict) -> bool:
     return bool(re.search(r"\bcontrol( channel)?\b|\bcntl\b|\bctrl\b", d))
 
 
+NOT_PUBLIC_WORDS = ("utility", "energy", "power", "electric", "gas", "water", "business", "security", "transit",
+                    "railroad", "airport", "aviation")
+
+
+def system_public(row) -> bool:
+    """Is this RadioReference row a public-safety system (one that can carry police / fire / EMS talkgroups)?
+    Unknown (no row) counts as public: an unlisted system is not excluded on a guess."""
+    if row is None:
+        return True
+    who = row.get("Agency/Category") or row.get("System Name") or ""
+    return is_public_system(who) and not is_federal(who) and not any(w in who.lower() for w in NOT_PUBLIC_WORDS)
+
+
 def rr_doubtful_site(row: dict) -> bool:
     """The list's site for a frequency is a guess when it is far from the phone, or — with no position
     shared — not in the configured county: several sites of a statewide system reuse a frequency, and
@@ -594,7 +607,8 @@ def rr_doubtful_site(row: dict) -> bool:
     km = RR._near(row)
     if km < 9e9:
         return km > RR_NEAR_KM
-    return row.get("_rank", 9) >= 9
+    rank = row.get("_rank", 9)
+    return rank >= 9 or rank % 2 == 1          # odd: the row's county is not one of --rr-county
 
 
 def rr_site(row: dict):
@@ -2641,15 +2655,21 @@ def cc_hunt(first: list) -> None:
         name = f"{key[0]} ({key[1]})" if key and key[0] else ""
         if key and key[0] and row is not None and rr_doubtful_site(row):
             name = key[0]                    # the system is right (it owns the frequency); the site is a guess
-        who = (row.get("Agency/Category") or row.get("System Name") or "") if row is not None else ""
-        public = row is None or (is_public_system(who) and not is_federal(who)
-                                 and not any(w in who.lower() for w in ("utility", "energy", "power", "electric", "gas", "water",
-                                                                         "business", "security", "transit", "railroad", "airport", "aviation")))
+        public = system_public(row)
         ranked.append({"mhz": m, "lvl": lvl, "modes": modes, "failed_at": 0.0, "ok": False, "name": name, "public": public})
         if len(ranked) >= CC_MAX_TRIES:
             break
     if TRUNK.get("cats"):
         ranked.sort(key=lambda r: not r.get("public", True))   # POLICE/FIRE/EMS asked for: public-safety systems first
+
+        def allowed(m: float) -> bool:
+            cc = RR.control_at(m) if RR else None
+            return system_public(cc[2] if cc else (RR.site_at(m) if RR else None))
+        tries = [t for t in tries if allowed(t[0])]          # last session's Duke Energy doesn't lead a POLICE scan
+    if ranked:
+        # the cached / listed candidates only go ahead of the ranking when the sweep actually heard them
+        heard = [t for t in tries if any(abs(t[0] - r["mhz"]) < 0.002 for r in ranked)]
+        tries = heard
     for r in ranked:
         tries += [(r["mhz"], md) for md in r["modes"]]
     TRUNK["ranked"], TRUNK["ranked_at"] = ranked, time.time()
