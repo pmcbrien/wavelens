@@ -38,5 +38,21 @@ WAVELENS_RTL433="-f 315M -f 433.92M -f 915M -H 30 -g 40"
 #                                           by agency, description, alpha tag and mode; preferred over the FCC pack
 #                                           (a trunked-sites export gives trunk lock-on its control channels;
 #                                           a talkgroups export names the calls)
+#   --listen-device SERIAL                  the RTL-SDR the scanner listens with (default: the first @SERIAL sweep dongle);
+#                                           a plain R820T dongle, not an RTL-SDR Blog V4 unless its own driver is installed
+#   --trunk-idle 5 --trunk-min-db 18        scanner: leave a locked trunked system after 5 s without a call for the
+#                                           next strongest; only systems ≥ 18 dB over the band floor are candidates
+#   --moto-band 800                         Motorola Type II channel plan: 800 | 800r | 800s | 900 | obt:BASE:SPACING:OFFSET
+#   --hackrf-keep-sweeping                  keep the HackRF sweeping during digital voice (default: paused — it costs audio)
+#   --echo                                  every line sent to the phone also in the journal (verbose)
 #   --name Wavelens-Car                     the name the app lists under Find
+#
+# A known-good two-dongle scanner setup (WAVELENS_AUTO=0), a plain dongle on the sweeps + listening and the
+# other on sensors:
+#   WAVELENS_RTL433="-d :SERIAL_A -f 315M -f 433.92M -f 915M -H 30 -g 40"
+#   WAVELENS_ARGS="--listen-device SERIAL_B --rtl-power 144M:174M:12.5k@SERIAL_B --rtl-power 440M:470M:12.5k@SERIAL_B \
+#                  --rtl-power 806M:824M:12.5k@SERIAL_B --hackrf-sweep --hackrf-lna 16 --hackrf-bin 100000 \
+#                  --rr-pack /usr/local/lib/wavelens/rr/sites.csv --rr-pack /usr/local/lib/wavelens/rr/talkgroups.csv \
+#                  --rr-pack /usr/local/lib/wavelens/rr/county.csv --rr-county YourCounty"
+# (851–869 MHz is added to the listening dongle's sweep by the bridge for the control-channel hunt.)
 WAVELENS_ARGS=""

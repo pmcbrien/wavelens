@@ -294,6 +294,15 @@ The full step-by-step guide, with every command, is on the website:
   to a dongle and each dongle sweeps in parallel, a full pass of its half roughly every 14 s. Catches steady
   carriers; misses short bursts (fobs, TPMS, brief key-ups) and names nothing. Phone uplink bands are labelled as phones.
 - **Antennas:** dongles sold for aircraft come with ~7 cm 1090/978 MHz antennas; use ~17 cm elements for 433 MHz.
+  A control-channel hunt that finds nothing steady in the 800 band while a manual `rtl_power -f 851M:869M:12.5k`
+  shows +30 dB lines is the antenna or the dongle assignment, not the band.
+- **Which dongle listens:** the plain RTL2838 / R820T dongles reach 800 MHz fine on the stock driver. The
+  **RTL-SDR Blog V4** (R828D) needs the rtl-sdr-blog driver (`github.com/rtlsdrblog/rtl-sdr-blog`); on the Pi OS
+  `rtl-sdr` package it shows `[R82XX] PLL not locked!`, tunes wrong and `rtl_power` hangs. Until the driver is
+  proven on your Pi, give the V4 the sensor job (`WAVELENS_RTL433="-d :SERIAL_V4 …"`) and a plain dongle the
+  sweeps and listening (`--rtl-power …@SERIAL_PLAIN --listen-device SERIAL_PLAIN`), with `WAVELENS_AUTO=0`.
+- **`rtl_433 … Could not find device with serial`** at start: that dongle isn't on the bus (`lsusb | grep 0bda`,
+  `rtl_test -t`). The bridge carries on without sensors; fix the serial in `/etc/default/wavelens-bridge` or replug.
 - **One program per dongle:** PiAware/dump1090 holds one. `sudo systemctl disable --now piaware dump1090-fa dump978-fa` frees them
   (serial 00000978 is usually dump978's; `usb_claim_interface error -6` means a dongle is held).
 - **HackRF + PortaPack (Mayhem):** `lsusb` showing `1d50:6018` / `ttyACM0` instead of `1d50:6089` means it's in
@@ -310,8 +319,11 @@ The full step-by-step guide, with every command, is on the website:
 - **No Bluetooth (`bluetoothctl show` empty):** check for a `disable-bt` overlay in `/boot/config.txt`, that
   `bluez`, `pi-bluetooth` and `bluez-firmware` are installed, that `hciuart` and `bluetooth` are enabled, and
   `systemctl status hciuart` / `dmesg | grep -iE "hci|bluetooth|brcm"`.
-- **Update:** `cd ~/wavelens && git config core.fileMode false && git pull && cd companion/pi && sudo ./install-service.sh`
-  (settings are kept). Without `core.fileMode false`, the `chmod +x` from setup counts as a local edit and blocks the pull
+- **Update:** `cd ~/wavelens && companion/pi/update.sh` — pulls, installs the bridge and `smartnet.py`, restarts the
+  service and tails the journal with the sensor and spectrum lines filtered out (Ctrl-C to stop watching). If `git pull`
+  says "Already up to date" but the journal shows old behaviour, the checkout has diverged:
+  `git fetch origin && git reset --hard origin/main`, then `update.sh` again. The older way,
+  `git pull && cd companion/pi && sudo ./install-service.sh`, still works (settings are kept). Without `core.fileMode false`, the `chmod +x` from setup counts as a local edit and blocks the pull
   (`git stash` clears it). `unrecognized arguments` in the log means the installed bridge is older than your settings:
   update, then rerun `install-service.sh`.
 
@@ -389,6 +401,14 @@ SSID · `r` RSSI dBm (default −100) · `f` MHz · `ch` Wi-Fi channel · `pub` 
 Rate-limit per address on the companion (about one report per second per device is plenty).
 The phone keeps RSSI history, so repeats are useful; floods are not.
 
+```jsonc
+{"t":"spec","src":"hackrf","lo":851.0,"hi":869.0,"n":184,"bin_hz":98039,"db0":-120.0,"step_db":0.5,"b":"<base64>"}
+                                     // one byte per bin: dB = db0 + byte * step_db. src hackrf | rtlpower | esp32
+{"t":"log","ts":1793469838,"l":"bridge: control-channel hunt: 800 MHz (sweep, 3 passes): 13 steady — …"}
+{"t":"page","f":462.75,"proto":"POCSAG1200","addr":"202803","msg":"…"}   // Lab: a decoded page (control
+                                     // tokens and bytes stripped on the Pi)
+```
+
 ### Phone → companion
 
 ```jsonc
@@ -412,6 +432,17 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // (an AUTO probe gets its 8 s undisturbed); a channel just played waits 60 s
                                      // before it's returned to. "sq": rtl_fm
                                      // squelch, changeable any time. Renew within 5 min or it stops itself.
+{"c":"listen","v":"trunk","mhz":856.9625,"qpsk":true}   // follow a trunked system from this control channel
+{"c":"listen","v":"trunk"}           // …or find the nearest system (hunt); see "Trunked systems" below
+{"c":"listen","v":"trunkauto","on":true,"qpsk":false}   // may Follow take trunked systems by itself; QPSK first?
+{"c":"listen","v":"scanlist","mhz":[462.5625,155.655]}  // ESP32 analog scanner: the channels Follow steps through
+{"c":"spec","on":true,"lo":851,"hi":869}   // stream the sweep's readings in this window as {"t":"spec"} frames
+                                     // about once a second (≤200 bins, one byte each, 0.5 dB from -120 dB);
+                                     // renew within 90 s. "on":false stops. Drawn by the Scanner / Spectrum tabs.
+{"c":"spec","on":false}
+{"c":"log","on":true}                // stream the bridge's own journal (its stderr: bridge lines, rtl_tcp,
+                                     // dsd-fme, hackrf_sweep, smartnet) as {"t":"log","ts","l"} lines — the
+                                     // last 100 first, then live; renew within 90 s. The Alerts tab shows it.
 ```
 
 **Automatic radio plan.** `WAVELENS_AUTO=1` in `/etc/default/wavelens-bridge` (the default for new
@@ -474,45 +505,89 @@ Ranking for lock-on with a sites export: control channels the sweep has heard fi
 coverage (Range, miles) includes the phone's shared position; among those, public-safety systems before
 utilities and businesses, P25 before DMR before EDACS; two candidates per site so several sites get a turn.
 
-**Trunked systems.** `{"c":"listen","v":"trunk"}` locks onto the nearest trunked system's control
-channel without being told it. Candidates, in order: the control channel that worked last time
-(`/var/lib/wavelens/control-channel.json`); **the control channels in your RadioReference exports** —
-marked `851.0125c` (primary) / `851.0125a` (alternate), a Control / Use column, a description such as
-"Control Channel", or a site export with the frequencies in one cell — ones the sweep has heard first, then
-the nearest site (when the phone shares its position and the export has Lat/Lon), primaries before
-alternates; site frequencies the sweep has matched to a RadioReference trunked site, most constant first;
-and, if none of those syncs, a **hunt** on the listening dongle — `rtl_power` over the
-base-station side of the trunking bands (851–869, 769–775, 935–940, 450–470, 150.8–174 MHz, about 6 s
-each), keeping carriers that are at least 12 dB over the band in *every* reading (ones your list calls control
-channels first, at their listed frequency). A control channel never
-stops; voice channels and conventional repeaters come and go. Each candidate is tried with `dsd-fme -ft -T`
-in C4FM, then in CQPSK (`-mq`, simulcast/LSM sites — most large county P25 systems), 8 s each; the first
-sync locks on and is remembered. RadioReference modes P25, P25e, Project 25, APCO-25 and TDMA (phase II)
-are all treated as P25. `"mhz"` still names a control channel directly if a client wants to.
-`{"c":"listen","v":"trunkauto","on":true}` lets Follow take trunked systems the sweep hears on its own (it
-stays until four minutes pass without a call) — public-safety systems only: never military / federal, and
-never business systems (FleetTalk, BCI, hotels, utilities), even ones a talkgroups export covers. Lock onto
-the nearest system still considers every system; it only ranks those lower. EDACS and DMR Cap+/Con+/Tier III sites get a channel map
-written from the overlay's site frequencies (LCN by ascending frequency — the usual convention, not a
-guarantee). dsd-fme decodes the grants and retunes the dongle (through rtl_tcp) to each voice channel and
-back — P25 phase 1/2, DMR Tier III / Cap+ / Con+. Status carries `call` while a call is followed:
-**talkgroup only** ("TG 1234"; encrypted grants read "TG 1234 · encrypted (ALGID 0xAA)") — the source
-radio's unit ID is never read or shown. Encrypted calls are never tuned (dsd-fme's default). Motorola
-Type II / SmartNet and LTR cannot be decoded by dsd-fme. Unencrypted public-safety trunked traffic is
-lawful to receive in the US; check state law for a receiver in a vehicle.
+**Trunked systems — the scanner.** The app's **Scanner** tab runs this: SCAN sends `follow`, and with
+`trunkauto` on (the default) the bridge behaves like a trunking scanner.
 
-**Auto mode** starts `dsd-fme -fa`; the sync it reports on stderr ("Sync: +DMR", "+P25p1") names the
-protocol and the audio layout (TDMA is stereo). If the carrier is on (the sweep still sees it) and no
-digital sync appears within 3 s, it is analog: the listen restarts as narrow FM. Decided once per tune.
-The status line carries `"asked":"auto"` and `"detected":"DMR"` / `"FM"` alongside the effective mode.
+1. **Hunt.** The control-channel hunt reads the running `rtl_power` sweep on the listening dongle (no
+   second `rtl_power`; two processes on one RTL-SDR left it wedged). While a hunt waits, the sweep
+   concentrates on the trunking bands (851–869 is added to the dongle's sweep automatically; 769–775,
+   935–940, 450–470 and 150.8–174 if configured) in short passes; after three passes of a band, carriers
+   that stayed 12 dB over the band in *every* reading are steady — a control channel never stops. If no
+   sweep covers a band, `rtl_power` probes it as the last resort. The journal prints
+   `control-channel hunt: 800 MHz (sweep, 3 passes): 13 steady — 856.9688 (+40 dB), …`.
+2. **Rank.** Steady carriers are ranked by strength; the RadioReference sites export names each one and
+   fixes its decoder (P25 / DMR / EDACS / Motorola Type II; LTR is skipped). One entry per site — a busy
+   system keeps several carriers up, and they are one system. `systems ranked: 856.9625 (+40 dB) Pinellas
+   County (Countywide Simulcast); …` lists them. Only carriers `--trunk-min-db` (default 18) over the floor
+   are candidates.
+3. **Lock.** Each candidate gets `dsd-fme -ft -T` with each demodulator for `TRUNK_CC_WAIT_S` (18 s):
+   C4FM first, or **CQPSK first** (`-mq`) when the phone's Simulcast switch is on or the site's
+   RadioReference row says simulcast / Phase II — a simulcast (LSM) system syncs on C4FM but its voice
+   comes out chopped. The first sync is the lock (`locked onto the control channel 856.9625 MHz (P25p1,
+   QPSK)`) and is cached in `/var/lib/wavelens/control-channel.json` for next time; a P25 phase 2 sync is
+   a voice channel, not a control channel, and is skipped. A candidate with no sync is not retried for
+   10 minutes; a cached one that fails is forgotten.
+4. **Follow calls.** dsd-fme decodes the grants and retunes the dongle (through `rtl_tcp`) to each voice
+   channel and back. A call is recognised from the grant *and* from the voice frames that follow it
+   (LDU1/LDU2, HDU), so a long conversation is never mistaken for silence. Status carries `call`:
+   **talkgroup only** ("TG 1540 · PCSO A-3 (Law Dispatch)" with a talkgroups export) — the source radio's
+   unit ID is never read, kept or shown. Encrypted calls (ALG ID other than 0x80/0x00) are shown as
+   "· encrypted" and decode to silence; a system whose control channel issues only encryption commands
+   with no clear call for 15 s is marked encrypted and skipped.
+5. **Rotate.** No call for `--trunk-idle` seconds (default 5) → the next strongest system in the ranking,
+   round-robin; a system is re-tried after the others. The ranking is redone with a fresh hunt after
+   15 minutes. Conventional hits (a VHF/UHF carrier in a voice band) get their turn when the system is
+   quiet and Follow returns to the system afterwards; low-band (30–54 MHz) hits are tuned only when the
+   licence pack names them (a HackRF's own products live there).
 
-Digital modes run `rtl_tcp` on the dongle and `dsd-fme` (install once with `install-dsd.sh`, ~10 min
-on a Pi 4) as the demodulator/decoder, which sends 8 kHz PCM to the bridge over UDP on localhost; DMR
-and P25 phase 2 are TDMA, two slots as stereo, mixed to mono. Encrypted talkgroups decode to silence.
-Trunked systems (most 800 MHz public safety) hop channels under a control channel and are not followed;
-that is OP25/trunk-recorder territory. A `status` line carries `"listen": {"mhz","mode","sq","follow"}` while on (`mhz` 0 while
-following with nothing tuned) and `"listen": "off"` when it ends. Follow skips always-on and background
-hits, digital trunked bands (806–870: P25/DMR would be buzzing) and broadcast. Receive only.
+Manual control still exists: `{"c":"listen","v":"trunk","mhz":856.9625}` names a control channel;
+`{"c":"listen","v":"trunk"}` with no frequency runs the hunt once; `{"c":"listen","v":"trunkauto","on":false}`
+makes Follow conventional-only; `"qpsk":true` on either is the Simulcast switch (changing it re-locks the
+current system with the other demodulator). Automatic following takes **public-safety systems only** —
+never military / federal, and never business, utility or transit systems (FleetTalk, hospitals, Duke
+Energy), even ones a talkgroups export covers; a tap on one of those systems' channels still follows it
+by hand. RadioReference matches for a frequency shared by several systems are ranked by distance from the
+phone (the sites export's Lat/Lon, with the app's *Share position* on) and then by `--rr-county`, so a
+Pinellas carrier is not labelled with an Indiana utility's site that shares the frequency; a site more
+than 80 km away is never auto-followed or counted as heard.
+
+**Decoders.** P25 phase 1/2 and DMR Tier III / Cap+ / Con+ through dsd-fme (`-ft`, with a channel map
+for DMR); EDACS through dsd-fme (`-fE`, ProVoice, channel map from the sites export, LCN by ascending
+frequency — the usual convention, not a guarantee); **Motorola Type II / SmartNet / SmartZone through
+the bridge's own decoder** (`pi/smartnet.py`: `rtl_fm` discriminator audio → 3600-baud FSK bits →
+preamble, 4×19 deinterleave, parity correction, 10-bit CRC → OSWs → grants; the same dongle plays each
+grant's analog voice channel and returns; `--moto-band` 800 | 800r | 800s | 900 | obt:BASE:SPACING:OFFSET).
+LTR has no control channel to follow. Unencrypted public-safety trunked traffic is lawful to receive in
+the US; check state law for a receiver in a vehicle.
+
+**Auto mode** (a plain Listen on a carrier) starts `dsd-fme -fa`; the sync it reports ("Sync: +DMR",
+"+P25p1") names the protocol. If the carrier is on and no digital sync appears within 3 s, it is analog:
+the listen restarts as narrow FM. A D-STAR or NXDN sync in the 700/800/900 MHz bands is a false sync on a
+data channel and is ignored. A tap on a channel the RadioReference list knows as part of a trunked system
+follows that system instead of probing the channel. Listen refuses bands with nothing to hear (cellular,
+GNSS, ADS-B) on the phone side.
+
+**Audio path.** `rtl_tcp` (`-b 32 -n 64`: bigger USB buffers) → dsd-fme → 8 kHz PCM over UDP on localhost
+(stereo for `-ft` / `-fs` / `-fa`, the two TDMA slots mixed to mono; mono for `-f1` / `-fi` / `-fE`; the
+channel count is fixed by the decoder flag) → IMA ADPCM, 164-byte frames of 320 samples → BLE. The sender
+runs a 40 ms frame clock with a jitter buffer: playback over the link starts after 240 ms of frames are
+queued, one frame per 40 ms after that, the oldest dropped past 1.2 s of lag, JSON lines slotted between
+frames. The phone pre-fills five frames before starting its DAC, inserts 40 ms of silence for each frame
+the sequence numbers show was lost, and asks Android for a high-priority BLE connection while listening.
+While a digital decode runs — and for the rest of a Follow session that used one — the **HackRF sweep is
+paused** (`--hackrf-keep-sweeping` to leave it on): its USB stream and the parsing of 60,000 bins a pass
+cost dsd-fme audio frames. The HackRF sweep itself runs in a forked worker process on a core of its own.
+
+**Keeping the dongle healthy.** The listening dongle is shared between the sweep and the listen. A
+listen refused twice with `usb_claim_interface -6` terminates whatever holds the dongle (SIGTERM, then
+SIGKILL); a dongle that opens but streams nothing for 20 s is **USB-reset** through sysfs
+(`authorized` 0 → 1, the software equivalent of a replug; the journal says `usb reset of RTL-SDR … done`).
+A sensor dongle that is missing at start (rtl_433 exits within 20 s) no longer restart-loops the service:
+the scanner carries on without sensors, and the journal says so.
+
+A `status` line carries `"listen": {"mhz","mode","asked","detected","call","sq","follow","lockout"}`
+while on (`mhz` 0 while following with nothing tuned) and `"listen": "off"` when it ends. Follow skips
+always-on and background hits and broadcast. Receive only.
 
 Unknown commands are ignored. Every command may be answered with a `status` line.
 

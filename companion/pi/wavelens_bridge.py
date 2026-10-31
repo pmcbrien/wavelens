@@ -20,10 +20,19 @@ writing Wavelens lines (see ../README.md) to stdin.
 
 Several at once:  rtl_433 -F json | ./wavelens_bridge.py --rtl433 --hackrf-sweep --dump1090 localhost:30003
 
-Needs: python3-bluezero (pip install bluezero), BlueZ 5.50+, the adapter powered, and
-whichever of rtl_433 / hackrf_sweep / rtl_power / dump1090 you use on PATH. Receive only:
-nothing here ever transmits. Status: written against the documented APIs and CSV formats;
-not yet run on a Pi by the author.
+  ./wavelens_bridge.py --rtl-power 144M:174M:12.5k@SERIAL --rtl-power 440M:470M:12.5k@SERIAL --listen-device SERIAL \
+      --rr-pack county.csv --rr-pack trunked_sites.csv --rr-pack talkgroups.csv --rr-county Pinellas
+                                                         # the scanner: Listen / Follow / trunk-tracking on one dongle,
+                                                         # control channels found from the sweep, calls named from
+                                                         # the RadioReference exports (see ../README.md, "Trunked systems")
+
+Needs: python3-bluezero (pip install bluezero), BlueZ 5.50+, the adapter powered, and whichever of
+rtl_433 / hackrf_sweep / rtl_power / rtl_fm / rtl_tcp / dump1090 you use on PATH; dsd-fme (install-dsd.sh)
+for digital voice and P25 / DMR / EDACS trunking; smartnet.py beside this file for Motorola Type II.
+Receive only: nothing here ever transmits. Runs on a Pi 4 in a car daily (Oct 2026); the HackRF sweep
+is a forked worker process, a hung RTL-SDR is USB-reset, and a missing sensor dongle is tolerated.
+Tunables that matter for the scanner: --trunk-idle (5 s), --trunk-min-db (18), --listen-squelch,
+--moto-band, --hackrf-keep-sweeping.
 """
 
 import argparse
@@ -3224,7 +3233,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 break
             if mode in TRUNK_MODES:
                 raw = getattr(p, "call", "")
-                voice = now - getattr(p, "voice_at", 0.0) < 3.0          # LDU frames in the last 3 s: a call is playing
+                voice = bool(LISTEN["detected"]) and now - getattr(p, "voice_at", 0.0) < 3.0   # LDU frames in the last 3 s, once locked
                 active = (bool(raw) and now - p.call_at < 8.0) or voice   # dsd-fme's last grant, or voice right now
                 if active:
                     enc = getattr(p, "enc_now", False) and now - getattr(p, "enc_at", 0.0) < 5.0
