@@ -2080,7 +2080,7 @@ TRUNK = {"auto": True, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc
          "tg_lock": 0,           # talkgroup lock: only this TG is heard (others on the system are muted)
          "tg_avoid": set(),      # talkgroups muted (the app's TG lockout; resent on connect)
          "tg_seen": [],          # recent (ts, tg, name, encrypted) on this system, for the app's call list
-         "cats": set(),          # category filter: only these kinds of talkgroup are heard (empty = all)
+         "cats": {"police"},     # category filter: only these kinds of talkgroup are heard (empty = all); police by default
          "system": ""}
 # Category of a talkgroup from the RadioReference Tag column ("Law Dispatch", "Fire-Tac", "EMS Dispatch",
 # "Multi-Dispatch", "Public Works", "Schools", "Interop", "Hospital"…). The phone's POLICE / FIRE / EMS / OTHER
@@ -2092,10 +2092,10 @@ TG_CATS = [(("law", "corrections", "police", "sheriff"), "police"), (("fire",), 
 def tg_category(tg: int) -> str:
     """police | fire | ems | other for a talkgroup, from its Tag (then its description) in the talkgroups export."""
     if not RR or not tg:
-        return "other"
+        return ""                            # unknown: the filter lets it through (an unlisted system would otherwise be silent)
     hit = RR.talkgroup(tg, TRUNK.get("system", ""))
     if not hit:
-        return "other"
+        return ""
     alpha, desc, mode, tag = hit
     text = f"{tag} {desc} {alpha}".lower()
     for words, cat in TG_CATS:
@@ -2797,7 +2797,8 @@ def listen_status(msg: str) -> None:
                      "system": (TRUNK.get("system") or "") if on and LISTEN["mode"] in TRUNK_MODES else "",
                      "hold": bool(TRUNK.get("hold")), "tglock": int(TRUNK.get("tg_lock") or 0),
                      "tgavoid": sorted(TRUNK.get("tg_avoid") or []),
-                     "systems": [{"mhz": r["mhz"], "db": round(r["lvl"]), "name": r.get("name", ""),
+                     "systems": [{"mhz": r["mhz"], "db": round(r["lvl"]),
+                                  "name": r.get("name", "") or TRUNK.get("learned", {}).get(round(r["mhz"], 4), ""),
                                   "skip": time.time() - r["failed_at"] < TRUNK_FAIL_SKIP_S}
                                  for r in (TRUNK.get("ranked") or [])[:8]],
                      "cats": sorted(TRUNK.get("cats") or []),
@@ -2958,6 +2959,9 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                         proc.alive_at = time.time()       # demodulating: the auto-detect clock starts here
                     if m and m.group(1).lower() not in ("no", "none", "lost"):
                         proc.sync, proc.sync_at = m.group(1), time.time()
+                        mn = re.search(r"NAC(?:/CC)?:\s*([0-9A-Fa-f]{1,4})", ln)
+                        if mn:
+                            proc.nac = mn.group(1).upper()
                     # Voice frames (P25 LDU1/LDU2, DMR voice bursts) mean a call is playing right now, whether
                     # or not a TG line came with them — dsd-fme names the talkgroup on the grant, then just
                     # streams LDUs for the rest of the call. ALG ID 0x80 / 0x00 = clear, anything else = encrypted.
@@ -3218,6 +3222,10 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 listen_stop("no dongle"); no_dongle_status()
             return
         procs.append(p)
+        for _ in range(40):                  # rtl_tcp says "listening..." once the dongle is open: dsd-fme can connect then
+            if any("listening" in ln for ln in p.err_tail) or p.poll() is not None or LISTEN["gen"] != gen:
+                break
+            time.sleep(0.1)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
@@ -3295,7 +3303,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 break
             if mode in TRUNK_MODES:
                 raw = getattr(p, "call", "")
-                voice = bool(LISTEN["detected"]) and now - getattr(p, "voice_at", 0.0) < 3.0   # LDU frames in the last 3 s, once locked
+                voice = bool(LISTEN["detected"]) and now - getattr(p, "voice_at", 0.0) < 4.5   # LDU frames in the last 4.5 s, once locked
                 active = (bool(raw) and now - p.call_at < 8.0) or voice   # dsd-fme's last grant, or voice right now
                 if active:
                     enc = getattr(p, "enc_now", False) and now - getattr(p, "enc_at", 0.0) < 5.0
@@ -3308,7 +3316,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
                     # the system; the mute is on the bridge's audio frames)
                     cat = tg_category(tg) if tg else ""
                     muted = (TRUNK.get("tg_lock") and tg and tg != TRUNK["tg_lock"]) or (tg in TRUNK.get("tg_avoid") or set()) \
-                        or (TRUNK.get("cats") and tg and cat not in TRUNK["cats"])
+                        or (TRUNK.get("cats") and tg and cat and cat not in TRUNK["cats"])
                     LISTEN["mute"] = bool(muted)
                     if muted and "· muted" not in call:
                         call += " · muted"
@@ -3348,6 +3356,10 @@ def _serve_listen(req: tuple, gen: int) -> None:
                         if cc:
                             a, s, _ = rr_site(cc[2])
                             name = f"{a} ({s})" if s != "?" else a
+                        nac = getattr(p, "nac", "")
+                        if name == "nearest system" and nac:
+                            name = f"unlisted P25 system (NAC {nac})"   # not in the RadioReference pack: named by its NAC
+                        TRUNK.setdefault("learned", {})[round(mhz, 4)] = name
                         cc_save(mhz, mode, name)
                         TRUNK["system"] = name
                         TRUNK["tg_seen"] = []

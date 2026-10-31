@@ -435,6 +435,14 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 {"c":"listen","v":"trunk","mhz":856.9625,"qpsk":true}   // follow a trunked system from this control channel
 {"c":"listen","v":"trunk"}           // …or find the nearest system (hunt); see "Trunked systems" below
 {"c":"listen","v":"trunkauto","on":true,"qpsk":false}   // may Follow take trunked systems by itself; QPSK first?
+{"c":"listen","v":"hold","on":true}      // stay on this trunked system (no 5 s rotation); "on":false releases
+{"c":"listen","v":"skip"}                // leave this system now, go to the next strongest
+{"c":"listen","v":"tglock","tg":1234}    // hear only this talkgroup (0 unlocks); "tgavoid" with "tgs":[...] mutes a list
+{"c":"listen","v":"cats","cats":["police"]}   // category filter, from each talkgroup's RadioReference tag:
+                                     // police / fire / ems / other. Police only by default; [] hears everything;
+                                     // a talkgroup the pack can't classify is always heard. Status carries
+                                     // "cats", "hold", "tglock", "tgavoid", "system", "systems":[...], "tgs":[...].
+{"c":"listen","v":"system","mhz":853.2}  // tune a ranked system by its control channel
 {"c":"listen","v":"scanlist","mhz":[462.5625,155.655]}  // ESP32 analog scanner: the channels Follow steps through
 {"c":"spec","on":true,"lo":851,"hi":869}   // stream the sweep's readings in this window as {"t":"spec"} frames
                                      // about once a second (≤200 bins, one byte each, 0.5 dB from -120 dB);
