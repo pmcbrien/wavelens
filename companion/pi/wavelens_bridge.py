@@ -1592,7 +1592,9 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm:
                 continue                 # a control-channel hunt is waiting on the trunking bands: skip the rest for now
             i = sweep_interval_s(spec)
             sw.settle_until = time.time() + SETTLE_S + i      # first integration after a retune is discarded
-            dwell = max(4, 2 * i) if hunting else max(dwell_s, 2 * i)   # short passes while the hunt counts them
+            # While a hunt counts passes: long enough for the settle window plus five integrations, so one
+            # pass already gives the three readings per bin that sweep_steady needs.
+            dwell = int(SETTLE_S + i * 5) if hunting else max(dwell_s, 2 * i)
             if not run_once(f"rtl_power -f {spec}{dev} -i {i} {(' -g ' + str(gain)) if gain else ''}{(' -p ' + str(ppm)) if ppm else ''} -e {dwell}s -", sw.row, planned=True, stop_when=busy):
                 return
             time.sleep(0.5)         # let the dongle close before the next range opens it
@@ -2070,12 +2072,12 @@ def cc_hunt(first: list) -> None:
             listen_status("trunked: looking for a control channel in the sweep ("
                           + ", ".join(label for _, _, _, label in covered) + ")…")
             while time.time() - t0 < HUNT_FROM_SWEEP_S and not HUNT["cancel"]:
-                ready = True
-                for _, lo, hi, label in covered:
-                    _, n = sweep_steady(lo, hi, time.time())
-                    if n < 3:
-                        ready = False
-                if ready:
+                counts = [sweep_steady(lo, hi, time.time())[1] for _, lo, hi, _ in covered]
+                if all(n >= 3 for n in counts):
+                    break
+                # the 800 MHz band is first in CC_BANDS and is where the answer almost always is: once it has
+                # its readings and shows something steady, don't wait on the rest
+                if counts and counts[0] >= 3 and sweep_steady(covered[0][1], covered[0][2], time.time())[0] and time.time() - t0 > 20:
                     break
                 time.sleep(2.0)
             for _, lo, hi, label in covered:
