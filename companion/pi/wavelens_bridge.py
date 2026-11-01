@@ -2728,6 +2728,9 @@ def cc_hunt(first: list) -> None:
     for r in ranked:
         tries += [(r["mhz"], md) for md in r["modes"]]
     TRUNK["ranked"], TRUNK["ranked_at"] = ranked, time.time()
+    if ranked and RR and RR.sites and state.get("lat") is None and not TRUNK.get("pos_asked"):
+        TRUNK["pos_asked"] = True            # once per run: the phone shows a Share button on the Scanner tab
+        listen_status("scanner: share your position (Scanner tab → Share) so the nearest sites are named and far ones skipped")
     if ranked:
         print("bridge: systems ranked: " + "; ".join(f"{r['mhz']:.4f} (+{r['lvl']:.0f} dB){' ' + r['name'] if r['name'] else ''}" for r in ranked), file=sys.stderr)
     if RR and RR.controls:
