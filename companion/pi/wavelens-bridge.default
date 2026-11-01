@@ -1,17 +1,21 @@
 # /etc/default/wavelens-bridge — settings for wavelens-bridge.service.
 # After editing: sudo systemctl restart wavelens-bridge
 
-# Automatic radio plan. With WAVELENS_AUTO=1 the bridge counts the RTL-SDRs and the HackRF at every start
-# and assigns roles — 1: sensors; 2: + VHF/UHF/800 sweep (listening borrows it); 3: + a dongle of its own
-# for listening; 4: VHF and UHF sweeps on separate dongles; 5+: 900 MHz / 1.2 GHz / GNSS sweep too.
-# WAVELENS_RTL433 then holds only rtl_433's frequencies and gain, and WAVELENS_ARGS only the extras
-# (--hackrf-mask, --fcc-pack, --rr-pack, --name): the sweeps, --listen-device and --hackrf-sweep come
-# from the plan. Set it to 0 to pin everything by hand as below.
-WAVELENS_AUTO=1
+# Radios: nothing to configure. With WAVELENS_AUTO=0 and no radio flags in WAVELENS_ARGS, the bridge itself
+# looks at the USB bus at start and assigns roles by what is there, whatever the serials — 1 RTL-SDR: sensors
+# (rtl_433, run by the bridge); 2: + VHF/UHF/800 sweep (listening borrows it); 3: + a dongle of its own for
+# listening; 4: VHF and UHF sweeps on separate dongles; HackRF: the 1–6000 MHz sweep when one is present —
+# and keeps watching: a dongle or HackRF plugged in later is taken up, one that is unplugged is handed off.
+# The Companion screen's hardware line shows the result. WAVELENS_ARGS then carries only the extras
+# (--rr-pack, --rr-county, --fcc-pack, --hackrf-mask, --name).
+#   WAVELENS_AUTO=1  does the same plan in the shell at each start (older way; no hot-plug)
+#   Naming radios in WAVELENS_ARGS (--rtl-power …@SERIAL, --listen-device, --hackrf-sweep) pins them by hand;
+#   a named dongle that isn't on the bus is still replaced by one that is.
+WAVELENS_AUTO=0
 
-# RTL-SDR decoding with rtl_433. Hops 315 / 433.92 / 915 MHz every 30 s with fixed gain.
-# Leave empty if no RTL-SDR is plugged in. (With WAVELENS_AUTO=1, no -d here: the plan adds it.)
-WAVELENS_RTL433="-f 315M -f 433.92M -f 915M -H 30 -g 40"
+# rtl_433 run by the shell on stdin (only with WAVELENS_AUTO=1 or a -d of your own). Leave empty to let the
+# bridge run rtl_433 itself on the dongle it picks (315 / 433.92 / 915 MHz, 30 s hops, gain 40).
+WAVELENS_RTL433=""
 
 # Extra bridge flags. Examples:
 #   --hackrf-sweep                          HackRF energy sweep of the whole 1 MHz–6 GHz range (~1 s a pass),

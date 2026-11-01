@@ -65,8 +65,66 @@ RX = "57617665-6c65-6e73-0100-000000000003"
 AU = "57617665-6c65-6e73-0100-000000000004"      # device → phone, notify: audio frames while listening
 FW = "wavelens-bridge 0.1"
 
-out: "Queue[str]" = Queue(maxsize=256)
-aout: "Queue[bytes]" = Queue(maxsize=100)       # four seconds of audio; the pump drops the oldest past 1.2 s of lag
+class Outbox:
+    """Everything bound for the phone, in three classes, so a busy link never costs a word of audio and never
+    loses a hit or a journal line either:
+      control  — hello, status, page: small and wanted now; always next after the audio frame in flight.
+      bulk     — rf / wifi / ble hits, journal lines, pager data: queued without limit (BULK_MAX lines, a few
+                 MB) and delivered when the link has room — one chunk per audio frame while a call plays,
+                 flat out between calls. Nothing here is dropped short of the cap, and the cap is logged.
+      spec     — spectrum frames: only the newest matters; a stale one is replaced, never queued.
+    The pump sends the line at the head of a class in ≤180-byte chunks, and after every chunk looks at the
+    audio clock again, so a long journal line can never hold an audio frame past its 40 ms slot."""
+    BULK_MAX = 20000
+    CONTROL_T = ("hello", "status", "page")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.control: "deque[bytes]" = deque()
+        self.bulk: "deque[bytes]" = deque()
+        self.spec: "bytes | None" = None
+        self.dropped = 0
+        self.high_water_said = False
+
+    def put(self, line: str, kind: str = "") -> None:
+        data = line.encode("utf-8")
+        with self.lock:
+            if kind == "spec":
+                self.spec = data
+            elif kind in self.CONTROL_T:
+                self.control.append(data)
+            else:
+                self.bulk.append(data)
+                if len(self.bulk) > self.BULK_MAX:
+                    self.bulk.popleft(); self.dropped += 1
+                    if self.dropped in (1, 1000, 10000):
+                        print(f"bridge: outbox: backlog over {self.BULK_MAX} lines; oldest dropped ({self.dropped} so far)", file=sys.stderr)
+                elif len(self.bulk) == 500 and not self.high_water_said:
+                    self.high_water_said = True
+                    print("bridge: outbox: 500 lines waiting for the link (audio comes first; they will follow)", file=sys.stderr)
+
+    def next(self, bulk_ok: bool) -> "bytes | None":
+        """The next line to send: control first, then the newest spectrum frame, then bulk when allowed."""
+        with self.lock:
+            if self.control:
+                return self.control.popleft()
+            if self.spec is not None:
+                sp, self.spec = self.spec, None
+                return sp
+            if bulk_ok and self.bulk:
+                if self.high_water_said and len(self.bulk) < 50:
+                    self.high_water_said = False
+                    print("bridge: outbox: backlog delivered", file=sys.stderr)
+                return self.bulk.popleft()
+        return None
+
+    def waiting(self) -> int:
+        with self.lock:
+            return len(self.control) + len(self.bulk) + (1 if self.spec is not None else 0)
+
+
+out = Outbox()
+aout: "Queue[bytes]" = Queue(maxsize=200)       # eight seconds of audio; the pump drops the oldest past AUDIO_DROP_S of lag
 state = {"linked": False, "band": "all", "mode": "rf", "ch": "hop", "park": "off", "lat": None, "lon": None, "pos_at": 0.0}
 
 
@@ -77,10 +135,7 @@ def emit(obj: dict) -> None:
     line = json.dumps(obj, separators=(",", ":")) + "\n"
     if ECHO:
         print("sent " + line.rstrip(), file=sys.stderr)
-    try:
-        out.put_nowait(line)
-    except Exception:
-        pass  # full: drop, the next packet will come
+    out.put(line, str(obj.get("t") or ""))
     if obj.get("t") == "rf" and obj.get("src") in ("hackrf", "rtlpower"):
         trunk_note(obj)
         if LISTEN.get("req") is not None:
@@ -3888,7 +3943,7 @@ def feed_stdin(mode: str) -> None:
             feed_rtl433(line)
         else:
             if line.startswith("{"):
-                out.put(line + "\n")
+                out.put(line + "\n")        # a foreign JSON line (kismet): bulk
     if mode == "rtl433":
         # rtl_433 has exited (dongle busy, unplugged, wrong serial). If it died within seconds of start
         # — the sensor dongle isn't there — carry on without sensors rather than restart-loop the whole
@@ -3903,6 +3958,89 @@ def feed_stdin(mode: str) -> None:
             return
         print("bridge: rtl_433 stopped sending; exiting so the service restarts it", file=sys.stderr)
         os._exit(1)
+
+
+def feed_rtl433_child(dev: str, extra: str = "") -> None:
+    """Run rtl_433 ourselves on this dongle (auto plan): restart it when it exits, give up on it for a
+    minute if it can't open the dongle, and keep the rest of the bridge up either way."""
+    cmd = f"rtl_433 -F json -d :{dev} {extra or RTL433_DEFAULT_ARGS}"
+    while True:
+        if dev not in usb_rtl_serials():
+            time.sleep(10); continue
+        p = spawn(cmd)
+        if p is None:
+            print("bridge: rtl_433 not on PATH: no sensor decoding (apt install rtl-433)", file=sys.stderr); return
+        for line in p.stdout:
+            line = line.strip()
+            if line.startswith("{"):
+                feed_rtl433(line)
+        reap(p, cmd)
+        time.sleep(5)
+
+
+RTL433_DEFAULT_ARGS = "-f 315M -f 433.92M -f 915M -H 30 -g 40"
+AUTO = {"on": False, "known": set(), "hackrf": False, "args": None}
+
+
+def hotplug_watch() -> None:
+    """Every 10 s: what radios are on the bus now versus a moment ago. A dongle that appears when nothing
+    is listening becomes the listening/sweep dongle; a HackRF that appears starts sweeping; something that
+    vanishes is said once (the hardware line on the phone shows it too). Serials never matter: the plan
+    is redone from what is present."""
+    a = AUTO["args"]
+    while True:
+        time.sleep(10)
+        try:
+            now_rtl = set(usb_rtl_serials())
+            hk = hackrf_on_usb()
+            gone = AUTO["known"] - now_rtl
+            new = now_rtl - AUTO["known"]
+            for sn in gone:
+                role = "listen" if sn == LISTEN.get("dev") else "a sweep/sensor"
+                print(f"bridge: hotplug: RTL-SDR {sn} ({role} dongle) left the bus", file=sys.stderr)
+                if sn == LISTEN.get("dev"):
+                    spare = [x for x in now_rtl if x != AUTO.get("rtl433")]
+                    if spare:
+                        LISTEN["dev"] = spare[0]
+                        print(f"bridge: hotplug: listening moves to {spare[0]}", file=sys.stderr)
+                        emit({"t": "status", "msg": f"RTL-SDR {sn} unplugged; listening on {spare[0]} now", "band": state["band"], "mode": state["mode"]})
+                    else:
+                        emit({"t": "status", "msg": f"RTL-SDR {sn} unplugged: nothing left to listen with", "band": state["band"], "mode": state["mode"]})
+            for sn in new:
+                print(f"bridge: hotplug: RTL-SDR {sn} appeared", file=sys.stderr)
+                if not LISTEN.get("dev") or LISTEN["dev"] not in now_rtl:
+                    LISTEN["dev"] = sn
+                    if "listen" not in CAPS:
+                        CAPS.extend(["listen", "trunk"])
+                    if a is not None and not any(sn in d for d in SWEEP_DEVS):
+                        specs = SWEEP_VHF + SWEEP_UHF + ["851M:869M:12.5k"]
+                        SWEEP_DEVS.add(sn)
+                        for sp in specs:
+                            SWEEP_RANGES.append((_mhz(sp.split(":")[0]), _mhz(sp.split(":")[1])))
+                        threading.Thread(target=feed_rtl_power, args=(specs, sn, max(3, a.rtl_power_dwell), a.rtl_ppm, a.rtl_gain), daemon=True).start()
+                        if "sweep" not in CAPS:
+                            CAPS.append("sweep")
+                    print(f"bridge: hotplug: {sn} is now the listening + sweep dongle", file=sys.stderr)
+                    emit({"t": "status", "msg": f"RTL-SDR {sn} plugged in: listening and sweeping on it", "band": state["band"], "mode": state["mode"]})
+                    hello()
+                elif AUTO["on"] and not AUTO.get("rtl433") and shutil.which("rtl_433"):
+                    AUTO["rtl433"] = sn
+                    threading.Thread(target=feed_rtl433_child, args=(sn,), daemon=True).start()
+                    print(f"bridge: hotplug: {sn} is now the sensor (rtl_433) dongle", file=sys.stderr)
+                    hello()
+            if hk and not AUTO["hackrf"] and a is not None and not HACKRF_ON:
+                print("bridge: hotplug: HackRF appeared; sweeping 1–6000 MHz with it", file=sys.stderr)
+                globals()["HACKRF_ON"] = True
+                if "sweep" not in CAPS: CAPS.append("sweep")
+                if "park" not in CAPS: CAPS.append("park")
+                hackrf_start(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask, a.hackrf_ppm)
+                hello()
+            AUTO["known"], AUTO["hackrf"] = now_rtl, hk
+        except Exception as e:
+            print(f"bridge: hotplug: {e}", file=sys.stderr)
+
+
+SWEEP_DEVS: "set[str]" = set()
 
 
 # ---------------------------------------------------------------- BLE peripheral
@@ -4230,21 +4368,33 @@ def run_peripheral(name: str) -> None:
     FRAME_S = LISTEN_FRAME / LISTEN_RATE          # 0.040
     AUDIO_PREFILL = 6                             # 240 ms before the first frame leaves
     AUDIO_PREFILL_MAX_S = 0.5
-    AUDIO_DROP_S = 1.2                            # the queue never holds more than this much lag
-    AUDIO_JSON_GAP = 2
-    pace = {"next": 0.0, "primed": False, "first_at": 0.0, "since_json": 0}
+    AUDIO_DROP_S = 2.0                            # the queue never holds more than this much lag (then the oldest go)
+    CHUNK = 180                                   # under a 247-byte MTU; the app reassembles on newline
+    pace = {"next": 0.0, "primed": False, "first_at": 0.0, "cur": b"", "pos": 0}
 
-    def send_json_line(line: str) -> None:
+    def audio_due(now: float) -> bool:
+        return chars.get("au") is not None and pace["primed"] and now >= pace["next"] - 0.004 and aout.qsize() > 0
+
+    def send_chunk() -> bool:
+        """One ≤180-byte chunk of the line in progress (taking the next line when none is). False if nothing to send."""
         tx = chars.get("tx")
         if tx is None:
-            return
-        data = line.encode("utf-8")
-        for i in range(0, len(data), 180):      # under a 247-byte MTU; the app reassembles on newline
-            try:
-                tx.set_value(list(data[i:i + 180]))
-            except Exception:
-                break
-            time.sleep(0.005)
+            return False
+        if pace["pos"] >= len(pace["cur"]):
+            # bulk goes only when the audio isn't behind its clock: a call in progress keeps the link for itself
+            behind = pace["primed"] and aout.qsize() > AUDIO_PREFILL + 2
+            nxt = out.next(bulk_ok=not behind)
+            if nxt is None:
+                return False
+            pace["cur"], pace["pos"] = nxt, 0
+        end = min(pace["pos"] + CHUNK, len(pace["cur"]))
+        try:
+            tx.set_value(list(pace["cur"][pace["pos"]:end]))
+        except Exception:
+            pace["cur"], pace["pos"] = b"", 0          # link gone mid-line: the rest is lost with the link
+            return False
+        pace["pos"] = end
+        return True
 
     def pump():
         while True:
@@ -4259,8 +4409,7 @@ def run_peripheral(name: str) -> None:
                         pace["primed"] = True
                         pace["next"] = now
                 if pace["primed"] and now >= pace["next"]:
-                    # too far behind: drop the oldest frames so the lag stays under AUDIO_DROP_S
-                    while aout.qsize() > int(AUDIO_DROP_S / FRAME_S):
+                    while aout.qsize() > int(AUDIO_DROP_S / FRAME_S):   # far behind: the oldest frames go
                         try:
                             aout.get_nowait()
                         except Empty:
@@ -4271,32 +4420,24 @@ def run_peripheral(name: str) -> None:
                         frame = None
                     if frame is not None:
                         try:
-                            au.set_value(list(frame))     # one 164-byte frame per notification, under a 247-byte MTU
+                            au.set_value(list(frame))     # one 164-byte frame per notification
                         except Exception:
                             pass
                         pace["next"] += FRAME_S
-                        if pace["next"] < now - FRAME_S:  # we fell behind the clock (a slow notify): resync
+                        if pace["next"] < now - FRAME_S:  # fell behind the clock (a slow notify): resync
                             pace["next"] = now
-                        pace["since_json"] += 1
-                # a JSON line between frames, when one is waiting and it's its turn
-                if pace["since_json"] >= AUDIO_JSON_GAP:
-                    try:
-                        line = out.get_nowait()
-                    except Empty:
-                        line = None
-                    if line is not None:
-                        pace["since_json"] = 0
-                        send_json_line(line)
+                # the gap until the next frame is for one JSON chunk — control first, bulk if the audio is keeping up
+                if not audio_due(time.monotonic()):
+                    send_chunk()
                 time.sleep(0.002)
                 continue
             if au is not None and not n and pace["primed"]:
-                # the queue ran dry (squelch closed, call ended): re-prime for the next burst
-                pace["primed"], pace["first_at"] = False, 0.0
-            try:
-                line = out.get(timeout=0.02 if au is not None else 0.5)
-            except Empty:
-                continue
-            send_json_line(line)
+                pace["primed"], pace["first_at"] = False, 0.0   # the burst ended: re-prime for the next
+            # no audio: drain everything, a chunk at a time, pausing only when there is nothing to send
+            if not send_chunk():
+                time.sleep(0.02 if au is not None else 0.1)
+            else:
+                time.sleep(0.004)
 
     threading.Thread(target=pump, daemon=True).start()
     print(f"{FW}: advertising as {name!r} on {dongle.address}  (pair code {code})", file=sys.stderr)
@@ -4431,6 +4572,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--rtl433", action="store_true", help="stdin is rtl_433 -F json")
     ap.add_argument("--hackrf-sweep", action="store_true", help="run hackrf_sweep and report carriers by band")
+    ap.add_argument("--auto", action="store_true", help="plan the radios from what is on the USB bus (the default when no "
+                    "--rtl-power / --listen-device / --hackrf-sweep / --rtl433 is given): rtl_433 on the first RTL-SDR, "
+                    "sweeps + listening on the next, HackRF if present; dongles plugged in later are taken up")
     ap.add_argument("--hackrf-range", default="1:6000", help="MHz range for hackrf_sweep (default 1:6000, the whole range)")
     ap.add_argument("--hackrf-bin", type=int, default=500000, help="bin width Hz (default 500000)")
     ap.add_argument("--portapack-port", metavar="TTY", default="",
@@ -4516,7 +4660,28 @@ def main() -> None:
     globals()["TRUNK_IDLE_S"] = max(2.0, a.trunk_idle)
     globals()["TRUNK_HOLD_S"] = max(2.0, a.trunk_idle)
     globals()["TRUNK_MIN_DB"] = a.trunk_min_db
-    if a.hackrf_sweep or a.rtl_power:
+    AUTO["args"] = a
+    if a.auto or not (a.rtl_power or a.listen_device or a.hackrf_sweep or a.rtl433):
+        # Nothing names a radio: look at the bus and take what is there, whatever its serial. Re-done at
+        # every start and (by hotplug_watch) while running. --rtl433 from the shell pipe still wins when given.
+        AUTO["on"] = True
+        rtls, hackrf = probe_radios()
+        plan = plan_radios(rtls, hackrf)
+        for dev, role in plan["roles"]:
+            print(f"bridge: auto: RTL-SDR {dev} → {role}", file=sys.stderr)
+        print(f"bridge: auto: HackRF {'found' if hackrf else 'not found'}; {len(rtls)} RTL-SDR(s)", file=sys.stderr)
+        if plan["rtl433"] and not a.rtl433 and shutil.which("rtl_433"):
+            AUTO["rtl433"] = plan["rtl433"]
+            CAPS.append("rf")
+            threading.Thread(target=feed_rtl433_child, args=(plan["rtl433"],), daemon=True).start()
+        a.rtl_power = a.rtl_power or plan["sweeps"]
+        a.listen_device = a.listen_device or plan["listen"]
+        a.hackrf_sweep = a.hackrf_sweep or hackrf
+        if not rtls and not hackrf:
+            print("bridge: auto: no radio on the bus yet — waiting; plug one in and it is taken up", file=sys.stderr)
+    AUTO["known"] = set(usb_rtl_serials()); AUTO["hackrf"] = hackrf_on_usb()
+    threading.Thread(target=hotplug_watch, daemon=True).start()
+    if a.hackrf_sweep or a.rtl_power or AUTO["on"]:
         threading.Thread(target=spec_pump, daemon=True).start()
     if a.hackrf_sweep:
         HACKRF_ON = True
@@ -4543,6 +4708,7 @@ def main() -> None:
                 except (ValueError, IndexError):
                     pass
         for dev, specs in groups.items():
+            SWEEP_DEVS.add(dev)
             threading.Thread(target=feed_rtl_power, args=(specs, dev, max(3, a.rtl_power_dwell), a.rtl_ppm, a.rtl_gain), daemon=True).start()
         if not a.listen_device:
             a.listen_device = next((d for d in groups if d), "")
