@@ -2343,7 +2343,7 @@ def tg_category(tg: int) -> str:
         if any(w in text for w in words):
             return cat
     return "other"
-HUNT = {"on": False, "cancel": False, "sweeping": False}
+HUNT = {"on": False, "cancel": False, "sweeping": False, "gen": 0}
 TRUNK_KINDS = ("p25", "dmr", "nxdn", "edacs", "moto")
 # Where control channels live: the base-station (output) side of the trunking bands, 800 MHz first
 # (most US public-safety P25 systems), then 700 MHz, 900 MHz, UHF and VHF.
@@ -2607,14 +2607,21 @@ def trunk_try(tries: list, what: str) -> None:
 def cc_hunt(first: list) -> None:
     """Scan the trunking bands on the listening dongle for carriers that are on in every reading (a control
     channel transmits continuously; voice channels and conventional repeaters come and go), strongest first."""
+    HUNT["gen"] += 1
+    my_gen = HUNT["gen"]                  # a hunt started after this one supersedes it: the old thread bows out
     HUNT["on"], HUNT["cancel"] = True, False
     TRUNK["hunted"] = True
     found = []
+
+    def cancelled() -> bool:
+        return HUNT["cancel"] or HUNT["gen"] != my_gen
+
     try:
         # First: the bands the running rtl_power sweep already covers. Its passes are the measurement —
         # no second rtl_power, no fight over the dongle (two processes on one RTL-SDR left it wedged).
         # Wait for three passes of each covered band, up to HUNT_FROM_SWEEP_S.
         covered = [(spec, lo, hi, label) for spec, lo, hi, label in CC_BANDS if sweep_covers(lo, hi)]
+        probe_extra = []
         if covered:
             # the sweep must keep running for this: "sweeping" tells listen_busy not to hold the dongle, and
             # tells the sweep to concentrate on the trunking bands with short dwells until the hunt is done
@@ -2622,7 +2629,7 @@ def cc_hunt(first: list) -> None:
             t0 = time.time()
             listen_status("trunked: looking for a control channel in the sweep ("
                           + ", ".join(label for _, _, _, label in covered) + ")…")
-            while time.time() - t0 < HUNT_FROM_SWEEP_S and not HUNT["cancel"]:
+            while time.time() - t0 < HUNT_FROM_SWEEP_S and not cancelled():
                 counts = [sweep_steady(lo, hi, time.time())[1] for _, lo, hi, _ in covered]
                 if all(n >= 3 for n in counts):
                     break
@@ -2631,16 +2638,36 @@ def cc_hunt(first: list) -> None:
                 if counts and counts[0] >= 3 and sweep_steady(covered[0][1], covered[0][2], time.time())[0] and time.time() - t0 > 20:
                     break
                 time.sleep(2.0)
+            stale_bands = []
             for _, lo, hi, label in covered:
                 here, n = sweep_steady(lo, hi, time.time())
+                if n < 3:
+                    # No fresh passes of this band: the sweep was off the dongle (listening borrows it) or
+                    # has not got round to it. Not evidence of silence — carry over what the last hunt
+                    # heard here (within the ranking's lifetime) and the system being listened to now,
+                    # rather than yanking a working lock for a band that merely wasn't measured.
+                    old = [(r["mhz"], r["lvl"]) for r in (TRUNK.get("ranked") or [])
+                           if lo <= r["mhz"] < hi and time.time() - TRUNK.get("ranked_at", 0.0) < 3 * TRUNK_RANK_TTL_S]
+                    if LISTEN["proc"] is not None and LISTEN["mode"] in TRUNK_MODES and lo <= LISTEN["mhz"] < hi \
+                            and all(abs(LISTEN["mhz"] - m) > 0.02 for m, _ in old):
+                        old.append((LISTEN["mhz"], 99.0))          # the one we're on outranks a remembered one
+                    here = old
+                    stale_bands.append(label)
                 here = [(m, lvl) for m, lvl in here if all(abs(m - f) > 0.02 for f, _ in found)]
-                print(f"bridge: control-channel hunt: {label} (sweep, {n} passes): {len(here)} steady"
+                print(f"bridge: control-channel hunt: {label} (sweep, {n} passes{', kept from last hunt' if n < 3 else ''}): {len(here)} steady"
                       + (" — " + ", ".join(f"{m:.4f} (+{l:.0f} dB)" for m, l in sorted(here, key=lambda c: -c[1])[:4]) if here else ""),
                       file=sys.stderr)
                 found += here
             HUNT["sweeping"] = False
+            if stale_bands and not found and not cancelled():
+                # Nothing remembered either: measure the unmeasured bands directly (takes the dongle).
+                probe_extra = [(spec, lo, hi, label) for spec, lo, hi, label in CC_BANDS if label in stale_bands]
+            else:
+                probe_extra = []
         probe = [(spec, lo, hi, label) for spec, lo, hi, label in CC_BANDS if not sweep_covers(lo, hi)]
-        if probe and not found and not HUNT["cancel"]:
+        if covered:
+            probe = probe_extra + probe
+        if probe and not found and not cancelled():
             # Bands no sweep covers, and nothing steady yet: probe them with rtl_power. This is the path
             # that has to take the dongle from the sweep, so it is the last resort.
             free_dongle(LISTEN["dev"])
@@ -2649,7 +2676,7 @@ def cc_hunt(first: list) -> None:
         dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
         ppm = f" -p {LISTEN['ppm']}" if LISTEN["ppm"] else ""
         for spec, lo, hi, label in probe:
-            if HUNT["cancel"] or len(found) >= CC_MAX_TRIES:
+            if cancelled() or len(found) >= CC_MAX_TRIES:
                 break
             listen_status(f"trunked: looking for a control channel, {label} ({lo:g}–{hi:g} MHz)…")
             rows, err = [], ""
@@ -2667,7 +2694,7 @@ def cc_hunt(first: list) -> None:
                     return
                 except subprocess.TimeoutExpired:
                     rows = []
-                if rows or HUNT["cancel"]:
+                if rows or cancelled():
                     break
                 time.sleep(1.0)
             if not rows:
@@ -2683,8 +2710,9 @@ def cc_hunt(first: list) -> None:
         print("bridge: control-channel hunt: " + (", ".join(f"{m:.4f} (+{l:.0f} dB)" for m, l in found[:CC_MAX_TRIES]) or "nothing steady"),
               file=sys.stderr)
     finally:
-        HUNT["on"], HUNT["sweeping"] = False, False
-    if HUNT["cancel"]:
+        if HUNT["gen"] == my_gen:
+            HUNT["on"], HUNT["sweeping"] = False, False
+    if cancelled():
         return
     tries = list(first)
     # Like a scanner: the strongest steady carrier first, then the next. The RadioReference list only
@@ -4508,7 +4536,7 @@ def plan_radios(rtls, hackrf) -> dict:
     the app's TPMS / sensor side needs. Then the VHF/UHF sweeps, then a dongle of its own for listening,
     then the two sweeps on separate dongles, then the ISM / video / GNSS ranges.
       1  rtl_433
-      2  rtl_433 · VHF+UHF+800 sweep (listening borrows it)
+      2  VHF+UHF+800 sweep · listen (no sensors: the scanner needs both)
       3  rtl_433 · VHF+UHF+800 sweep · listen
       4  rtl_433 · VHF sweep · UHF+800 sweep · listen
       5+ … · 900 MHz / 1.2 GHz / GNSS sweep
@@ -4532,8 +4560,16 @@ def plan_radios(rtls, hackrf) -> dict:
     if n >= 1:
         plan["rtl433"] = ids[0]; plan["roles"].append((ids[0], "rtl_433 sensors (TPMS, 315/433/915 MHz)"))
     if n == 2:
-        plan["sweeps"] += [f"{r}@{ids[1]}" for r in SWEEP_VHF + SWEEP_UHF]
-        plan["listen"] = ids[1]; plan["roles"].append((ids[1], "VHF + UHF + 800 sweep; listening borrows it"))
+        # The scanner needs two dongles at once: the sweep keeps measuring the trunking bands (that is how
+        # the control-channel hunt and the rotation know what is on air) while the other one decodes. Sharing
+        # one left the hunt with stale readings whenever it was listening, and rtl_fm and rtl_power fighting
+        # over the USB device (usb_claim_interface -6). So with two, no sensor decoder: it comes back with a
+        # third dongle, or name one with WAVELENS_RTL433 to keep sensors and share the other.
+        plan["rtl433"] = ""; plan["roles"] = []
+        plan["sweeps"] += [f"{r}@{ids[0]}" for r in SWEEP_VHF + SWEEP_UHF]
+        plan["listen"] = ids[1]
+        plan["roles"] += [(ids[0], "VHF + UHF + 800 sweep"), (ids[1], "listen / Follow / trunking"),
+                          ("", "no rtl_433 sensors with two dongles (a third brings them back)")]
     elif n == 3:
         plan["sweeps"] += [f"{r}@{ids[1]}" for r in SWEEP_VHF + SWEEP_UHF]
         plan["listen"] = ids[2]
@@ -4556,7 +4592,7 @@ def print_plan_shell(extra_hackrf: str) -> None:
     rtls, hackrf = probe_radios()
     plan = plan_radios(rtls, hackrf)
     for dev, role in plan["roles"]:
-        print(f"bridge: plan: RTL-SDR {dev} → {role}", file=sys.stderr)
+        print(f"bridge: plan: {'RTL-SDR ' + dev + ' → ' if dev else ''}{role}", file=sys.stderr)
     print(f"bridge: plan: HackRF {'found → 1–6000 MHz sweep' if hackrf else 'not found'}; {len(rtls)} RTL-SDR(s) by {plan['by']}", file=sys.stderr)
     args = []
     for sp in plan["sweeps"]:
@@ -4671,7 +4707,7 @@ def main() -> None:
         rtls, hackrf = probe_radios()
         plan = plan_radios(rtls, hackrf)
         for dev, role in plan["roles"]:
-            print(f"bridge: auto: RTL-SDR {dev} → {role}", file=sys.stderr)
+            print(f"bridge: auto: {'RTL-SDR ' + dev + ' → ' if dev else ''}{role}", file=sys.stderr)
         print(f"bridge: auto: HackRF {'found' if hackrf else 'not found'}; {len(rtls)} RTL-SDR(s)", file=sys.stderr)
         if plan["rtl433"] and not a.rtl433 and shutil.which("rtl_433"):
             AUTO["rtl433"] = plan["rtl433"]
