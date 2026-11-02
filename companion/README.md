@@ -352,6 +352,30 @@ tagged by `src`; it gets the same `mode` / `band` / `ch` / `park` commands as th
 `log` and audio are never sent to it. Both reconnect on their own. A companion's own advertisement is never
 adopted as the other link.
 
+**The Pi is always the main one.** Each link remembers the caps from its last hello; whenever the second link
+reports a better scanner (`trunk` > `listen` > `sweep`) than the main one — or the main slot is empty — the app
+swaps the two pairings and reconnects. Pair them in any order; an ESP32 paired first ends up as the sniffer,
+not driving the Scanner tab. The journal says `companion roles: … is now the main companion` when it happens.
+
+### Who hears what
+
+Nothing is handed off: every radio in the car listens, and their hits merge in the phone by address (strongest
+signal wins, same device on Live and Alerts whichever radio heard it).
+
+| | Phone | ESP32 (second companion) | Pi + RTL-SDR (main companion) |
+|---|---|---|---|
+| Body cams, cruiser routers, in-car video, doorbells (Wi-Fi / BLE) | yes — always, as before | yes — same frames, same signatures, same *Confirmed* / *Likely* rules | no (no Wi-Fi/BLE sniffing; its Bluetooth is the link to the phone) |
+| Trackers, phones, wearables, drones (Remote ID) | yes | yes | no |
+| Licensed radio: keying up, repeaters, trunked systems, the scanner | no | no | yes — the sweep, Listen, Follow, trunking, the FCC pack |
+| Tyre-pressure and other 315/433/915 MHz sensors | no | no | with a third dongle (rtl_433) |
+| Riding-with-you / following-you, second-pass gate (fixed vs moving) | the phone's GPS track decides, whichever radio heard the device | | |
+
+What the ESP32 adds for body cams is **position and timing**, not a different detector: on the dash or roof with
+a directional antenna it hears a camera before the phone in a pocket does; with *Park for body cams & radios*
+it sits on Wi-Fi channels 1 · 6 · 11 with BLE on, so an advertisement is caught within a second instead of when
+the phone's hop lands on that channel (Android sets the phone's scan schedule, and throttles it with the
+screen off — the ESP32 never throttles).
+
 ## Pairing
 
 1. Power the companion near the phone. It blinks twice, then advertises the Wavelens
