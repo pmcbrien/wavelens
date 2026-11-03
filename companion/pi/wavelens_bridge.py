@@ -54,6 +54,19 @@ import sys
 import threading
 import time
 from queue import Queue, Empty
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import regions as region_packs   # noqa: E402  (companion/pi/regions.py)
+except ImportError:                  # an install that predates region packs: US tables only
+    class region_packs:              # noqa: N801
+        DIRS = []
+        @staticmethod
+        def find(code): return None
+        @staticmethod
+        def table(pack, base): return base
+        @staticmethod
+        def rtl433_args(pack, default): return default
 try:
     import audioop                   # C-speed mixing/resampling; gone in Python 3.13 (the Pi images have it)
 except ImportError:
@@ -287,7 +300,7 @@ def hello() -> None:
     else:
         spec = None
     msg = {"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""),
-           "caps": sorted(set(CAPS)), "hw": hw}
+           "caps": sorted(set(CAPS)), "hw": hw, "region": REGION["code"]}
     if spec:
         msg["spec"] = spec
     emit(msg)
@@ -1083,6 +1096,39 @@ RTL_STALL_S = 20.0      # rtl_power reports every second or two; this long with 
 
 
 _band_cache = {}
+# The table band_of reads: BANDS, or the active region pack's bands ahead of it (regions.py).
+REGION = {"code": "US", "pack": None}
+ACTIVE_BANDS = BANDS
+
+
+def set_region(code: str, announce: bool = True) -> None:
+    """Switch the band names and rtl_433 frequencies to a region pack. A code with no pack on this
+    bridge keeps the US tables and says so."""
+    global ACTIVE_BANDS
+    code = (code or "US").upper()[:2]
+    if code == REGION["code"] and (REGION["pack"] is not None or code == "US"):
+        return
+    pack = region_packs.find(code)
+    old_args = region_packs.rtl433_args(REGION["pack"], RTL433_DEFAULT_ARGS)
+    if pack is None and code != "US":
+        if announce:
+            emit({"t": "status", "msg": f"no {code} region pack on this bridge: keeping US band names "
+                                        f"(copy region-{code.lower()}.json to /etc/wavelens/regions/)",
+                  "band": state["band"], "mode": state["mode"]})
+        print(f"bridge: region {code}: no pack found in {', '.join(region_packs.DIRS)}", file=sys.stderr)
+        code = "US"
+    REGION["code"], REGION["pack"] = code, pack
+    ACTIVE_BANDS = region_packs.table(pack, BANDS)
+    _band_cache.clear()
+    print(f"bridge: region {code}" + (f" from {pack['_path']}" if pack else " (built-in US tables)"), file=sys.stderr)
+    if region_packs.rtl433_args(pack, RTL433_DEFAULT_ARGS) != old_args:
+        p = RTL433_CHILD.get("p")
+        if p is not None and p.poll() is None:
+            p.terminate()              # feed_rtl433_child restarts it with the region's frequencies
+    if announce and pack is not None:
+        emit({"t": "status", "msg": f"region {code}: {pack.get('name', code)} band names"
+                                    + (" (in testing)" if pack.get("status") == "testing" else ""),
+              "band": state["band"], "mode": state["mode"]})
 
 
 def band_of(mhz: float):
@@ -1090,7 +1136,7 @@ def band_of(mhz: float):
     k = round(mhz * 1000)
     b = _band_cache.get(k)
     if b is None:
-        for e in BANDS:
+        for e in ACTIVE_BANDS:
             if e["lo"] <= mhz <= e["hi"]:
                 b = e
                 break
@@ -3994,11 +4040,12 @@ def feed_stdin(mode: str) -> None:
 def feed_rtl433_child(dev: str, extra: str = "") -> None:
     """Run rtl_433 ourselves on this dongle (auto plan): restart it when it exits, give up on it for a
     minute if it can't open the dongle, and keep the rest of the bridge up either way."""
-    cmd = f"rtl_433 -F json -d :{dev} {extra or RTL433_DEFAULT_ARGS}"
     while True:
         if dev not in usb_rtl_serials():
             time.sleep(10); continue
+        cmd = f"rtl_433 -F json -d :{dev} {extra or region_packs.rtl433_args(REGION['pack'], RTL433_DEFAULT_ARGS)}"
         p = spawn(cmd)
+        RTL433_CHILD["p"] = p
         if p is None:
             print("bridge: rtl_433 not on PATH: no sensor decoding (apt install rtl-433)", file=sys.stderr); return
         for line in p.stdout:
@@ -4010,6 +4057,7 @@ def feed_rtl433_child(dev: str, extra: str = "") -> None:
 
 
 RTL433_DEFAULT_ARGS = "-f 315M -f 433.92M -f 915M -H 30 -g 40"
+RTL433_CHILD = {"p": None}       # the rtl_433 the auto plan runs, so a region change can restart it
 AUTO = {"on": False, "known": set(), "hackrf": False, "args": None}
 
 
@@ -4214,6 +4262,8 @@ def run_peripheral(name: str) -> None:
             else:
                 msg = "sweeping the full range"
             emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"], "park": state["park"]})
+        elif c == "region":
+            set_region(str(cmd.get("v") or "US"))
         elif c == "pages":
             LISTEN["pages"] = bool(cmd.get("v", True))
             emit({"t": "status", "msg": "pager decoding " + ("on" if LISTEN["pages"] else "off"), "band": state["band"], "mode": state["mode"]})
@@ -4664,6 +4714,9 @@ def main() -> None:
     ap.add_argument("--rr-county", metavar="NAME", action="append", default=[],
                     help="county (repeatable) whose rows in a statewide export rank ahead of other counties'")
     ap.add_argument("--echo", action="store_true", help="print every line sent to the phone on stderr (see it with journalctl -u wavelens-bridge -f)")
+    ap.add_argument("--region", default=os.environ.get("WAVELENS_REGION", "US"),
+                    help="region pack to start with (two-letter code; the phone's choice replaces it on connect). "
+                         "Packs are read from /etc/wavelens/regions, ~/.config/wavelens/regions and regions/ beside this script")
     ap.add_argument("--name", default="", help="advertised name (default Wavelens-XXXX from the adapter address)")
     ap.add_argument("--plan", action="store_true",
                     help="print shell assignments (PLAN_RTL433_DEV, PLAN_ARGS) for the radios found, and exit; run-bridge.sh uses it when WAVELENS_AUTO=1")
@@ -4678,6 +4731,7 @@ def main() -> None:
 
     global FCC, RR, ECHO, HACKRF_ON
     ECHO = a.echo
+    set_region(a.region, announce=False)
     if a.fcc_pack:
         FCC = FccPack(a.fcc_pack)
         CAPS.append("fcc")
