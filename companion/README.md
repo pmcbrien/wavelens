@@ -332,7 +332,7 @@ The full step-by-step guide, with every command, is on the website:
 `companion/desktop/wavelens_scanner.py` is the app's Scanner tab as a Windows / Mac / Linux window: the
 frequency and talkgroup being heard, the ranked systems (double-click to tune one), the spectrum around the
 channel (click to listen there), recent calls (double-click to lock a talkgroup), the companion journal,
-SCAN / STOP / HOLD / SKIP, the POLICE / FIRE / EMS / OTHER filter and the hand-off time, with Listen audio
+SCAN / STOP / HOLD / SKIP, the PUBLIC SAFETY / FIRE / EMS / OTHER filter and the hand-off time, with Listen audio
 through the speakers. `pip install bleak sounddevice`, then `python wavelens_scanner.py`
 (`--demo` shows the window with a scripted session and no radio). Needs tkinter — included with
 python.org's installers; `apt install python3-tk` on Debian/Ubuntu.

@@ -355,8 +355,28 @@ def hw_inventory() -> dict:
     parts.append({"ok": "HackRF", "portapack": "HackRF (PortaPack menu)", "none": "no HackRF"}[hackrf])
     if esp:
         parts.append(f"ESP32 on USB ({len(esp)})")
+    ip = admin_address()
+    if ip:
+        parts.append(f"admin http://{ip}:8080")     # the Pi's admin page, for people whose phone can't resolve .local
     hw["line"] = " · ".join(parts) + (" — " + "; ".join(missing) if missing else "")
     return hw
+
+
+_ADMIN = {"at": 0.0, "ip": ""}
+
+
+def admin_address() -> str:
+    """The Pi's first LAN address, if the admin service is enabled (checked once a minute)."""
+    if time.time() - _ADMIN["at"] > 60:
+        _ADMIN["at"] = time.time()
+        _ADMIN["ip"] = ""
+        try:
+            if os.path.exists("/etc/systemd/system/wavelens-admin.service"):
+                out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=3).stdout.split()
+                _ADMIN["ip"] = next((a for a in out if "." in a and not a.startswith("127.")), "")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return _ADMIN["ip"]
 
 
 def hello() -> None:

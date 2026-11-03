@@ -1,0 +1,68 @@
+# Keeping a Wavelens companion up to date
+
+Updates are free for life, for the Spotter (ESP32) and the Scanner (Raspberry Pi) alike, whether you bought
+one from us or built your own from this folder. Nothing phones home: a companion only reaches the network
+when you ask it to update, and the phone app never does (it has no network permission).
+
+One version number covers everything: `companion/VERSION` (a date, e.g. `2026.11.03`). The Pi bridge, the
+ESP32 firmware and the app's bundled firmware all report it, so "is it current?" is one comparison. The app's
+Companion screen shows the companion's version next to its name.
+
+## Spotter (ESP32): three ways
+
+| Way | Needs | How |
+|---|---|---|
+| **From the phone** (the usual way) | nothing but the app | *More → Companion radio*. When the app carries a newer firmware than the Spotter reports, an **Update firmware** button appears. Tap it; the image goes over Bluetooth in about a minute, the Spotter reboots into it and reconnects by itself. Don't unplug it while the bar is moving. |
+| **From a browser** | a computer with Chrome or Edge, a data USB cable | https://pmcbrien.github.io/wavelens/flash/ — plug in, click *Install*, pick the port. Also the way to put Wavelens on a blank ESP32 board, and the way to bring a Spotter with pre-2026.11 firmware (no Bluetooth updates yet) up to date once. |
+| **From a Scanner Pi** | a Scanner, a USB cable | Plug the Spotter into the Pi's USB, open the Pi's admin page (`http://wavelens.local:8080` → *Spotter*), *Flash*. The Pi keeps the current firmware image from its own updates. |
+
+Command line, if you'd rather: `pip install esptool`, then
+`esptool.py --chip esp32 write_flash 0x0 wavelens-esp32-merged.bin` (image on the
+[firmware release](https://github.com/pmcbrien/wavelens/releases/tag/firmware)).
+
+How the Bluetooth update is safe: the firmware has two slots (OTA partitions). The new image is written to
+the spare slot and verified before the board switches to it; if it ever fails to boot, the bootloader
+falls back to the one that was running. A cancelled or interrupted update leaves the old firmware in
+place.
+
+Where the firmware comes from: every change to `companion/esp32/` on `main` is built by CI
+(`.github/workflows/firmware.yml`) and published as the rolling **firmware** release on this repo, plus a
+`firmware-<version>` tag you can go back to. The Android build downloads the same image into the app, so a
+new app release carries the newest firmware.
+
+## Scanner (Raspberry Pi): four ways
+
+The Pi updates itself from this repository with `wavelens-update`, over its own Wi-Fi. Join it to your home
+Wi-Fi once (admin page → *Wi-Fi*, or `nmtui` at the console).
+
+| Way | How |
+|---|---|
+| **From the phone** | *More → Companion radio*: **Check for updates**, then **Install update** when one is waiting. The Pi reports "update available" in its hello, so the app shows it without asking. About a minute; the bridge restarts and the phone reconnects. **Roll back** puts the previous version back. |
+| **From the admin page** | `http://wavelens.local:8080` → *Update*: the same three buttons with the live log, plus a switch for **automatic overnight updates**. |
+| **Automatically** | A systemd timer (`wavelens-update.timer`) checks every night between 03:00 and 04:00 and 10 minutes after every boot. It only *installs* when `WAVELENS_AUTO_UPDATE=1` is set in `/etc/default/wavelens-bridge` (the admin page's switch), and never while a phone is connected. |
+| **At the console** | `sudo wavelens-update check` / `apply` / `rollback` / `status`. The old `companion/pi/update.sh` still works and now calls the same tool. |
+
+What an update does, in order: `git fetch` + fast-forward of the checkout (`/etc/wavelens/source` says
+where it is), a copy of the current install to `/usr/local/lib/wavelens.prev`, install of the bridge, the
+admin page, the region packs, `VERSION` and the Spotter firmware image, `systemctl restart wavelens-bridge`,
+then a health check: if the bridge isn't up and advertising within 20 s, it rolls back by itself and tells
+you. Your settings (`/etc/default/wavelens-bridge`), RadioReference packs and the admin password are never
+touched. The record of the last check lives in `/var/lib/wavelens/update.json`.
+
+## A fresh Pi, the way we ship them
+
+`companion/pi/provision.sh` (run with sudo on a fresh Raspberry Pi OS) installs the packages, clones the public repo to `/opt/wavelens`, sets the hostname to `wavelens`, and runs `install-service.sh` — bridge, updater, nightly timer and admin page in one go. Digital voice is the separate `install-dsd.sh` (longer build, patent notice).
+
+## Everything else on the Pi
+
+The operating system and the radio tools (`rtl_433`, `rtl-sdr`, `dsd-fme`) are not touched by
+`wavelens-update`; `sudo apt update && sudo apt full-upgrade` once in a while is the usual Raspberry Pi OS
+advice, and the admin page's *Power → Reboot* afterwards.
+
+## For the person releasing
+
+1. Change what you need under `companion/`, bump `companion/VERSION` to today's date, push to `main`.
+2. CI mirrors `companion/` to the public repo (`android.yml`), builds the ESP32 image and publishes the
+   firmware release (`firmware.yml`), and the next app build bundles it.
+3. Every Pi that checks tonight sees the new version; phones see it the next time they connect to one.
+   The ESP32 image reaches phones with the next app release on Google Play.
