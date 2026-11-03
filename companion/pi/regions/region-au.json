@@ -3,16 +3,65 @@
   "format": 1,
   "region": "AU",
   "name": "Australia",
-  "pack_version": 1,
+  "pack_version": 2,
   "pack_date": "2026-11-02",
   "status": "testing",
   "summary": "Australian band names from the ACMA spectrum plan, 433 MHz tyre sensors and fobs, km/h, and Australian plate-reader signatures. In testing with drivers in Australia: expect mislabels and report them.",
   "units": "metric",
-  "scanner_idle": [403, 430],
-  "disable_rules": [],
-  "rules": [],
+  "scanner_idle": [
+    403,
+    430
+  ],
+  "disable_rules": [
+    "redflex-oui",
+    "sensys-gatso-oui",
+    "jenoptik-oui",
+    "decatur-radar-oui"
+  ],
+  "rules": [
+    {
+      "id": "genetec-autovu-au",
+      "category": "ALPR",
+      "confidence": "POSSIBLE",
+      "weight": 79,
+      "verified": true,
+      "note": "Genetec Inc. (Montreal) MA-L blocks. In Australia Genetec AutoVu Sharp plate readers run parking enforcement and car-park access. The same registrant ships Security Center servers, access control and ordinary CCTV, so a hit means Genetec hardware, not necessarily a plate reader. Weight sits under enterprise-camera-oui (80) so the card keeps CAMERA and gains this note. 00:0A:B1 (GENETEC Corporation, Japan) is a different company and excluded",
+      "source": "https://standards-oui.ieee.org/oui/oui.txt (00-BF-15, 0C-BF-15) ; https://www.genetec.com/customer-stories/first-parking",
+      "checked": "ieee-2026-10-18",
+      "regions": [
+        "AU"
+      ],
+      "match": {
+        "ouis": [
+          "00:BF:15",
+          "0C:BF:15"
+        ],
+        "publicAddr": true
+      }
+    },
+    {
+      "id": "adaptive-recognition-au",
+      "category": "ALPR",
+      "confidence": "POSSIBLE",
+      "weight": 30,
+      "verified": true,
+      "note": "Adaptive Recognition Hungary (Carmen ANPR engine, Vidar/MicroCam ANPR cameras). The same registrant makes passport/document readers, so POSSIBLE",
+      "source": "https://standards-oui.ieee.org/oui/oui.txt (00-1D-4D) ; https://adaptiverecognition.com/blog/traffic-transportation/carmen-anpr-software-engine/",
+      "checked": "ieee-2026-10-18",
+      "regions": [
+        "AU"
+      ],
+      "match": {
+        "ouis": [
+          "00:1D:4D"
+        ],
+        "publicAddr": true
+      }
+    }
+  ],
   "notes": [
     "Speed-measuring devices are not detected in this region: radar and speed-camera detectors are prohibited in most Australian states, so rules for speed-enforcement makers are switched off.",
+    "Plate readers: rules for Elsag, Neology (formerly PIPS), Tattile, Kapsch and Motorola already apply everywhere; this pack adds Genetec AutoVu (parking) and Adaptive Recognition. Acusensus and SenSen units have no published radio identifiers, so they are not detected yet.",
     "Band names come from the ACMA spectrum plan. A frequency the pack does not name shows as a plain carrier rather than a US label.",
     "Remote ID is not mandated in Australia, so fewer drones announce themselves; DJI's own broadcast still works."
   ],
@@ -20,30 +69,150 @@
     "drop_us_bands": true,
     "rtl433_args": "-f 433.92M -f 915M -H 30 -g 40",
     "bands": [
-      {"lo": 476.4, "hi": 477.42, "name": "UHF CB radio nearby (476–477 MHz: trucks, 4WDs, worksites)", "cat": "VEHICLE"},
-      {"lo": 915, "hi": 928, "name": "915–928 MHz LIPD burst (LoRa, telemetry, meters)", "cat": "IOT",
-       "steady": {"name": "Steady 915–928 MHz carrier: meter collector, LoRa gateway, or an RFID / toll reader", "cat": "IOT"}},
-      {"lo": 403, "hi": 430, "name": "UHF land-mobile radio (400 MHz band: government and business two-way)"},
-      {"lo": 430, "hi": 450, "name": "Amateur radio (70 cm) / defence"},
-      {"lo": 450, "hi": 520, "name": "UHF land-mobile radio (400 MHz band: business, transport, utilities)"},
-      {"lo": 148, "hi": 174, "name": "VHF two-way radio (land mobile, marine, paging)"},
-      {"lo": 30, "hi": 50, "name": "VHF low-band two-way radio"},
-      {"lo": 703, "hi": 748, "name": "Phone transmitting nearby (700 MHz LTE uplink)", "cat": "PHONE"},
-      {"lo": 825, "hi": 845, "name": "Phone transmitting nearby (850 MHz uplink)", "cat": "PHONE"},
-      {"lo": 890, "hi": 915, "name": "Phone transmitting nearby (900 MHz uplink)", "cat": "PHONE"},
-      {"lo": 1710, "hi": 1785, "name": "Phone transmitting nearby (1800 MHz uplink)", "cat": "PHONE"},
-      {"lo": 1920, "hi": 1980, "name": "Phone transmitting nearby (2100 MHz uplink)", "cat": "PHONE"},
-      {"lo": 2500, "hi": 2570, "name": "Phone transmitting nearby (2600 MHz uplink)", "cat": "PHONE"},
-      {"lo": 758, "hi": 803, "name": "Cell tower (700 MHz downlink)", "cat": "CELL_SITE", "kind": "bg"},
-      {"lo": 870, "hi": 890, "name": "Cell tower (850 MHz downlink)", "cat": "CELL_SITE", "kind": "bg"},
-      {"lo": 935, "hi": 960, "name": "Cell tower (900 MHz downlink)", "cat": "CELL_SITE", "kind": "bg"},
-      {"lo": 1805, "hi": 1880, "name": "Cell tower (1800 MHz downlink)", "cat": "CELL_SITE", "kind": "bg"},
-      {"lo": 2110, "hi": 2170, "name": "Cell tower (2100 MHz downlink)", "cat": "CELL_SITE", "kind": "bg"},
-      {"lo": 2620, "hi": 2690, "name": "Cell tower (2600 MHz downlink)", "cat": "CELL_SITE", "kind": "bg"},
-      {"lo": 3400, "hi": 3800, "name": "5G (3.4–3.8 GHz): tower or phone", "cat": "CELL_SITE", "kind": "bg"},
-      {"lo": 174, "hi": 230, "name": "TV and DAB+ digital radio broadcast (VHF)", "kind": "bg"},
-      {"lo": 520, "hi": 694, "name": "TV broadcast (UHF)", "kind": "bg"},
-      {"lo": 88, "hi": 108, "name": "FM broadcast", "kind": "bg"}
+      {
+        "lo": 476.4,
+        "hi": 477.42,
+        "name": "UHF CB radio nearby (476–477 MHz: trucks, 4WDs, worksites)",
+        "cat": "VEHICLE"
+      },
+      {
+        "lo": 915,
+        "hi": 928,
+        "name": "915–928 MHz LIPD burst (LoRa, telemetry, meters)",
+        "cat": "IOT",
+        "steady": {
+          "name": "Steady 915–928 MHz carrier: meter collector, LoRa gateway, or an RFID / toll reader",
+          "cat": "IOT"
+        }
+      },
+      {
+        "lo": 403,
+        "hi": 430,
+        "name": "UHF land-mobile radio (400 MHz band: government and business two-way)"
+      },
+      {
+        "lo": 430,
+        "hi": 450,
+        "name": "Amateur radio (70 cm) / defence"
+      },
+      {
+        "lo": 450,
+        "hi": 520,
+        "name": "UHF land-mobile radio (400 MHz band: business, transport, utilities)"
+      },
+      {
+        "lo": 148,
+        "hi": 174,
+        "name": "VHF two-way radio (land mobile, marine, paging)"
+      },
+      {
+        "lo": 30,
+        "hi": 50,
+        "name": "VHF low-band two-way radio"
+      },
+      {
+        "lo": 703,
+        "hi": 748,
+        "name": "Phone transmitting nearby (700 MHz LTE uplink)",
+        "cat": "PHONE"
+      },
+      {
+        "lo": 825,
+        "hi": 845,
+        "name": "Phone transmitting nearby (850 MHz uplink)",
+        "cat": "PHONE"
+      },
+      {
+        "lo": 890,
+        "hi": 915,
+        "name": "Phone transmitting nearby (900 MHz uplink)",
+        "cat": "PHONE"
+      },
+      {
+        "lo": 1710,
+        "hi": 1785,
+        "name": "Phone transmitting nearby (1800 MHz uplink)",
+        "cat": "PHONE"
+      },
+      {
+        "lo": 1920,
+        "hi": 1980,
+        "name": "Phone transmitting nearby (2100 MHz uplink)",
+        "cat": "PHONE"
+      },
+      {
+        "lo": 2500,
+        "hi": 2570,
+        "name": "Phone transmitting nearby (2600 MHz uplink)",
+        "cat": "PHONE"
+      },
+      {
+        "lo": 758,
+        "hi": 803,
+        "name": "Cell tower (700 MHz downlink)",
+        "cat": "CELL_SITE",
+        "kind": "bg"
+      },
+      {
+        "lo": 870,
+        "hi": 890,
+        "name": "Cell tower (850 MHz downlink)",
+        "cat": "CELL_SITE",
+        "kind": "bg"
+      },
+      {
+        "lo": 935,
+        "hi": 960,
+        "name": "Cell tower (900 MHz downlink)",
+        "cat": "CELL_SITE",
+        "kind": "bg"
+      },
+      {
+        "lo": 1805,
+        "hi": 1880,
+        "name": "Cell tower (1800 MHz downlink)",
+        "cat": "CELL_SITE",
+        "kind": "bg"
+      },
+      {
+        "lo": 2110,
+        "hi": 2170,
+        "name": "Cell tower (2100 MHz downlink)",
+        "cat": "CELL_SITE",
+        "kind": "bg"
+      },
+      {
+        "lo": 2620,
+        "hi": 2690,
+        "name": "Cell tower (2600 MHz downlink)",
+        "cat": "CELL_SITE",
+        "kind": "bg"
+      },
+      {
+        "lo": 3400,
+        "hi": 3800,
+        "name": "5G (3.4–3.8 GHz): tower or phone",
+        "cat": "CELL_SITE",
+        "kind": "bg"
+      },
+      {
+        "lo": 174,
+        "hi": 230,
+        "name": "TV and DAB+ digital radio broadcast (VHF)",
+        "kind": "bg"
+      },
+      {
+        "lo": 520,
+        "hi": 694,
+        "name": "TV broadcast (UHF)",
+        "kind": "bg"
+      },
+      {
+        "lo": 88,
+        "hi": 108,
+        "name": "FM broadcast",
+        "kind": "bg"
+      }
     ]
   }
 }
