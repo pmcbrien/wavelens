@@ -384,6 +384,20 @@ Everything to build one is in [`companion/`](companion/): the one‑page [line p
 
 ---
 
+## Updates, free for life
+
+One version number (`companion/VERSION`, a date) covers the Pi bridge, the ESP32 firmware and the copy of that firmware inside the app.
+
+- **Spotter (ESP32):** the app pushes new firmware over Bluetooth — *More → Companion radio → Update firmware* when a newer one is available. Two OTA slots, so an interrupted update leaves the old firmware running. From a computer: the [browser flasher](https://pmcbrien.github.io/wavelens/flash/) (Chrome/Edge, USB), also for blank boards. Images: the [firmware release](https://github.com/pmcbrien/wavelens/releases/tag/firmware).
+- **Scanner (Raspberry Pi):** `sudo wavelens-update check | apply | rollback` on the Pi, or the same from the app's Companion screen, or the Pi's admin page at `http://wavelens.local:8080` (Wi-Fi, logs, settings, updates, flash a Spotter, power). A nightly timer checks; it installs only if you switch that on. A failed update rolls back by itself.
+- A fresh Pi: `sudo companion/pi/provision.sh`.
+
+Details: [companion/UPDATES.md](companion/UPDATES.md), [companion/pi/ADMIN.md](companion/pi/ADMIN.md).
+
+## Contribute
+
+Email an export from the app (*More → Help improve Wavelens where you live* — nothing is sent unless you press send), open a pull request here (region packs in `packs/`, companion code), or write a signature pack. The rule format, field by field: [wavelensapp.us/contribute.html](https://wavelensapp.us/contribute.html).
+
 ## Privacy
 
 - No network permission. Nothing leaves the phone except files you export yourself — including **More → Share diagnostics**, a scrubbed report (no coordinates, cell IDs, rotating addresses or personal device names) that you read in full and then hand to the share sheet.
