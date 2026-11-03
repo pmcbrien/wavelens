@@ -1,0 +1,2 @@
+{"name": "Wavelens Spotter", "version": "2026.11.03", "new_install_prompt_erase": true,
+ "builds": [{"chipFamily": "ESP32", "parts": [{"path": "wavelens-esp32-merged.bin", "offset": 0}]}]}
