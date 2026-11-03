@@ -1112,8 +1112,8 @@ def set_region(code: str, announce: bool = True) -> None:
     old_args = region_packs.rtl433_args(REGION["pack"], RTL433_DEFAULT_ARGS)
     if pack is None and code != "US":
         if announce:
-            emit({"t": "status", "msg": f"no {code} region pack on this bridge: keeping US band names "
-                                        f"(copy region-{code.lower()}.json to /etc/wavelens/regions/)",
+            emit({"t": "status", "msg": f"no {code} local pack on this bridge: keeping US band names "
+                                        f"(copy {code.lower()}.json to /etc/wavelens/packs/)",
                   "band": state["band"], "mode": state["mode"]})
         print(f"bridge: region {code}: no pack found in {', '.join(region_packs.DIRS)}", file=sys.stderr)
         code = "US"
@@ -1126,7 +1126,7 @@ def set_region(code: str, announce: bool = True) -> None:
         if p is not None and p.poll() is None:
             p.terminate()              # feed_rtl433_child restarts it with the region's frequencies
     if announce and pack is not None:
-        emit({"t": "status", "msg": f"region {code}: {pack.get('name', code)} band names"
+        emit({"t": "status", "msg": f"local pack: {pack.get('name', code)} band names"
                                     + (" (in testing)" if pack.get("status") == "testing" else ""),
               "band": state["band"], "mode": state["mode"]})
 
@@ -4715,8 +4715,8 @@ def main() -> None:
                     help="county (repeatable) whose rows in a statewide export rank ahead of other counties'")
     ap.add_argument("--echo", action="store_true", help="print every line sent to the phone on stderr (see it with journalctl -u wavelens-bridge -f)")
     ap.add_argument("--region", default=os.environ.get("WAVELENS_REGION", "US"),
-                    help="region pack to start with (two-letter code; the phone's choice replaces it on connect). "
-                         "Packs are read from /etc/wavelens/regions, ~/.config/wavelens/regions and regions/ beside this script")
+                    help="local pack to start with (its two-letter country code; the phone's choice replaces it on connect). "
+                         "Packs are read from /etc/wavelens/packs, ~/.config/wavelens/packs, packs/ beside this script and the repo's packs/")
     ap.add_argument("--name", default="", help="advertised name (default Wavelens-XXXX from the adapter address)")
     ap.add_argument("--plan", action="store_true",
                     help="print shell assignments (PLAN_RTL433_DEV, PLAN_ARGS) for the radios found, and exit; run-bridge.sh uses it when WAVELENS_AUTO=1")

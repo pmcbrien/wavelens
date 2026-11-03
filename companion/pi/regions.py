@@ -1,14 +1,15 @@
-"""Region packs for the Wavelens bridge.
+"""Local packs for the Wavelens bridge.
 
-The phone sends {"c": "region", "v": "AU"} on every connect. The bridge looks for a pack with that code
-in, in order:
+The phone sends {"c": "region", "v": "AU"} on every connect: the country code of the local pack in use.
+The bridge looks for a pack with that "country" in, in order:
 
-    /etc/wavelens/regions/*.json
-    ~/.config/wavelens/regions/*.json
-    <this folder>/regions/*.json          (shipped with the bridge)
+    /etc/wavelens/packs/*.json
+    ~/.config/wavelens/packs/*.json
+    <this folder>/packs/*.json            (installed by install-service.sh / update.sh)
+    <repo>/packs/*.json                   (running from a checkout)
 
-It is the same file the phone imports (download from wavelensapp.us/regions). Only its "companion"
-section matters here:
+It is the same file the phone imports (community packs: github.com/pmcbrien/wavelens/tree/main/packs).
+Only its "companion" section matters here:
 
     "companion": {
       "drop_us_bands": true,            # forget the band names that come from the US allocation table
@@ -26,7 +27,8 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DIRS = ["/etc/wavelens/regions", os.path.expanduser("~/.config/wavelens/regions"), os.path.join(HERE, "regions")]
+DIRS = ["/etc/wavelens/packs", os.path.expanduser("~/.config/wavelens/packs"), os.path.join(HERE, "packs"),
+        os.path.normpath(os.path.join(HERE, "..", "..", "packs"))]
 
 # BANDS keys (lo-hi as the bridge writes them) whose labels come from the US allocation table, US cellular
 # band plan or US-only services. Kept here, not as a flag on each entry, so the main table stays as it was.
@@ -63,9 +65,9 @@ def find(code: str):
                 with open(path, encoding="utf-8") as f:
                     pack = json.load(f)
             except (OSError, ValueError) as e:
-                print(f"bridge: region pack {path} unreadable: {e}", file=sys.stderr)
+                print(f"bridge: pack {path} unreadable: {e}", file=sys.stderr)
                 continue
-            if pack.get("kind") == "wavelens-region" and str(pack.get("region", "")).upper() == code:
+            if pack.get("kind") == "wavelens-country" and str(pack.get("country", "")).upper() == code:
                 pack["_path"] = path
                 return pack
     return None
@@ -81,7 +83,7 @@ def table(pack, base: list) -> list:
         try:
             own.append(_band(e))
         except (KeyError, TypeError, ValueError):
-            print(f"bridge: region pack band entry skipped: {e}", file=sys.stderr)
+            print(f"bridge: pack band entry skipped: {e}", file=sys.stderr)
     drop = bool(comp.get("drop_us_bands"))
     rest = [b for b in base if not (drop and b["key"] in US_ONLY)]
     return own + rest

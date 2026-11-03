@@ -1,0 +1,33 @@
+{
+  "kind": "wavelens-country",
+  "format": 1,
+  "country": "XX",
+  "name": "Country name",
+  "pack_version": 1,
+  "pack_date": "YYYY-MM-DD",
+  "status": "testing",
+  "maintainers": [
+    "Your name or handle"
+  ],
+  "summary": "One or two sentences shown before someone installs the pack.",
+  "units": "metric",
+  "scanner_idle": null,
+  "rules": [],
+  "disable_rules": [],
+  "notes": [
+    "What is different here, and anything you checked about local law."
+  ],
+  "companion": {
+    "drop_us_bands": true,
+    "rtl433_args": "-f 433.92M -f 868M -H 30 -g 40",
+    "bands": [
+      {
+        "lo": 0,
+        "hi": 0,
+        "name": "Label shown on the phone",
+        "cat": "UNKNOWN",
+        "kind": ""
+      }
+    ]
+  }
+}

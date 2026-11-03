@@ -19,8 +19,8 @@ fi
 install -d /usr/local/lib/wavelens
 install -m 0755 wavelens_bridge.py smartnet.py run-bridge.sh /usr/local/lib/wavelens/
 install -m 0644 regions.py /usr/local/lib/wavelens/
-install -d /usr/local/lib/wavelens/regions
-install -m 0644 regions/region-*.json /usr/local/lib/wavelens/regions/
+install -d /usr/local/lib/wavelens/packs
+install -m 0644 ../../packs/??.json /usr/local/lib/wavelens/packs/ 2>/dev/null || true
 install -m 0644 wavelens-bridge.service /etc/systemd/system/
 # Keep an existing settings file; only install the example the first time.
 [ -f /etc/default/wavelens-bridge ] || install -m 0644 wavelens-bridge.default /etc/default/wavelens-bridge
