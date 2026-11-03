@@ -394,6 +394,10 @@ One version number (`companion/VERSION`, a date) covers the Pi bridge, the ESP32
 
 Details: [companion/UPDATES.md](companion/UPDATES.md), [companion/pi/ADMIN.md](companion/pi/ADMIN.md).
 
+## Hardware that works
+
+Phones, Raspberry Pi models, RTL-SDR dongles (V3 yes; V4 only for sensors until its driver is in), HackRF, ESP32 boards, powered hubs, power supplies, SD cards, antennas — known good, works with care, avoid, and the known-bad combinations with fixes: [companion/HARDWARE.md](companion/HARDWARE.md) ([web version](https://wavelensapp.us/hardware.html)).
+
 ## Contribute
 
 Email an export from the app (*More → Help improve Wavelens where you live* — nothing is sent unless you press send), open a pull request here (region packs in `packs/`, companion code), or write a signature pack. The rule format, field by field: [wavelensapp.us/contribute.html](https://wavelensapp.us/contribute.html).
