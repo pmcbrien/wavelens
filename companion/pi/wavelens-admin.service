@@ -1,0 +1,17 @@
+[Unit]
+Description=Wavelens companion admin web UI (http://<hostname>.local:8080, LAN only)
+After=network.target
+
+[Service]
+Type=simple
+# Port can be changed with WAVELENS_ADMIN_PORT in /etc/default/wavelens-bridge.
+EnvironmentFile=-/etc/default/wavelens-bridge
+ExecStart=/usr/bin/python3 /usr/local/lib/wavelens/wavelens_admin.py
+Restart=always
+RestartSec=3
+# Root: it edits /etc/default/wavelens-bridge and /etc/hosts, drives nmcli/hostnamectl/systemctl,
+# and opens the Spotter's USB serial port for esptool.
+User=root
+
+[Install]
+WantedBy=multi-user.target

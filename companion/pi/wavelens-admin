@@ -1,0 +1,5 @@
+#!/bin/sh
+# Wavelens admin CLI wrapper (installed to /usr/local/bin by install-service.sh).
+#   sudo wavelens-admin --reset-password   forget the admin password; the next visit sets a new one
+#   wavelens-admin                         run the admin web UI in the foreground (normally a systemd service)
+exec /usr/bin/python3 /usr/local/lib/wavelens/wavelens_admin.py "$@"

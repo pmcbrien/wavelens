@@ -33,13 +33,17 @@
 #include <algorithm>
 #include "esp_wifi.h"
 #include "esp_mac.h"
+#include <Update.h>
 
 static void candAdd(float mhz);               // a carrier the spectrum sweep found: Follow may tune it (SA818)
 static void subghzInit();
 
 // ------------------------------------------------------------------ config
 
-#define FW_NAME     "wavelens-esp32 0.3"
+#ifndef WL_VERSION
+#define WL_VERSION  "dev"        // platformio.ini injects companion/VERSION; Arduino IDE builds say "dev"
+#endif
+#define FW_NAME     "wavelens-esp32 " WL_VERSION
 #ifndef LED_PIN
 #define LED_PIN     2            // on-board LED on most DevKit boards; set -1 if yours has none
 #endif
@@ -47,6 +51,7 @@ static void subghzInit();
 #define TX_UUID     "57617665-6c65-6e73-0100-000000000002"
 #define RX_UUID     "57617665-6c65-6e73-0100-000000000003"
 #define AU_UUID     "57617665-6c65-6e73-0100-000000000004"   // audio frames while listening (same as the Pi bridge)
+#define OTA_UUID    "57617665-6c65-6e73-0100-000000000005"   // firmware update: raw .bin chunks from the phone (see otaCommand)
 
 // #define HAS_RX5808           // uncomment if an RX5808 5.8 GHz module is wired (see below)
 // #define HAS_SUBGHZ           // uncomment for a CC1101 / SX1276 sub-GHz receiver via the rtl_433_ESP library (see below)
@@ -195,8 +200,8 @@ static void hello() {
   hwJson(hw, sizeof hw);
   char line[QL];
   snprintf(line, sizeof line,
-           "{\"t\":\"hello\",\"fw\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\"%s%s%s%s]%s,\"hw\":%s}\n",
-           FW_NAME, devName, pairCode,
+           "{\"t\":\"hello\",\"fw\":\"%s\",\"ver\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\",\"ota\"%s%s%s%s]%s,\"hw\":%s}\n",
+           FW_NAME, WL_VERSION, devName, pairCode,
 #if defined(HAS_RX5808) || defined(HAS_SPECTRUM)
            ",\"rf\"",
 #else
@@ -961,6 +966,86 @@ static void listenCommand(const char*, const char*) {
 }
 #endif
 
+// ------------------------------------------------------------------ firmware update over BLE (OTA)
+//
+// The phone app carries the current Spotter firmware inside it (so it needs no network of its own) and
+// pushes it here:  {"c":"ota","v":"begin","size":N}  → we stop sniffing, open the other OTA partition and
+// answer {"t":"ota","st":"ready","win":W}. The phone then writes raw chunks to OTA_UUID (≤ MTU-3 bytes each,
+// write-without-response) and waits for {"t":"ota","st":"ack","got":N} after every W bytes before sending
+// the next window — that is the flow control, so a slow flash never overruns the link. {"c":"ota","v":"end"}
+// verifies the image, answers {"t":"ota","st":"done"} and reboots into it; "abort" throws it away.
+// Needs an OTA partition table (platformio.ini: min_spiffs.csv — two 1.9 MB app slots on a 4 MB module).
+// The bootloader keeps the old image until the new one has booted, so a bad flash is not a brick.
+
+static const uint32_t OTA_WIN = 16384;
+static bool     otaOn = false;
+static uint32_t otaSize = 0, otaGot = 0, otaAcked = 0;
+static NimBLECharacteristic* otaChar = nullptr;
+
+static void otaStatus(const char* st, const char* extra = "") {
+  char line[QL];
+  snprintf(line, sizeof line, "{\"t\":\"ota\",\"st\":\"%s\",\"got\":%u,\"size\":%u,\"win\":%u%s}\n", st, otaGot, otaSize, OTA_WIN, extra);
+  enqueue(line);
+}
+
+static void otaStop(bool resume) {
+  otaOn = false;
+  if (resume) { wifiStart(); bleScanStart(); }
+}
+
+static void otaCommand(const char* line, const char* v) {
+  if (v && !strncmp(v, "\"begin\"", 7)) {
+    const char* sz = strstr(line, "\"size\":");
+    otaSize = sz ? strtoul(sz + 7, nullptr, 10) : 0;
+    if (!otaSize) { otaStatus("error", ",\"msg\":\"no size\""); return; }
+    if (Update.isRunning()) Update.abort();
+    wifiStop(); NimBLEDevice::getScan()->stop();           // the radio is for the update now
+    if (!Update.begin(otaSize)) {
+      char ex[96]; snprintf(ex, sizeof ex, ",\"msg\":\"cannot start: %s (no OTA partition?)\"", Update.errorString());
+      otaStatus("error", ex); otaStop(true); return;
+    }
+    otaOn = true; otaGot = otaAcked = 0;
+    Serial.printf("ota: begin, %u bytes\n", otaSize);
+    otaStatus("ready");
+    return;
+  }
+  if (v && !strncmp(v, "\"end\"", 5)) {
+    if (!otaOn) { otaStatus("error", ",\"msg\":\"not started\""); return; }
+    bool ok = otaGot == otaSize && Update.end(true);
+    if (ok) {
+      Serial.println("ota: done, rebooting");
+      otaStop(false); otaStatus("done"); drain();
+      delay(400); ESP.restart();
+    } else {
+      char ex[96]; snprintf(ex, sizeof ex, ",\"msg\":\"%s (%u of %u bytes)\"", Update.errorString(), otaGot, otaSize);
+      Update.abort(); otaStop(true); otaStatus("error", ex);
+    }
+    return;
+  }
+  if (v && !strncmp(v, "\"abort\"", 7)) {
+    if (otaOn) Update.abort();
+    otaStop(true); otaStatus("aborted");
+    return;
+  }
+  if (v && !strncmp(v, "\"status\"", 8)) { otaStatus(otaOn ? "running" : "idle"); return; }
+  status("ota: begin | end | abort | status");
+}
+
+class OtaCB : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo&) override {
+    if (!otaOn) return;
+    std::string v = ch->getValue();
+    size_t n = Update.write((uint8_t*)v.data(), v.size());
+    otaGot += n;
+    if (n != v.size()) {
+      char ex[96]; snprintf(ex, sizeof ex, ",\"msg\":\"write failed: %s\"", Update.errorString());
+      Update.abort(); otaStop(true); otaStatus("error", ex); return;
+    }
+    if (otaGot - otaAcked >= OTA_WIN || otaGot >= otaSize) { otaAcked = otaGot; otaStatus("ack"); }
+  }
+};
+static OtaCB otaCb;
+
 // ------------------------------------------------------------------ commands from the phone
 
 static char cmdBuf[256]; static size_t cmdLen = 0;
@@ -980,6 +1065,7 @@ static void applyCommand(const char* line) {
     return;
   }
   const char* v = strstr(line, "\"v\":");
+  if (!strncmp(c, "ota", 3)) { otaCommand(line, v ? v + 4 : nullptr); return; }
   if (!strncmp(c, "listen", 6)) { listenCommand(line, v ? v + 4 : nullptr); return; }
   if (!strncmp(c, "spec", 4)) {
     if (strstr(line, "\"on\":false")) { specStop(); return; }
@@ -1071,6 +1157,8 @@ void setup() {
   rxChar->setCallbacks(&rxCb);
   auChar = svc->createCharacteristic(AU_UUID, NIMBLE_PROPERTY::NOTIFY);
   auChar->setCallbacks(&auCb);
+  otaChar = svc->createCharacteristic(OTA_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  otaChar->setCallbacks(&otaCb);
   svc->start();
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(SVC_UUID);
@@ -1090,6 +1178,7 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
+  if (otaOn) { ledTick(now); drain(); delay(2); return; }   // firmware coming in: nothing else touches the radio
   wifiTick(now);
   rfTick(now);
   subghzTick();

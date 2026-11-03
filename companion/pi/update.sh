@@ -1,15 +1,14 @@
 #!/bin/bash
-# Update the Wavelens bridge on this Pi from the checked-out repo: pull, install, restart, tail the journal.
+# Update the Wavelens companion on this Pi. Kept for people with the old instructions; it is now a
+# thin wrapper around wavelens-update (see wavelens-update for check / apply / rollback / status).
 # Run from anywhere: ~/wavelens/companion/pi/update.sh
 set -e
 cd "$(dirname "$0")/../.."
-git pull --ff-only
-sudo install -m 0755 companion/pi/wavelens_bridge.py /usr/local/lib/wavelens/wavelens_bridge.py
-sudo install -m 0755 companion/pi/smartnet.py /usr/local/lib/wavelens/smartnet.py
-sudo install -m 0644 companion/pi/regions.py /usr/local/lib/wavelens/regions.py
-sudo install -d /usr/local/lib/wavelens/packs
-sudo install -m 0644 packs/??.json /usr/local/lib/wavelens/packs/ 2>/dev/null || true
-sudo install -m 0755 companion/pi/run-bridge.sh /usr/local/lib/wavelens/run-bridge.sh 2>/dev/null || true
-sudo systemctl restart wavelens-bridge
-echo "bridge restarted from $(git rev-parse --short HEAD); journal follows (Ctrl-C to stop)"
+if ! command -v wavelens-update >/dev/null 2>&1; then
+    # first time with the new tool: install it from this checkout, then let it do the rest
+    sudo install -m 0755 companion/pi/wavelens-update /usr/local/bin/wavelens-update
+    sudo mkdir -p /etc/wavelens && pwd | sudo tee /etc/wavelens/source >/dev/null
+fi
+sudo WAVELENS_SRC="$(pwd)" wavelens-update apply --force
+echo "journal follows (Ctrl-C to stop)"
 exec journalctl -u wavelens-bridge -f --no-pager | grep -v '"t":"rf"\|"t":"spec"'

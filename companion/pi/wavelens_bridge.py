@@ -76,7 +76,77 @@ SVC = "57617665-6c65-6e73-0100-000000000001"
 TX = "57617665-6c65-6e73-0100-000000000002"
 RX = "57617665-6c65-6e73-0100-000000000003"
 AU = "57617665-6c65-6e73-0100-000000000004"      # device → phone, notify: audio frames while listening
-FW = "wavelens-bridge 0.1"
+def _version() -> str:
+    # companion/VERSION, installed beside this file by install-service.sh / wavelens-update; the
+    # checkout's copy when run from the repo.
+    for cand in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "VERSION")):
+        try:
+            return open(cand).read().strip() or "dev"
+        except OSError:
+            continue
+    return "dev"
+
+
+VERSION = _version()
+FW = f"wavelens-bridge {VERSION}"
+UPDATE_STATE = "/var/lib/wavelens/update.json"     # written by wavelens-update
+RUN_STATUS = "/run/wavelens/status.json"           # written here for the admin page and the update timer
+
+
+def update_info() -> dict:
+    """{"installed", "available", "checked_at"} from the updater's record; available is None when current."""
+    info = {"installed": VERSION, "available": None, "checked_at": None}
+    try:
+        rec = json.load(open(UPDATE_STATE))
+        avail = rec.get("available")
+        info["available"] = avail if avail and avail != VERSION else None
+        info["checked_at"] = rec.get("checked_at")
+    except (OSError, ValueError):
+        pass
+    return info
+
+
+def write_run_status(hw: dict | None = None) -> None:
+    """A small JSON the admin page shows and wavelens-update reads (no update while a phone is linked)."""
+    try:
+        os.makedirs(os.path.dirname(RUN_STATUS), exist_ok=True)
+        doc = {"linked": bool(state.get("linked")), "name": state.get("name"), "code": state.get("code"),
+               "hw_line": (hw or {}).get("line") or state.get("hw_line"), "hw_missing": (hw or {}).get("missing", []),
+               "fw": FW, "at": int(time.time()), "update": update_info()}
+        tmp = RUN_STATUS + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(doc, f)
+        os.replace(tmp, RUN_STATUS)
+    except OSError:
+        pass
+
+
+def run_update(what: str) -> None:
+    """Phone asked for an update (c=update, v=check|apply|rollback): run wavelens-update, report as status lines."""
+    if what not in ("check", "apply", "rollback"):
+        emit({"t": "status", "msg": f"update: unknown action {what}", "band": state["band"], "mode": state["mode"]})
+        return
+    emit({"t": "status", "msg": f"update: {what} started" + (" (the bridge restarts when it is done)" if what != "check" else ""),
+          "band": state["band"], "mode": state["mode"]})
+    try:
+        r = subprocess.run(["/usr/local/bin/wavelens-update", what], capture_output=True, text=True, timeout=900)
+        last = (r.stdout.strip().splitlines() or r.stderr.strip().splitlines() or ["(no output)"])[-1]
+        msg = last.replace("update: ", "")
+        if r.returncode == 10:
+            msg = "update available: " + msg
+        elif r.returncode != 0:
+            msg = f"update {what} failed: " + msg
+    except FileNotFoundError:
+        msg = "wavelens-update is not installed on this Pi (run companion/pi/install-service.sh once)"
+    except subprocess.TimeoutExpired:
+        msg = f"update {what}: timed out"
+    print("bridge: " + msg, file=sys.stderr)
+    emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
+    # apply/rollback restart the service; if we are still here (check, or a failure) refresh what the phone sees
+    write_run_status()
+    hello()
+
 
 class Outbox:
     """Everything bound for the phone, in three classes, so a busy link never costs a word of audio and never
@@ -300,10 +370,11 @@ def hello() -> None:
     else:
         spec = None
     msg = {"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""),
-           "caps": sorted(set(CAPS)), "hw": hw, "region": REGION["code"]}
+           "caps": sorted(set(CAPS)), "hw": hw, "region": REGION["code"], "ver": VERSION, "update": update_info()}
     if spec:
         msg["spec"] = spec
     emit(msg)
+    write_run_status(hw)
     if hw["line"] != state.get("hw_line"):          # hello repeats every 15 s (the app's ping): say it when it changes
         state["hw_line"] = hw["line"]
         print(f"bridge: hardware: {hw['line']}", file=sys.stderr)
@@ -4214,6 +4285,10 @@ def run_peripheral(name: str) -> None:
         elif c == "blink":
             threading.Thread(target=blink, args=(int(cmd.get("v") or 5),), daemon=True).start()
             emit({"t": "status", "msg": "blinking", "band": state["band"], "mode": state["mode"]})
+        elif c == "update":
+            # The Companion screen's Check / Install update / Roll back buttons. The Pi does the network
+            # work (git pull from the public repo); the phone never needs a network permission for it.
+            threading.Thread(target=run_update, args=(str(cmd.get("v") or "check"),), daemon=True).start()
         elif c == "pos":
             # Opt-in from the phone: its GPS fix, so licensed sites can be ranked by distance.
             # Kept in memory only, never written anywhere, forgotten after two minutes.
@@ -4422,6 +4497,8 @@ def run_peripheral(name: str) -> None:
         state["linked"] = bool(notifying)
         if notifying:
             hello()
+        else:
+            write_run_status()
 
     dev.add_characteristic(srv_id=1, chr_id=1, uuid=TX, value=[], notifying=False,
                            flags=["notify"], notify_callback=notify_cb)
@@ -4724,6 +4801,7 @@ def main() -> None:
     sys.stderr = _StderrTee(sys.stderr)
     threading.Thread(target=log_pump, daemon=True).start()
     CAPS.append("log")
+    CAPS.append("update")
     globals()["PORTAPACK_TTY"] = a.portapack_port
     if a.plan:
         print_plan_shell("")

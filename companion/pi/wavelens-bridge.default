@@ -60,3 +60,8 @@ WAVELENS_RTL433=""
 #                  --rr-pack /usr/local/lib/wavelens/rr/county.csv --rr-county YourCounty"
 # (851–869 MHz is added to the listening dongle's sweep by the bridge for the control-channel hunt.)
 WAVELENS_ARGS=""
+
+# Updates. "sudo wavelens-update check" / "apply" / "rollback" by hand, or from the app's Companion screen, or
+# the admin page (http://<hostname>.local:8080). A timer checks every night; with WAVELENS_AUTO_UPDATE=1 it also
+# installs what it finds (never while a phone is connected) and rolls back by itself if the new bridge won't start.
+WAVELENS_AUTO_UPDATE=0

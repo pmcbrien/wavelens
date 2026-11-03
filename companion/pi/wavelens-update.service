@@ -1,0 +1,8 @@
+[Unit]
+Description=Wavelens companion: nightly update check (installs it only with WAVELENS_AUTO_UPDATE=1)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wavelens-update auto
