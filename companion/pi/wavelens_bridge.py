@@ -103,6 +103,7 @@ def update_info() -> dict:
         avail = rec.get("available")
         info["available"] = avail if avail and avail != VERSION else None
         info["checked_at"] = rec.get("checked_at")
+        info["last"] = rec.get("last_result")   # e.g. "update to X did not start, so Y was put back"
     except (OSError, ValueError):
         pass
     return info

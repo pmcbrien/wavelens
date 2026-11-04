@@ -28,7 +28,7 @@ later visit asks for that password; a login lasts 12 hours on that device. Chang
 
 | Page | What it does |
 |------|--------------|
-| **Status** | Bridge running or not, phone connected or not, the radios it found (and anything missing), the Pi's name, IP, Wi-Fi, temperature, disk and uptime. A banner appears when an update is available. Buttons to restart the bridge or reboot. |
+| **Status** | If something is wrong, a red box at the top says what in plain words and has the fix as a button (below). Bridge running or not, phone connected or not, the radios it found (and anything missing), the Pi's name, IP, Wi-Fi, temperature, disk and uptime. A banner appears when an update is available. Buttons to restart the bridge or reboot. |
 | **Logs** | The last 300 lines of the bridge's log, refreshing every 2 seconds. The very chatty signal lines are hidden unless you tick *include rf/spec lines*. *Download full log* saves the last 5000 lines to send to support. |
 | **Settings** | The radio name the app lists under *Find*, and the bridge's options from `/etc/default/wavelens-bridge`, with the file's own explanations below. Saving restarts the bridge. |
 | **Update** | Installed and available version, *Check now*, *Install update*, *Roll back to previous*, and a box for installing updates automatically overnight. Progress streams onto the page. Updates are free for life and come from the public GitHub repo `pmcbrien/wavelens`; the Pi needs Wi-Fi to fetch them. |
@@ -36,6 +36,29 @@ later visit asks for that password; a login lasts 12 hours on that device. Chang
 | **Spotter** | Flash a Wavelens Spotter (ESP32) plugged into the Pi's USB: download the latest firmware, or upload a `.bin`, pick the port, flash. Progress streams onto the page. Needs `esptool` on the Pi (`sudo apt install esptool`). |
 | **Power** | Restart the bridge, restart the admin page, reboot, shut down. Each asks you to confirm. |
 | **Account** | Change the admin password, log out. |
+
+## When something goes wrong
+
+The Status page checks the scanner software every time you open it. If it isn't running, or keeps stopping
+and restarting, a red box says what's wrong and offers the fix:
+
+| What the box says | What to do |
+|---|---|
+| *This version of the scanner software doesn't run on this Pi.* | **Put the previous version back**, or **Install the latest update** if there's no previous version. |
+| *Some of the scanner software's files are missing.* | **Install the latest update** — it reinstalls everything and checks the result. |
+| *A radio dongle isn't answering.* | Unplug each USB radio, wait five seconds, plug it back in. It's picked up within ten seconds. |
+| *The Pi's Bluetooth isn't working.* | **Reboot**. If it's the same afterwards, power the Pi off for ten seconds. |
+| *The scanner software keeps stopping and restarting.* | **Restart the scanner**; if it stops again, **Put the previous version back**. |
+
+Every box also has **Download log for support** — email it to wavelensapp@gmail.com.
+
+Updates look after themselves: if a new version doesn't start, the Pi puts the one that worked back on its
+own and the Status page says so ("Last update: … was put back"). Nothing else needs doing — the next update
+that fixes it installs normally. Details: [UPDATES.md](../UPDATES.md#an-update-cant-leave-the-scanner-dead).
+
+**Can't open the page at all?** The Pi isn't on your Wi-Fi, or is off. Check it has power (the red LED),
+give it two minutes after plugging in, and try its IP address instead of `wavelens.local`. If it was never
+joined to your Wi-Fi, see *Wi-Fi* below, or plug in a screen and keyboard and run `sudo nmtui`.
 
 ## Forgot the password?
 

@@ -42,12 +42,34 @@ Wi-Fi once (admin page → *Wi-Fi*, or `nmtui` at the console).
 | **Automatically** | A systemd timer (`wavelens-update.timer`) checks every night between 03:00 and 04:00 and 10 minutes after every boot. It only *installs* when `WAVELENS_AUTO_UPDATE=1` is set in `/etc/default/wavelens-bridge` (the admin page's switch), and never while a phone is connected. |
 | **At the console** | `sudo wavelens-update check` / `apply` / `rollback` / `status`. The old `companion/pi/update.sh` still works and now calls the same tool. |
 
-What an update does, in order: `git fetch` + fast-forward of the checkout (`/etc/wavelens/source` says
-where it is), a copy of the current install to `/usr/local/lib/wavelens.prev`, install of the bridge, the
-admin page, the region packs, `VERSION` and the Spotter firmware image, `systemctl restart wavelens-bridge`,
-then a health check: if the bridge isn't up and advertising within 20 s, it rolls back by itself and tells
-you. Your settings (`/etc/default/wavelens-bridge`), RadioReference packs and the admin password are never
-touched. The record of the last check lives in `/var/lib/wavelens/update.json`.
+### An update can't leave the Scanner dead
+
+What an update does, in order, and what happens if any step goes wrong:
+
+1. **Save the working version.** The current install (and the updater, admin page and service files it would
+   replace) is copied to `/usr/local/lib/wavelens.prev` — but only if the bridge is actually running right
+   now. A Pi that is already broken keeps its earlier saved copy, so the fallback is always a version that worked.
+2. **Fetch and install** the new bridge, admin page, region packs, `VERSION` and the Spotter firmware image.
+   If installing fails part-way, the saved version goes straight back.
+3. **Try it before switching.** The new bridge must load on this Pi's Python. If it doesn't — the 4 Nov
+   case, code that needed Python 3.10 on a Pi with 3.9 — the saved version goes back and the running bridge
+   is never interrupted.
+4. **Restart and watch.** The bridge must stay up without systemd having to restart it, and get as far as
+   advertising to the phone, within about 25 seconds. If it crashes or keeps restarting, the saved version
+   goes back.
+5. **Check the rollback too.** After putting the saved version back, the same health check runs again.
+
+Started from the phone or the admin page, the update runs in a systemd unit of its own
+(`wavelens-update-run`), so restarting the bridge or the admin page can't cut it off half-way. The result —
+"updated to X", or "update to X did not start, so Y was put back — <the error>" — is in
+`/var/lib/wavelens/update.json`, shown on the admin page's Status and Update pages and on the phone's
+Companion screen. The step-by-step log is `/var/lib/wavelens/update.log`.
+
+Your settings (`/etc/default/wavelens-bridge`), RadioReference packs and the admin password are never touched.
+
+CI (`.github/workflows/pi.yml`) loads the bridge on Python 3.9, 3.11 and 3.13 and runs the updater against
+a fake systemd — a good update, one that won't load, one that crash-loops, a rollback, and an update from an
+already-broken install — before anything reaches a Pi.
 
 ## A fresh Pi, the way we ship them
 
@@ -61,7 +83,8 @@ advice, and the admin page's *Power → Reboot* afterwards.
 
 ## For the person releasing
 
-1. Change what you need under `companion/`, bump `companion/VERSION` to today's date, push to `main`.
+1. Change what you need under `companion/`, bump `companion/VERSION` to today's date (add `.1`, `.2` for a
+   second release the same day), push to `main`. Check that **Pi companion** and **Spotter firmware** are green.
 2. CI mirrors `companion/` to the public repo (`android.yml`), builds the ESP32 image and publishes the
    firmware release (`firmware.yml`), and the next app build bundles it.
 3. Every Pi that checks tonight sees the new version; phones see it the next time they connect to one.

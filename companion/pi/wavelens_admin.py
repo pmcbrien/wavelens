@@ -66,6 +66,9 @@ ADMIN_JSON = "/etc/wavelens/admin.json"
 STATUS_JSON = "/run/wavelens/status.json"
 UPDATE_JSON = "/var/lib/wavelens/update.json"
 UPDATE_CLI = "/usr/local/bin/wavelens-update"
+UPDATE_LOG = "/var/lib/wavelens/update.log"     # written by wavelens-update apply/rollback; survives this page restarting
+UPDATE_RUN_UNIT = "wavelens-update-run"          # the transient unit wavelens-update runs apply/rollback in
+PREV_DIR = "/usr/local/lib/wavelens.prev"        # the saved working version a rollback puts back
 BRIDGE_UNIT = "wavelens-bridge"
 ADMIN_UNIT = "wavelens-admin"
 PORT = int(os.environ.get("WAVELENS_ADMIN_PORT", "8080"))
@@ -437,6 +440,100 @@ def journal_lines(n=300, noise=False):
 
 
 # --------------------------------------------------------------------------------------------
+# Is the bridge actually working? Plain-language diagnosis for people who will never open a terminal.
+# --------------------------------------------------------------------------------------------
+# (pattern in the bridge's journal, what it means, what to do) — first match wins, most specific first.
+KNOWN_FAULTS = [
+    (re.compile(r"unsupported operand type\(s\) for \||SyntaxError|ModuleNotFoundError|ImportError"),
+     "This version of the scanner software doesn't run on this Pi.",
+     "rollback"),
+    (re.compile(r"No such file or directory: '/usr/local/lib/wavelens|run-bridge.sh: not found|can't open file"),
+     "Some of the scanner software's files are missing — usually an update that was interrupted.",
+     "reinstall"),
+    (re.compile(r"usb_claim_interface|Failed to open rtlsdr|No supported devices found|usb_open error"),
+     "A radio dongle isn't answering. It may have come loose, or another program is using it.",
+     "replug"),
+    (re.compile(r"org\.bluez|No Bluetooth adapter|Bluetooth.*(not available|failed)|hci0.*(down|not)", re.I),
+     "The Pi's Bluetooth isn't working, so the phone can't connect.",
+     "reboot"),
+    (re.compile(r"Traceback \(most recent call last\)|Error:"),
+     "The scanner software stopped with an error.",
+     "rollback"),
+]
+FIXES = {
+    "rollback": "Tap <b>Put the previous version back</b>. If there's no previous version, tap <b>Install the latest update</b> — "
+                "fixes for problems like this are usually already out.",
+    "reinstall": "Tap <b>Install the latest update</b>: it reinstalls every file and checks the result.",
+    "replug": "Unplug each USB radio, wait five seconds, plug it back in. The scanner picks it up by itself within ten seconds.",
+    "reboot": "Tap <b>Reboot</b>. If it comes back the same, power the Pi off for ten seconds.",
+}
+
+
+def unit_show(unit, *props):
+    _, out = run(["systemctl", "show", unit, "--no-pager"] + [f"-p{p}" for p in props], timeout=5)
+    d = {}
+    for line in out.splitlines():
+        k, _, v = line.partition("=")
+        d[k] = v
+    return d
+
+
+def bridge_health():
+    """{'ok': bool, 'looping': bool, 'restarts_5m': int, 'title', 'fix', 'detail'} — the Status page's verdict."""
+    props = unit_show(BRIDGE_UNIT, "ActiveState", "SubState", "Result")
+    _, recent = run(["journalctl", "-u", BRIDGE_UNIT, "--since", "-5min", "--no-pager", "-o", "cat"], timeout=15)
+    lines = recent.splitlines()
+    restarts = sum(1 for l in lines if "Scheduled restart job" in l or "Main process exited" in l)
+    active = props.get("ActiveState") == "active"
+    looping = restarts >= 3
+    h = {"ok": active and not looping, "looping": looping, "restarts_5m": restarts,
+         "state": props.get("ActiveState") or "unknown", "title": "", "fix": "", "detail": ""}
+    if h["ok"]:
+        return h
+    text = "\n".join(lines[-400:])
+    for rx, title, fix in KNOWN_FAULTS:
+        m = rx.search(text)
+        if m:
+            h["title"], h["fix"] = title, FIXES[fix]
+            # the line that matched, without the journal's own prefix
+            for l in reversed(lines):
+                if rx.search(l):
+                    h["detail"] = l.strip()[:240]
+                    break
+            break
+    if not h["title"]:
+        h["title"] = ("The scanner software keeps stopping and restarting." if looping
+                      else "The scanner software isn't running.")
+        h["fix"] = "Tap <b>Restart the scanner</b>. If it stops again, tap <b>Put the previous version back</b>."
+    return h
+
+
+def update_running():
+    _, st = run(["systemctl", "is-active", UPDATE_RUN_UNIT], timeout=5)
+    return st in ("active", "activating")
+
+
+def update_log_snapshot():
+    """The live job if this page started one and is still here; otherwise the updater's own log file, which
+    carries on even when the update restarts this page part-way through."""
+    snap = UPDATE_JOB.snapshot()
+    if snap["running"] and snap["lines"]:
+        return snap
+    try:
+        with open(UPDATE_LOG, errors="replace") as f:
+            lines = f.read().splitlines()[-2000:]
+    except OSError:
+        return snap
+    if not lines:
+        return snap
+    running = update_running()
+    result = (read_json(UPDATE_JSON) or {}).get("last_result") or ""
+    failed = any(w in result for w in ("failed", "did not start", "would not start", "could not", "not running"))
+    return {"running": running, "title": "update", "seq": snap["seq"],
+            "exit": None if running else (1 if failed else 0), "lines": lines}
+
+
+# --------------------------------------------------------------------------------------------
 # HTML shell
 # --------------------------------------------------------------------------------------------
 CSS = """
@@ -623,7 +720,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/logs.txt":
             return self.send_text("\n".join(journal_lines(5000, noise=True)) + "\n", "wavelens-bridge.log")
         if path == "/api/update/log":
-            return self.send_json(UPDATE_JOB.snapshot())
+            return self.send_json(update_log_snapshot())
+        if path == "/api/health":
+            return self.send_json(bridge_health())
         if path == "/api/spotter/log":
             return self.send_json(FLASH_JOB.snapshot())
         self.send_html(page("Not found", "<p>No such page.</p>", nav=True), 404)
@@ -737,9 +836,32 @@ open this page. If you forget it: <code>sudo wavelens-admin --reset-password</co
         facts = pi_facts()
         upd = st.get("update") or {}
         banner = ""
+        health = bridge_health()
+        if not health["ok"] and not update_running():
+            can_rb = os.path.isdir(PREV_DIR)
+            rb = (f'<form method="post" action="/update" class="inline">{csrf_field(sess)}<input type="hidden" name="do" value="rollback">'
+                  f'<button class="btn" type="submit">Put the previous version back</button></form>') if can_rb else ""
+            banner += f"""<div class="warn"><h2 style="color:var(--bad)">{esc(health['title'])}</h2>
+<p>{health['fix']}</p>
+{f'<p class="note">What it said: <code>{esc(health["detail"])}</code></p>' if health["detail"] else ""}
+<div class="row">{rb}
+<form method="post" action="/update" class="inline">{csrf_field(sess)}<input type="hidden" name="do" value="apply"><button class="btn {"sec" if can_rb else ""}" type="submit">Install the latest update</button></form>
+<form method="post" action="/bridge/restart" class="inline">{csrf_field(sess)}<button class="btn sec" type="submit">Restart the scanner</button></form>
+<a class="btn sec" href="/power/reboot">Reboot…</a>
+<a class="btn sec" href="/api/logs.txt">Download log for support</a></div>
+<p class="note">Updates check themselves: if a new version doesn't start, the previous one is put back automatically.
+Support: wavelensapp@gmail.com — attach the downloaded log.</p></div>"""
+        elif update_running():
+            banner += '<div class="flash">An update is running → <a href="/update">watch it on the Update page</a>. The phone may lose the scanner for up to a minute.</div>'
+        uj = read_json(UPDATE_JSON) or {}
+        last = uj.get("last_result") or ""
+        recent = time.time() - float(uj.get("checked_at") or 0) < 24 * 3600
+        if recent and health["ok"] and any(w in last for w in ("put back", "rolled back")):
+            banner += f'<div class="flash">Last update: {esc(last)}. The scanner is on the version that worked; nothing else needs doing.</div>'
         if upd.get("available"):
             banner = f'<div class="flash">Update <b>{esc(upd["available"])}</b> is available → <a href="/update">Update page</a></div>'
-        state_html = f'<span class="{"ok" if state == "active" else "bad"}">{esc(state)}</span>' + (f" · up {esc(up)}" if up else "")
+        state_html = (f'<span class="{"ok" if health["ok"] else "bad"}">{esc(state if not health["looping"] else "restarting over and over")}</span>'
+                      + (f" · up {esc(up)}" if up and health["ok"] else ""))
         age = ""
         if st.get("at"):
             age = f'<tr><th>Reported</th><td>{int(time.time() - float(st["at"]))} s ago</td></tr>'

@@ -21,11 +21,40 @@ RUN=/run/wavelens
 DEFAULTS=/etc/default/wavelens-bridge
 SRC_FILE=/etc/wavelens/source
 FW_URL=https://github.com/pmcbrien/wavelens/releases/download/firmware
+LOGF=$STATE_DIR/update.log      # the last apply/rollback, line by line; the admin page shows it after a restart
+LOCKF=$RUN/update.lock
 
 log() { echo "update: $*"; }
 die() { echo "update: $*" >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || die "run with sudo"
 mkdir -p "$STATE_DIR" "$RUN"
+
+# apply / rollback restart wavelens-bridge and wavelens-admin. Started from the phone (the bridge) or the admin
+# page, this script is a child of the very service it restarts, so the restart would kill it before the health
+# check and the rollback. Run those two in a transient unit of their own and follow its log from here instead.
+case "${1:-}" in apply|rollback)
+    if [ -z "${WAVELENS_UPDATE_DETACHED:-}" ] && command -v systemd-run >/dev/null 2>&1; then
+        unit="wavelens-update-run"
+        if systemctl is-active -q "$unit" 2>/dev/null; then die "an update is already running"; fi
+        systemctl reset-failed "$unit" 2>/dev/null || true
+        : > "$LOGF"; rm -f "$STATE_DIR/update.rc"
+        systemd-run --unit="$unit" --quiet --collect --setenv=WAVELENS_UPDATE_DETACHED=1 \
+            ${WAVELENS_SRC:+--setenv=WAVELENS_SRC="$WAVELENS_SRC"} /usr/local/bin/wavelens-update "$@" \
+            || die "could not start the update job"
+        shown=0
+        while :; do
+            st=$(systemctl is-active "$unit" 2>/dev/null)
+            n=$(wc -l < "$LOGF" 2>/dev/null || echo 0)
+            [ "$n" -gt "$shown" ] && { sed -n "$((shown + 1)),${n}p" "$LOGF"; shown=$n; }
+            case "$st" in active|activating|reloading) sleep 1 ;; *) break ;; esac
+        done
+        exit "$(cat "$STATE_DIR/update.rc" 2>/dev/null || echo 1)"
+    fi
+    exec 9>"$LOCKF"
+    flock -n 9 || die "an update is already running"
+    exec > >(tee -a "$LOGF") 2>&1
+    trap 'echo $? > "$STATE_DIR/update.rc"' EXIT ;;
+esac
 
 # Where the checkout is.
 if [ -n "${WAVELENS_SRC:-}" ]; then SRC=$WAVELENS_SRC
@@ -80,7 +109,8 @@ install_files() {   # from $SRC into $LIB (same list as install-service.sh)
     install -m 0644 "$SRC"/packs/??.json "$LIB/packs/" 2>/dev/null || true
     install -m 0644 "$SRC/companion/VERSION" "$LIB/VERSION"
     install -m 0644 "$p/wavelens-bridge.default" "$LIB/wavelens-bridge.default"
-    install -m 0755 "$p/wavelens-update" /usr/local/bin/wavelens-update
+    # never rewrite the running script in place: bash reads it as it goes
+    install -m 0755 "$p/wavelens-update" /usr/local/bin/.wavelens-update.new && mv -f /usr/local/bin/.wavelens-update.new /usr/local/bin/wavelens-update
     [ -f "$p/wavelens-admin" ] && install -m 0755 "$p/wavelens-admin" /usr/local/bin/wavelens-admin
     install -m 0644 "$p/wavelens-bridge.service" /etc/systemd/system/
     [ -f "$p/wavelens-admin.service" ] && install -m 0644 "$p/wavelens-admin.service" /etc/systemd/system/
@@ -102,51 +132,118 @@ fetch_firmware() {   # the Spotter firmware that matches this release, for the a
     fi
 }
 
-healthy() {   # the bridge is up and got as far as advertising
-    local i=0
-    while [ $i -lt 20 ]; do
+restarts() { systemctl show -p NRestarts --value wavelens-bridge 2>/dev/null || echo 0; }
+bridge_error() {   # the bridge's own last complaint since $1, in one line, for update.json and the admin page
+    journalctl -u wavelens-bridge --since "$1" --no-pager -o cat 2>/dev/null \
+        | grep -E "Error|error:|Traceback|not found|No such|failed" | grep -v "PLL not locked" | tail -1 | cut -c1-200
+}
+healthy() {   # started after $1 (a journal timestamp), got as far as advertising, and is not crash-looping
+    local since=$1 r0 i=0
+    r0=$(restarts)
+    while [ $i -lt 25 ]; do
         sleep 1; i=$((i + 1))
+        [ "$(restarts)" = "$r0" ] || return 1          # systemd had to restart it: it crashed
         systemctl is-active -q wavelens-bridge || continue
-        if journalctl -u wavelens-bridge --since "-60s" --no-pager -o cat 2>/dev/null | grep -q "advertising as\|bridge: hardware"; then return 0; fi
+        if journalctl -u wavelens-bridge --since "$since" --no-pager -o cat 2>/dev/null | grep -q "advertising as\|bridge: hardware"; then
+            sleep 3; [ "$(restarts)" = "$r0" ] && systemctl is-active -q wavelens-bridge; return
+        fi
     done
-    systemctl is-active -q wavelens-bridge   # still running after 20 s counts, even without the log line
+    # up for 25 s with no restart counts even without the log line (e.g. Bluetooth slow to come up)
+    [ "$(restarts)" = "$r0" ] && systemctl is-active -q wavelens-bridge
+}
+# Everything an update writes, beyond $LIB itself; copied into $PREV/.sys so a rollback restores all of it.
+SYS_FILES="/usr/local/bin/wavelens-update /usr/local/bin/wavelens-admin /etc/systemd/system/wavelens-bridge.service
+/etc/systemd/system/wavelens-admin.service /etc/systemd/system/wavelens-update.service /etc/systemd/system/wavelens-update.timer"
+
+snapshot_good() {   # $LIB (+ system files) -> $PREV, the version a failed update falls back to
+    rm -rf "$PREV.new"; cp -a "$LIB" "$PREV.new" || return 1
+    mkdir -p "$PREV.new/.sys"
+    local f; for f in $SYS_FILES; do [ -f "$f" ] && cp -a "$f" "$PREV.new/.sys/$(basename "$f")"; done
+    rm -rf "$PREV"; mv "$PREV.new" "$PREV"
+}
+
+preflight() {   # the new code at least loads on this Pi's Python, before anything is restarted
+    local out
+    out=$(cd /tmp && timeout 30 python3 "$LIB/wavelens_bridge.py" --help 2>&1 >/dev/null) \
+        || { echo "bridge does not load: $(printf '%s' "$out" | tail -1 | cut -c1-200)"; return 1; }
+    if [ -f "$LIB/wavelens_admin.py" ]; then
+        out=$(cd /tmp && timeout 30 python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$LIB/wavelens_admin.py" 2>&1) \
+            || { echo "admin page does not load: $(printf '%s' "$out" | tail -1 | cut -c1-200)"; return 1; }
+    fi
+    bash -n /usr/local/bin/wavelens-update 2>/dev/null || { echo "updater script is broken"; return 1; }
 }
 
 do_apply() {
     do_fetch
-    local have want
+    local have want t0 why
     have=$(installed); want=$(remote_version)
     if [ "$want" = "$have" ] && [ "${1:-}" != "--force" ]; then log "already on $have"; write_state "" "up to date"; return 0; fi
     log "updating $have -> $want"
-    git -C "$SRC" reset -q --hard origin/main || die "checkout failed"
-    rm -rf "$PREV"; [ -d "$LIB" ] && cp -a "$LIB" "$PREV"
-    install_files
+    # Fall back to what is running now only if it is actually working; a bridge that is already broken
+    # (or crash-looping) must not overwrite the last good copy.
+    if [ -d "$LIB" ] && { [ ! -d "$PREV" ] || bridge_ok_now; }; then
+        snapshot_good || die "could not save a copy of the current version; nothing changed"
+    else
+        log "keeping the saved copy of $(cat "$PREV/VERSION" 2>/dev/null || echo 'the previous version') to fall back to (the current one isn't running properly)"
+    fi
+    git -C "$SRC" reset -q --hard origin/main || die "checkout failed; nothing changed"
+    if ! ( set -e; install_files ); then
+        log "installing $want failed part-way; putting the saved version back"
+        do_rollback; write_state "$want" "update to $want could not be installed, so the saved version was put back"; return 1
+    fi
+    if ! why=$(preflight); then
+        log "$want would not start on this Pi ($why); putting the saved version back"
+        do_rollback; write_state "$want" "update to $want would not start on this Pi ($why), so the saved version was put back"; return 1
+    fi
     fetch_firmware
+    t0=$(date '+%Y-%m-%d %H:%M:%S')
     systemctl restart wavelens-bridge
     systemctl is-enabled -q wavelens-admin 2>/dev/null && systemctl restart wavelens-admin || true
-    if healthy; then
+    if healthy "$t0"; then
         write_state "" "updated to $want"
         log "done: $want is running"
         return 0
     fi
-    log "the new bridge did not come up; rolling back"
+    why=$(bridge_error "$t0")
+    log "the new bridge did not start${why:+ ($why)}; putting the saved version back"
     do_rollback
-    write_state "$want" "update to $want failed, rolled back to $have"
+    write_state "$want" "update to $want did not start, so $(installed) was put back${why:+ — $why}"
     return 1
 }
 
+bridge_ok_now() {   # running, and no restart in the last 30 s
+    systemctl is-active -q wavelens-bridge || return 1
+    local r0; r0=$(restarts); sleep 30
+    [ "$(restarts)" = "$r0" ] && systemctl is-active -q wavelens-bridge
+}
+
 do_rollback() {
-    [ -d "$PREV" ] || die "nothing to roll back to"
-    rm -rf "$LIB.failed"; mv "$LIB" "$LIB.failed"; cp -a "$PREV" "$LIB"
+    [ -d "$PREV" ] || die "nothing saved to roll back to"
+    local t0 f
+    rm -rf "$LIB.failed"; [ -d "$LIB" ] && mv "$LIB" "$LIB.failed"; cp -a "$PREV" "$LIB"
+    if [ -d "$LIB/.sys" ]; then
+        for f in $SYS_FILES; do
+            [ -f "$LIB/.sys/$(basename "$f")" ] || continue
+            cp -a "$LIB/.sys/$(basename "$f")" "$f.rb" && mv -f "$f.rb" "$f"
+        done
+        rm -rf "$LIB/.sys"
+    fi
+    systemctl daemon-reload
+    t0=$(date '+%Y-%m-%d %H:%M:%S')
     systemctl restart wavelens-bridge
     systemctl is-enabled -q wavelens-admin 2>/dev/null && systemctl restart wavelens-admin || true
-    log "rolled back to $(installed)"
+    if healthy "$t0"; then
+        log "rolled back to $(installed); the bridge is running"
+    else
+        log "rolled back to $(installed), but the bridge still isn't running: $(bridge_error "$t0")"
+        return 1
+    fi
 }
 
 case "${1:-}" in
     check) do_check ;;
     apply) do_apply "${2:-}" ;;
-    rollback) do_rollback; write_state "" "rolled back" ;;
+    rollback) if do_rollback; then write_state "" "rolled back to $(installed)"; else write_state "" "rolled back to $(installed), but the bridge is not running"; exit 1; fi ;;
     status) cat "$STATE" 2>/dev/null || echo '{"installed":"'"$(installed)"'","available":null}'; echo; [ "$(installed)" = "$(checkout_version)" ] && exit 0 || exit 10 ;;
     auto)
         do_check; rc=$?
