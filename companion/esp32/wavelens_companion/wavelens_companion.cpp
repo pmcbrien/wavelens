@@ -122,7 +122,7 @@ static uint16_t              mtu = 23;
 // Output ring: the Wi-Fi callback runs in the Wi-Fi task, so lines are queued and
 // drained from loop() where it is safe to notify.
 #define QN 24
-#define QL 240
+#define QL 384   // hello with dated version + hw is ~310 B
 static char     q[QN][QL];
 static volatile uint8_t qh = 0, qt = 0;
 
