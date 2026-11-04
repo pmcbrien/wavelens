@@ -34,6 +34,7 @@ is a forked worker process, a hung RTL-SDR is USB-reset, and a missing sensor do
 Tunables that matter for the scanner: --trunk-idle (5 s), --trunk-min-db (18), --listen-squelch,
 --moto-band, --hackrf-keep-sweeping.
 """
+from __future__ import annotations   # Pi OS Bullseye ships Python 3.9: keeps `dict | None` hints lazy
 
 import argparse
 import base64
