@@ -1115,7 +1115,7 @@ Do this on your home Wi-Fi, not on public Wi-Fi.</div>
                      f'<noscript><button class="btn sec" type="submit">Set</button></noscript></form></td></tr>')
         units_html = (f'<table>{rows}</table><p class="note">Spotters plugged into the Pi talk over the cable, not Bluetooth, and the Pi passes '
                       'what they hear to the phone. <b>Automatic</b> splits the work: one on Bluetooth, the others on the busy Wi-Fi channels '
-                      '(1, 6, 11) — or all on Wi-Fi when the phone has its own Spotter over Bluetooth. A job stays with the USB socket.</p>'
+                      '(1, 6, 11); a Spotter the phone holds over Bluetooth keeps Wi-Fi + Bluetooth on every channel. A job stays with the USB socket.</p>'
                       if units else '<p class="mut">None plugged in. Plug a Spotter into one of the Pi\'s USB ports: it is picked up within a few '
                       'seconds and the phone gets what it hears over the Pi\'s one Bluetooth link.</p>')
         body = f"""<div class="card"><h2>Spotters on this Pi</h2>{units_html}</div>

@@ -86,12 +86,15 @@ def role_commands(role: str) -> "list[dict]":
 
 def auto_roles(units: "list[str]", phone_spotter: bool) -> "dict[str, str]":
     """Split the work between the Pi's units (sorted by port, so it is stable) and, when the phone holds a
-    Spotter over Bluetooth, that one too — the phone is told to put it on Bluetooth only (see phone_role())."""
+    Spotter over Bluetooth, that one too. The Pi's units park on the busy Wi-Fi channels (1, 6, 11), where a
+    drive-past camera is heard within a beacon or two; the phone's Spotter keeps Wi-Fi + Bluetooth on every
+    channel (see phone_role()), so a network on 3, 9 or 13 is still heard, and Bluetooth is still covered."""
     n = len(units)
     if n == 0:
         return {}
-    if phone_spotter:                       # the phone's Spotter takes Bluetooth; the Pi's take Wi-Fi
-        plans = {1: ["wifi:1,6,11"], 2: ["wifi:1,6", "wifi:11"], 3: ["wifi:1", "wifi:6", "wifi:11"]}
+    if phone_spotter:                       # the phone's Spotter hops everything; the Pi's park on 1, 6, 11
+        plans = {1: ["wifi:1,6,11"], 2: ["ble", "wifi:1,6,11"], 3: ["ble", "wifi:1,6", "wifi:11"],
+                 4: ["ble", "wifi:1", "wifi:6", "wifi:11"]}
     else:
         plans = {1: ["both"], 2: ["ble", "wifi:1,6,11"], 3: ["ble", "wifi:1,6", "wifi:11"],
                  4: ["ble", "wifi:1", "wifi:6", "wifi:11"]}
@@ -324,9 +327,10 @@ class Hub:
             self.replan()
 
     def phone_role(self) -> "str | None":
-        """The job the phone should give its own Bluetooth Spotter, when the Pi's units take Wi-Fi."""
-        if self.phone_spotter and any(u.role.startswith("wifi") for u in self.units.values()):
-            return "ble"
+        """The job the phone should give its own Bluetooth Spotter while the Pi has units: Wi-Fi + Bluetooth,
+        hopping every channel — the all-channel, all-radio catch-all next to the Pi's parked units."""
+        if self.phone_spotter and self.units:
+            return "both"
         return None
 
     def changed(self) -> None:

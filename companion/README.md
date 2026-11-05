@@ -370,14 +370,15 @@ admin page's Spotter tab):
 
 | Plugged in | Automatic jobs | With a Spotter also on the phone over Bluetooth |
 |---|---|---|
-| 1 | Wi-Fi + Bluetooth | Pi's: Wi-Fi ch 1, 6, 11 · phone's: Bluetooth only |
-| 2 | Bluetooth only · Wi-Fi ch 1, 6, 11 | Wi-Fi ch 1, 6 · Wi-Fi ch 11 · phone's: Bluetooth only |
-| 3 | Bluetooth · Wi-Fi 1, 6 · Wi-Fi 11 | Wi-Fi 1 · 6 · 11 · phone's: Bluetooth only |
-| 4 | Bluetooth · Wi-Fi 1 · 6 · 11 | — |
+| 1 | Wi-Fi + Bluetooth | Pi's: Wi-Fi ch 1, 6, 11 · phone's: Wi-Fi + Bluetooth, every channel |
+| 2 | Bluetooth only · Wi-Fi ch 1, 6, 11 | same, plus phone's: Wi-Fi + Bluetooth, every channel |
+| 3 | Bluetooth · Wi-Fi 1, 6 · Wi-Fi 11 | same, plus phone's: Wi-Fi + Bluetooth, every channel |
+| 4 | Bluetooth · Wi-Fi 1 · 6 · 11 | same, plus phone's: Wi-Fi + Bluetooth, every channel |
 
 Mixing works: one Spotter paired with the phone over Bluetooth and one plugged into the Pi is the common case —
-the phone tells the Pi it holds one (`{"c":"peer","spotter":true}`), the Pi's takes Wi-Fi and the phone's is
-switched to Bluetooth only. Power: the Pi shares about 1.2 A across its USB ports (Pi 5 with the 5 A supply:
+the phone tells the Pi it holds one (`{"c":"peer","spotter":true}`); the Pi's parks on Wi-Fi 1, 6, 11 (a drive-past
+camera heard within a beacon or two: about ¾ s per round instead of 3¼ s hopping all 13) and the phone's keeps
+Wi-Fi + Bluetooth on every channel, so networks on 3, 9 or 13 and Bluetooth are still covered. Power: the Pi shares about 1.2 A across its USB ports (Pi 5 with the 5 A supply:
 1.6 A); two RTL-SDRs plus two Spotters is about 1 A, more than that wants a powered hub. The admin page's
 USB flasher asks the bridge to let go of the port (`/run/wavelens/spotter-pause`) while it flashes.
 `--no-spotters` leaves USB boards alone. Tests: `python3 -m unittest companion/pi/tests/test_spotters.py`.

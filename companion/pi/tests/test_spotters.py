@@ -108,12 +108,11 @@ class HubTest(unittest.TestCase):
         self.hub.set_role("USB 1.1", "auto")
         self.assertTrue(wait(lambda: self.a.mode == "ble"))
 
-    def test_phone_spotter_takes_bluetooth(self):
+    def test_phone_spotter_hops_everything(self):
         self.assertTrue(wait(lambda: self.a.hosted and self.b.hosted))
         self.hub.set_phone_spotter(True)
-        self.assertTrue(wait(lambda: self.a.mode == "wifi" and self.b.mode == "wifi"))
-        self.assertEqual((self.a.ch, self.b.ch), ([1, 6], [11]))
-        self.assertEqual(self.hub.phone_role(), "ble")
+        self.assertTrue(wait(lambda: self.a.mode == "ble" and self.b.mode == "wifi" and self.b.ch == [1, 6, 11]))
+        self.assertEqual(self.hub.phone_role(), "both")
 
     def test_pause_for_flasher_then_resume(self):
         self.assertTrue(wait(lambda: self.a.hosted))
@@ -140,6 +139,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(list(r(["a", "b", "c", "d"], False).values()), ["ble", "wifi:1", "wifi:6", "wifi:11"])
         self.assertEqual(list(r(["a", "b", "c", "d", "e"], False).values())[-1], "wifi:hop")
         self.assertEqual(list(r(["a"], True).values()), ["wifi:1,6,11"])
+        self.assertEqual(list(r(["a", "b"], True).values()), ["ble", "wifi:1,6,11"])
 
     def test_port_label(self):
         self.assertEqual(spotters.port_label("platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.3:1.0-port0"), "USB 1.3")
