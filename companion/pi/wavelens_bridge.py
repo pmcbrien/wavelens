@@ -56,6 +56,8 @@ import threading
 import time
 from queue import Queue, Empty
 
+import spotters                       # ESP32 Spotters plugged into this Pi over USB
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     import regions as region_packs   # noqa: E402  (companion/pi/regions.py)
@@ -115,7 +117,8 @@ def write_run_status(hw: dict | None = None) -> None:
         os.makedirs(os.path.dirname(RUN_STATUS), exist_ok=True)
         doc = {"linked": bool(state.get("linked")), "name": state.get("name"), "code": state.get("code"),
                "hw_line": (hw or {}).get("line") or state.get("hw_line"), "hw_missing": (hw or {}).get("missing", []),
-               "fw": FW, "at": int(time.time()), "update": update_info()}
+               "fw": FW, "at": int(time.time()), "update": update_info(),
+               "spotters": HUB.info() if HUB else []}
         tmp = RUN_STATUS + ".tmp"
         with open(tmp, "w") as f:
             json.dump(doc, f)
@@ -236,6 +239,7 @@ def emit(obj: dict) -> None:
 
 
 CAPS = ["rf"]
+HUB: "spotters.Hub | None" = None     # started in main(); None under --plan / tests
 START_AT = time.time()
 
 # The bridge's own journal, for the phone. Everything the bridge prints on stderr (its "bridge: …" lines
@@ -324,7 +328,7 @@ def hw_inventory() -> dict:
         elif kind == "hackrf":
             hackrf = "ok"
         elif kind == "esp32":
-            esp.append(sn or os.path.basename(d))
+            esp.append(sn or os.path.basename(d))      # counted for the line below; HUB drives them
     if hackrf == "none" and portapack_tty():
         hackrf = "portapack"                 # on the bus as a PortaPack console: ensure_hackrf_mode() flips it
     try:
@@ -355,7 +359,11 @@ def hw_inventory() -> dict:
     if rtls:
         parts.append(f"{len(rtls)} RTL-SDR (" + ", ".join(f"{r['serial'] or '?'}: {r['role']}" for r in hw["rtl"]) + ")")
     parts.append({"ok": "HackRF", "portapack": "HackRF (PortaPack menu)", "none": "no HackRF"}[hackrf])
-    if esp:
+    units = HUB.info() if HUB else []
+    if units:
+        parts.append(f"{len(units)} Spotter{'s' if len(units) != 1 else ''} on USB (" +
+                     ", ".join(f"{u['u']}: {u['role_label'] if u['hosted'] else u['msg']}" for u in units) + ")")
+    elif esp:
         parts.append(f"ESP32 on USB ({len(esp)})")
     ip = admin_address()
     if ip:
@@ -393,6 +401,12 @@ def hello() -> None:
         spec = None
     msg = {"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""),
            "caps": sorted(set(CAPS)), "hw": hw, "region": REGION["code"], "ver": VERSION, "update": update_info()}
+    if HUB:
+        msg["spotters"] = HUB.info()
+        msg["peer"] = HUB.phone_spotter          # what the Pi believes; the phone corrects it if wrong
+        pr = HUB.phone_role()
+        if pr:
+            msg["phone_spotter"] = pr        # the job for the Spotter the phone holds over Bluetooth
     if spec:
         msg["spec"] = spec
     emit(msg)
@@ -4304,6 +4318,15 @@ def run_peripheral(name: str) -> None:
         if c == "ping":
             hello()
             emit({"t": "status", "msg": "ok", "band": state["band"], "mode": state["mode"]})
+        elif c == "spotter" and HUB:
+            # Companion screen / admin page: give a Pi-hosted Spotter a job ("ble", "wifi:1,6,11", "both", "auto")
+            msg = HUB.set_role(str(cmd.get("u") or ""), str(cmd.get("role") or "auto"))
+            emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
+            hello()
+        elif c == "peer" and HUB:
+            # the phone also holds a Spotter over Bluetooth: the Pi's units take Wi-Fi, the phone's takes Bluetooth
+            HUB.set_phone_spotter(bool(cmd.get("spotter")))
+            hello()
         elif c == "blink":
             threading.Thread(target=blink, args=(int(cmd.get("v") or 5),), daemon=True).start()
             emit({"t": "status", "msg": "blinking", "band": state["band"], "mode": state["mode"]})
@@ -4817,6 +4840,8 @@ def main() -> None:
                     help="local pack to start with (its two-letter country code; the phone's choice replaces it on connect). "
                          "Packs are read from /etc/wavelens/packs, ~/.config/wavelens/packs, packs/ beside this script and the repo's packs/")
     ap.add_argument("--name", default="", help="advertised name (default Wavelens-XXXX from the adapter address)")
+    ap.add_argument("--no-spotters", action="store_true",
+                    help="don't drive ESP32 Spotters plugged into the Pi over USB (they keep talking to the phone over Bluetooth)")
     ap.add_argument("--plan", action="store_true",
                     help="print shell assignments (PLAN_RTL433_DEV, PLAN_ARGS) for the radios found, and exit; run-bridge.sh uses it when WAVELENS_AUTO=1")
     a = ap.parse_args()
@@ -4874,6 +4899,10 @@ def main() -> None:
             print("bridge: auto: no radio on the bus yet — waiting; plug one in and it is taken up", file=sys.stderr)
     AUTO["known"] = set(usb_rtl_serials()); AUTO["hackrf"] = hackrf_on_usb()
     threading.Thread(target=hotplug_watch, daemon=True).start()
+    if not a.no_spotters:
+        globals()["HUB"] = spotters.Hub(emit, lambda s: print("bridge: " + s, file=sys.stderr))
+        HUB.on_change = hello
+        CAPS.append("spotters")
     if a.hackrf_sweep or a.rtl_power or AUTO["on"]:
         threading.Thread(target=spec_pump, daemon=True).start()
     if a.hackrf_sweep:

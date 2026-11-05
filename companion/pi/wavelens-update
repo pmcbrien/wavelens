@@ -104,7 +104,7 @@ install_files() {   # from $SRC into $LIB (same list as install-service.sh)
     local p=$SRC/companion/pi
     install -d "$LIB" "$LIB/packs" "$LIB/firmware"
     install -m 0755 "$p/wavelens_bridge.py" "$p/smartnet.py" "$p/run-bridge.sh" "$LIB/"
-    install -m 0644 "$p/regions.py" "$LIB/"
+    install -m 0644 "$p/regions.py" "$p/spotters.py" "$LIB/"
     [ -f "$p/wavelens_admin.py" ] && install -m 0755 "$p/wavelens_admin.py" "$LIB/"
     install -m 0644 "$SRC"/packs/??.json "$LIB/packs/" 2>/dev/null || true
     install -m 0644 "$SRC/companion/VERSION" "$LIB/VERSION"

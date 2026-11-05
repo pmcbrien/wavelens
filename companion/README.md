@@ -357,6 +357,31 @@ reports a better scanner (`trunk` > `listen` > `sweep`) than the main one — or
 swaps the two pairings and reconnects. Pair them in any order; an ESP32 paired first ends up as the sniffer,
 not driving the Scanner tab. The journal says `companion roles: … is now the main companion` when it happens.
 
+### Spotters plugged into the Pi (USB)
+
+Plug one or more Spotters into the Pi's USB ports and the bridge drives them over the cable (`spotters.py`):
+it sends `{"c":"host"}` on the serial port, the board answers with `@`-prefixed protocol lines (firmware
+2026.11.04.3 and later; the `@` tells them from boot text), takes commands from the cable and stops
+advertising over Bluetooth. Their `wifi` / `ble` / `rf` lines reach the phone through the Pi's one Bluetooth
+link, tagged `"u": "USB 1.2"` (the socket). No extra pairing, no extra Bluetooth load on the phone.
+
+Jobs, by USB socket (kept in `/etc/wavelens/spotters.json`; change them on the phone's Companion screen or the
+admin page's Spotter tab):
+
+| Plugged in | Automatic jobs | With a Spotter also on the phone over Bluetooth |
+|---|---|---|
+| 1 | Wi-Fi + Bluetooth | Pi's: Wi-Fi ch 1, 6, 11 · phone's: Bluetooth only |
+| 2 | Bluetooth only · Wi-Fi ch 1, 6, 11 | Wi-Fi ch 1, 6 · Wi-Fi ch 11 · phone's: Bluetooth only |
+| 3 | Bluetooth · Wi-Fi 1, 6 · Wi-Fi 11 | Wi-Fi 1 · 6 · 11 · phone's: Bluetooth only |
+| 4 | Bluetooth · Wi-Fi 1 · 6 · 11 | — |
+
+Mixing works: one Spotter paired with the phone over Bluetooth and one plugged into the Pi is the common case —
+the phone tells the Pi it holds one (`{"c":"peer","spotter":true}`), the Pi's takes Wi-Fi and the phone's is
+switched to Bluetooth only. Power: the Pi shares about 1.2 A across its USB ports (Pi 5 with the 5 A supply:
+1.6 A); two RTL-SDRs plus two Spotters is about 1 A, more than that wants a powered hub. The admin page's
+USB flasher asks the bridge to let go of the port (`/run/wavelens/spotter-pause`) while it flashes.
+`--no-spotters` leaves USB boards alone. Tests: `python3 -m unittest companion/pi/tests/test_spotters.py`.
+
 ### Who hears what
 
 Nothing is handed off: every radio in the car listens, and their hits merge in the phone by address (strongest

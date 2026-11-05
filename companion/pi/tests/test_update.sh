@@ -51,7 +51,7 @@ ORIGIN=$T/origin.git; WORK=$T/work; SRC=$T/src
 git init -q --bare -b main "$ORIGIN"
 git init -q -b main "$WORK"
 mkdir -p "$WORK/companion/pi" "$WORK/packs"
-cp "$PI"/wavelens_bridge.py "$PI"/smartnet.py "$PI"/run-bridge.sh "$PI"/regions.py "$PI"/wavelens_admin.py \
+cp "$PI"/wavelens_bridge.py "$PI"/smartnet.py "$PI"/run-bridge.sh "$PI"/regions.py "$PI"/spotters.py "$PI"/wavelens_admin.py \
    "$PI"/wavelens-admin "$PI"/wavelens-update "$PI"/wavelens-bridge.default "$PI"/*.service "$PI"/*.timer "$WORK/companion/pi/"
 release() {   # release <version> [ok|noload|crash]
     echo "$1" > "$WORK/companion/VERSION"

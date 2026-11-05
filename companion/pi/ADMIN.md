@@ -33,7 +33,7 @@ later visit asks for that password; a login lasts 12 hours on that device. Chang
 | **Settings** | The radio name the app lists under *Find*, and the bridge's options from `/etc/default/wavelens-bridge`, with the file's own explanations below. Saving restarts the bridge. |
 | **Update** | Installed and available version, *Check now*, *Install update*, *Roll back to previous*, and a box for installing updates automatically overnight. Progress streams onto the page. Updates are free for life and come from the public GitHub repo `pmcbrien/wavelens`; the Pi needs Wi-Fi to fetch them. |
 | **Wi-Fi** | Networks nearby, join one, forget saved ones, and rename the Pi. Do this on your home Wi-Fi, not public Wi-Fi: the password you type travels over the local network unencrypted. |
-| **Spotter** | Flash a Wavelens Spotter (ESP32) plugged into the Pi's USB: download the latest firmware, or upload a `.bin`, pick the port, flash. Progress streams onto the page. Needs `esptool` on the Pi (`sudo apt install esptool`). |
+| **Spotter** | *Spotters on this Pi*: each ESP32 plugged into the Pi's USB, whether it's working, what it's heard, and its job (Automatic, Bluetooth only, a Wi-Fi channel, …) — change it from the list. Then flash a Spotter plugged into the Pi's USB: download the latest firmware, or upload a `.bin`, pick the port, flash. Progress streams onto the page. Needs `esptool` on the Pi (`sudo apt install esptool`). |
 | **Power** | Restart the bridge, restart the admin page, reboot, shut down. Each asks you to confirm. |
 | **Account** | Change the admin password, log out. |
 

@@ -20,7 +20,7 @@ fi
 
 install -d /usr/local/lib/wavelens /usr/local/lib/wavelens/packs /usr/local/lib/wavelens/firmware /etc/wavelens /var/lib/wavelens
 install -m 0755 wavelens_bridge.py smartnet.py run-bridge.sh /usr/local/lib/wavelens/
-install -m 0644 regions.py /usr/local/lib/wavelens/
+install -m 0644 regions.py spotters.py /usr/local/lib/wavelens/
 install -m 0644 ../../packs/??.json /usr/local/lib/wavelens/packs/ 2>/dev/null || true
 install -m 0644 ../VERSION /usr/local/lib/wavelens/VERSION
 install -m 0644 wavelens-bridge.default /usr/local/lib/wavelens/wavelens-bridge.default   # the admin page's help text

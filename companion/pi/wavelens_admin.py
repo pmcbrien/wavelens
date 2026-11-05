@@ -64,6 +64,9 @@ UPLOAD_BIN = "/tmp/wavelens-upload.bin"
 DEFAULTS_FILE = "/etc/default/wavelens-bridge"
 ADMIN_JSON = "/etc/wavelens/admin.json"
 STATUS_JSON = "/run/wavelens/status.json"
+SPOTTER_ROLES = "/etc/wavelens/spotters.json"   # owner-chosen jobs for Spotters on USB, by port; the bridge re-reads it
+SPOTTER_JOBS = [("auto", "Automatic"), ("ble", "Bluetooth only"), ("wifi:1,6,11", "Wi-Fi ch 1, 6, 11"), ("wifi:1", "Wi-Fi ch 1"),
+                ("wifi:6", "Wi-Fi ch 6"), ("wifi:11", "Wi-Fi ch 11"), ("wifi:hop", "Wi-Fi, all channels"), ("both", "Wi-Fi + Bluetooth")]
 UPDATE_JSON = "/var/lib/wavelens/update.json"
 UPDATE_CLI = "/usr/local/bin/wavelens-update"
 UPDATE_LOG = "/var/lib/wavelens/update.log"     # written by wavelens-update apply/rollback; survives this page restarting
@@ -1098,7 +1101,25 @@ Do this on your home Wi-Fi, not on public Wi-Fi.</div>
         port_html = "".join(f'<option value="{esc(p)}">{esc(p)}</option>' for p in ports) or '<option value="">no Spotter found on USB</option>'
         tool_html = ('<span class="ok">esptool found</span>' if tool else
                      '<span class="bad">esptool is not installed</span> — over SSH run <code>sudo apt install esptool</code> (or <code>pip install esptool</code>), then reload.')
-        body = f"""<div class="card"><h2>1 · Firmware</h2><table>
+        units = (read_json(STATUS_JSON) or {}).get("spotters") or []
+        rows = ""
+        for u in units:
+            cur = "auto" if u.get("auto") else u.get("role", "auto")
+            opts = "".join(f'<option value="{k}"{" selected" if k == cur else ""}>{esc(v)}</option>' for k, v in SPOTTER_JOBS)
+            state = ('<span class="ok">working</span>' if u.get("ok") else
+                     f'<span class="bad">{esc(u.get("msg") or "not answering")}</span>')
+            rows += (f'<tr><th>{esc(u.get("u", "?"))}</th><td>{esc(u.get("name") or "ESP32")} {esc(u.get("ver") or "")}<br>'
+                     f'{state} · {int(u.get("hits") or 0)} heard · now: {esc(u.get("role_label") or "")}{" (automatic)" if u.get("auto") else ""}</td>'
+                     f'<td><form method="post" action="/spotter" class="inline">{csrf_field(sess)}<input type="hidden" name="do" value="role">'
+                     f'<input type="hidden" name="id" value="{esc(u.get("id", ""))}"><select name="role" onchange="this.form.submit()">{opts}</select>'
+                     f'<noscript><button class="btn sec" type="submit">Set</button></noscript></form></td></tr>')
+        units_html = (f'<table>{rows}</table><p class="note">Spotters plugged into the Pi talk over the cable, not Bluetooth, and the Pi passes '
+                      'what they hear to the phone. <b>Automatic</b> splits the work: one on Bluetooth, the others on the busy Wi-Fi channels '
+                      '(1, 6, 11) — or all on Wi-Fi when the phone has its own Spotter over Bluetooth. A job stays with the USB socket.</p>'
+                      if units else '<p class="mut">None plugged in. Plug a Spotter into one of the Pi\'s USB ports: it is picked up within a few '
+                      'seconds and the phone gets what it hears over the Pi\'s one Bluetooth link.</p>')
+        body = f"""<div class="card"><h2>Spotters on this Pi</h2>{units_html}</div>
+<div class="card"><h2>1 · Firmware</h2><table>
 <tr><th>Installed file</th><td>{esc(fw_ver) if os.path.isfile(FW_BIN) else '<span class=mut>none</span>'}</td></tr>
 <tr><th>Uploaded file</th><td>{'present' if os.path.isfile(UPLOAD_BIN) else '<span class=mut>none</span>'}</td></tr></table>
 <div class="row"><form method="post" action="/spotter" class="inline">{csrf_field(sess)}<input type="hidden" name="do" value="download">
@@ -1118,6 +1139,24 @@ restarts by itself afterwards.</p></div>
 
     def post_spotter(self, sess, form, files, tok):
         do = form.get("do")
+        if do == "role":
+            uid, role = form.get("id", ""), form.get("role", "auto")
+            if not uid or role not in dict(SPOTTER_JOBS) or "/" in uid:
+                self.flash(sess, "Pick a job from the list.")
+            else:
+                roles = read_json(SPOTTER_ROLES) or {}
+                if not isinstance(roles, dict):
+                    roles = {}
+                if role == "auto":
+                    roles.pop(uid, None)
+                else:
+                    roles[uid] = role
+                os.makedirs(os.path.dirname(SPOTTER_ROLES), exist_ok=True)
+                with open(SPOTTER_ROLES + ".tmp", "w") as f:
+                    json.dump(roles, f, indent=1)
+                os.replace(SPOTTER_ROLES + ".tmp", SPOTTER_ROLES)
+                self.flash(sess, f"Job set to {dict(SPOTTER_JOBS)[role]}. The Spotter switches within a few seconds.")
+            return self.redirect("/spotter")
         if do == "download":
             threading.Thread(target=self.download_firmware, daemon=True).start()
             self.flash(sess, "Downloading firmware from GitHub; reload in a few seconds.")
@@ -1151,7 +1190,12 @@ restarts by itself afterwards.</p></div>
                 self.flash(sess, "esptool is not installed: sudo apt install esptool")
             elif path:
                 offset = "0x0" if "merged" in name.lower() else "0x10000"
-                argv = tool + ["--chip", "esp32", "--port", port, "--baud", "460800", "write_flash", offset, path]
+                # The bridge drives Spotters plugged in here (spotters.py): ask it to let go of this port for the
+                # flash, and take the request back afterwards whatever esptool's result.
+                pause = ('p="$1"; shift; mkdir -p /run/wavelens; echo "$p" >> /run/wavelens/spotter-pause; sleep 2; "$@"; rc=$?; '
+                         'grep -vxF "$p" /run/wavelens/spotter-pause > /run/wavelens/spotter-pause.n 2>/dev/null; '
+                         'mv -f /run/wavelens/spotter-pause.n /run/wavelens/spotter-pause; exit $rc')
+                argv = ["/bin/sh", "-c", pause, "sh", port] + tool + ["--chip", "esp32", "--port", port, "--baud", "460800", "write_flash", offset, path]
                 if FLASH_JOB.start("flash " + name, argv, timeout=600):
                     self.flash(sess, f"Flashing {name} at {offset} on {port}. Watch the progress box.")
                 else:

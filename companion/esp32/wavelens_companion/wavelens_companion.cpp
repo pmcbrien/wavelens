@@ -118,6 +118,10 @@ static NimBLECharacteristic* txChar = nullptr;
 static NimBLECharacteristic* rxChar = nullptr;
 static volatile bool         linked = false;
 static uint16_t              mtu = 23;
+// Hosted: plugged into a Wavelens Pi over USB. The Pi said {"c":"host"} on the serial port; lines then go out
+// on Serial with an '@' in front (so the Pi tells them from boot and debug text), commands come in on Serial,
+// and the board stops advertising over Bluetooth so the phone doesn't see a second Spotter to pair.
+static volatile bool         usbHost = false;
 
 // Output ring: the Wi-Fi callback runs in the Wi-Fi task, so lines are queued and
 // drained from loop() where it is safe to notify.
@@ -136,6 +140,13 @@ static bool enqueue(const char* s) {
 
 static void drain() {
   while (qt != qh) {
+    if (usbHost) {
+      const char* s = q[qt];
+      size_t len = strlen(s);
+      Serial.write('@');
+      Serial.write((const uint8_t*)s, len);
+      if (len == 0 || s[len - 1] != '\n') Serial.write('\n');
+    }
     if (linked && txChar) {
       const char* s = q[qt];
       size_t len = strlen(s);
@@ -200,7 +211,7 @@ static void hello() {
   hwJson(hw, sizeof hw);
   char line[QL];
   snprintf(line, sizeof line,
-           "{\"t\":\"hello\",\"fw\":\"%s\",\"ver\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\",\"ota\"%s%s%s%s]%s,\"hw\":%s}\n",
+           "{\"t\":\"hello\",\"fw\":\"%s\",\"ver\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\"%s%s%s%s]%s,\"hw\":%s}\n",
            FW_NAME, WL_VERSION, devName, pairCode,
 #if defined(HAS_RX5808) || defined(HAS_SPECTRUM)
            ",\"rf\"",
@@ -1126,11 +1137,46 @@ class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer*, NimBLEConnInfo&) override { linked = true; hello(); }
   void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
     linked = false; mtu = 23;
-    NimBLEDevice::startAdvertising();
+    if (!usbHost) NimBLEDevice::startAdvertising();   // a Pi-hosted board stays off the phone's list
   }
   void onMTUChange(uint16_t m, NimBLEConnInfo&) override { mtu = m; }
 };
 static ServerCB serverCb;
+
+// ------------------------------------------------------------------ commands from the Pi over USB
+
+static char serBuf[1024]; static size_t serLen = 0;   // a channel list for a parked radio can be long
+
+static void serialTick() {
+  while (Serial.available() > 0) {
+    int b = Serial.read();
+    if (b < 0) break;
+    if (b == '\r') continue;
+    if (b != '\n') {
+      if (serLen < sizeof serBuf - 1) serBuf[serLen++] = (char)b; else serLen = 0;
+      continue;
+    }
+    serBuf[serLen] = 0;
+    if (serLen && serBuf[0] == '{') {
+      if (strstr(serBuf, "\"c\":\"host\"")) {
+        if (!usbHost) {
+          usbHost = true;
+          if (!linked) NimBLEDevice::stopAdvertising();
+          Serial.println("host: driven by the Pi over USB");
+        }
+        hello();
+        status("hosted by the Pi over USB");
+      } else if (strstr(serBuf, "\"c\":\"unhost\"")) {
+        usbHost = false;
+        NimBLEDevice::startAdvertising();
+        Serial.println("host: released; advertising again");
+      } else {
+        applyCommand(serBuf);
+      }
+    }
+    serLen = 0;
+  }
+}
 
 // ------------------------------------------------------------------ setup / loop
 
@@ -1179,6 +1225,7 @@ void setup() {
 void loop() {
   uint32_t now = millis();
   if (otaOn) { ledTick(now); drain(); delay(2); return; }   // firmware coming in: nothing else touches the radio
+  serialTick();
   wifiTick(now);
   rfTick(now);
   subghzTick();
