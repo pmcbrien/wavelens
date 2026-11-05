@@ -35,6 +35,9 @@ def check(pack: dict, fname: str, pack_ids) -> list:
     if pack.get("status", "testing") not in ("stable", "testing"): p.append('"status" must be stable or testing')
     if pack.get("units", "metric") not in ("metric", "imperial"): p.append('"units" must be metric or imperial')
     if not pack.get("maintainers"): p.append('"maintainers" must name at least one person or group')
+    legal = pack.get("legal")
+    if not isinstance(legal, list) or not legal or not all(isinstance(x, str) and x.strip() for x in legal):
+        p.append('"legal" must be a non-empty list of strings: what the law here says about receiving radio and detectors')
     for rid in pack.get("disable_rules", []):
         if pack_ids is not None and rid not in pack_ids: p.append(f'disable_rules: "{rid}" is not a rule in signatures.json')
     seen = set()

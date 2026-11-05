@@ -36,6 +36,7 @@ The app ships one built-in pack (US settings) and uses it by default. Anyone can
   "rules": [],
   "disable_rules": [],
   "notes": ["Shown under the pack on the phone: what is different, what you checked about local law."],
+  "legal": ["Required. What the law in this country says about receiving radio, scanners in vehicles and detectors. The app shows it before the Scanner's first use and on the packs screen."],
   "companion": {
     "drop_us_bands": true,
     "rtl433_args": "-f 433.92M -f 868M -H 30 -g 40",

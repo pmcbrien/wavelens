@@ -17,6 +17,9 @@
   "notes": [
     "What is different here, and anything you checked about local law."
   ],
+  "legal": [
+    "What the law here says about receiving radio, scanners in vehicles and detectors. Shown before the Scanner's first use. General information, not legal advice."
+  ],
   "companion": {
     "drop_us_bands": true,
     "rtl433_args": "-f 433.92M -f 868M -H 30 -g 40",
