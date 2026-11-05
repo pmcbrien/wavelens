@@ -52,7 +52,7 @@ case "${1:-}" in apply|rollback)
     fi
     exec 9>"$LOCKF"
     flock -n 9 || die "an update is already running"
-    exec > >(tee -a "$LOGF") 2>&1
+    [ -n "${WAVELENS_UPDATE_REEXEC:-}" ] || exec > >(tee -a "$LOGF") 2>&1   # a re-exec already writes the log
     trap 'echo $? > "$STATE_DIR/update.rc"' EXIT ;;
 esac
 
@@ -109,9 +109,12 @@ do_check() {
 install_files() {   # from $SRC into $LIB (same list as install-service.sh)
     local p=$SRC/companion/pi
     install -d "$LIB" "$LIB/packs" "$LIB/firmware"
-    install -m 0755 "$p/wavelens_bridge.py" "$p/smartnet.py" "$p/run-bridge.sh" "$LIB/"
-    install -m 0644 "$p/regions.py" "$p/spotters.py" "$LIB/"
-    [ -f "$p/wavelens_admin.py" ] && install -m 0755 "$p/wavelens_admin.py" "$LIB/"
+    # every module the bridge might import, not a hand-kept list: a new .py (spotters.py, 4 Nov) that the
+    # list forgot made the update fail preflight with ModuleNotFoundError and roll back
+    install -m 0644 "$p"/*.py "$LIB/"
+    install -m 0755 "$p/run-bridge.sh" "$LIB/"
+    chmod 0755 "$LIB/wavelens_bridge.py" "$LIB/smartnet.py"
+    [ -f "$LIB/wavelens_admin.py" ] && chmod 0755 "$LIB/wavelens_admin.py"
     install -m 0644 "$SRC"/packs/??.json "$LIB/packs/" 2>/dev/null || true
     install -m 0644 "$SRC/companion/VERSION" "$LIB/VERSION"
     install -m 0644 "$p/wavelens-bridge.default" "$LIB/wavelens-bridge.default"
@@ -184,6 +187,18 @@ do_apply() {
     local have want t0 why
     have=$(installed); want=$(remote_version)
     if [ "$want" = "$have" ] && [ "${1:-}" != "--force" ]; then log "already on $have"; write_state "" "up to date"; return 0; fi
+    # Run the updater that ships with the new version, not the one installed now: an old updater installs
+    # the new bridge with its old file list and old checks. Once per run (WAVELENS_UPDATE_REEXEC).
+    if [ -z "${WAVELENS_UPDATE_REEXEC:-}" ]; then
+        local next=/usr/local/bin/.wavelens-update.next
+        if git -C "$SRC" show origin/main:companion/pi/wavelens-update > "$next" 2>/dev/null \
+            && bash -n "$next" && ! cmp -s "$next" /usr/local/bin/wavelens-update; then
+            chmod 0755 "$next" && mv -f "$next" /usr/local/bin/wavelens-update
+            log "updater changed; continuing with the new one"
+            WAVELENS_UPDATE_REEXEC=1 exec /usr/local/bin/wavelens-update apply ${1:+"$1"}
+        fi
+        rm -f "$next"
+    fi
     log "updating $have -> $want"
     # Fall back to what is running now only if it is actually working; a bridge that is already broken
     # (or crash-looping) must not overwrite the last good copy.
