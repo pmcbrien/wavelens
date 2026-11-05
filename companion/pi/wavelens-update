@@ -62,8 +62,14 @@ elif [ -f "$SRC_FILE" ]; then SRC=$(cat "$SRC_FILE")
 elif [ -d /opt/wavelens/.git ]; then SRC=/opt/wavelens
 else SRC=$(ls -d /home/*/wavelens/.git 2>/dev/null | head -1 | xargs -r dirname); fi
 [ -n "$SRC" ] && [ -d "$SRC/.git" ] || die "no checkout found; clone https://github.com/pmcbrien/wavelens to /opt/wavelens (or write its path to $SRC_FILE)"
-# git refuses to touch a checkout owned by another user unless told it's fine
-git config --global --add safe.directory "$SRC" 2>/dev/null || true
+# git refuses to touch a checkout owned by another user (root updating /home/pi/wavelens) unless told it's
+# fine. This runs as root inside a systemd-run unit, which has no HOME, so --global silently did nothing and
+# every fetch died with "dubious ownership". Write it to the system config (/etc/gitconfig) once instead, and
+# also pass it on the command line for this run so a read-only /etc can't break the update either.
+export HOME="${HOME:-/root}"
+git config --system --get-all safe.directory 2>/dev/null | grep -qxF "$SRC" \
+    || git config --system --add safe.directory "$SRC" 2>/dev/null || true
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$SRC"
 
 installed() { cat "$LIB/VERSION" 2>/dev/null || echo "unknown"; }
 checkout_version() { cat "$SRC/companion/VERSION" 2>/dev/null || echo "unknown"; }
