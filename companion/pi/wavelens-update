@@ -132,8 +132,16 @@ fetch_firmware() {   # the Spotter firmware that matches this release, for the a
     v=$(curl -fsSL --max-time 20 "$FW_URL/VERSION" 2>/dev/null | tr -d '[:space:]') || return 0
     [ -n "$v" ] || return 0
     [ "$(cat "$LIB/firmware/VERSION" 2>/dev/null)" = "$v" ] && return 0
+    # one image per chip; the classic ESP32 one must arrive, the others are best effort (a release may lack one)
     if curl -fsSL --max-time 120 -o "$LIB/firmware/wavelens-esp32.bin.part" "$FW_URL/wavelens-esp32.bin"; then
         mv "$LIB/firmware/wavelens-esp32.bin.part" "$LIB/firmware/wavelens-esp32.bin"
+        for c in esp32s3 esp32c3 esp32c5 esp32c6; do
+            if curl -fsSL --max-time 120 -o "$LIB/firmware/wavelens-$c.bin.part" "$FW_URL/wavelens-$c.bin"; then
+                mv "$LIB/firmware/wavelens-$c.bin.part" "$LIB/firmware/wavelens-$c.bin"
+            else
+                rm -f "$LIB/firmware/wavelens-$c.bin.part"
+            fi
+        done
         echo "$v" > "$LIB/firmware/VERSION"
         log "Spotter firmware $v downloaded"
     else

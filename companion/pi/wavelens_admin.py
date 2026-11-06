@@ -59,6 +59,12 @@ FW_DIR = os.path.join(LIB_DIR, "firmware")
 FW_BIN = os.path.join(FW_DIR, "wavelens-esp32.bin")
 FW_VERSION = os.path.join(FW_DIR, "VERSION")
 FW_URL = "https://github.com/pmcbrien/wavelens/releases/download/firmware/wavelens-esp32.bin"
+# one app image per chip; FW_BIN (classic ESP32) is the one every release has
+FW_CHIPS = ("esp32", "esp32s3", "esp32c3", "esp32c5", "esp32c6")
+
+
+def fw_bin_for(chip: str) -> str:
+    return os.path.join(FW_DIR, f"wavelens-{chip}.bin")
 FW_VERSION_URL = "https://github.com/pmcbrien/wavelens/releases/download/firmware/VERSION"
 UPLOAD_BIN = "/tmp/wavelens-upload.bin"
 DEFAULTS_FILE = "/etc/default/wavelens-bridge"
@@ -1179,7 +1185,8 @@ restarts by itself afterwards.</p></div>
             if port not in glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"):
                 self.flash(sess, "That USB port isn't there any more; reload and pick again.")
             elif src == "installed" and os.path.isfile(FW_BIN):
-                path, name = FW_BIN, os.path.basename(FW_BIN)
+                # resolved at flash time: the job asks the board which chip it is and flashes wavelens-<chip>.bin
+                path, name = "@installed", "wavelens-<chip>.bin"
             elif src == "upload" and os.path.isfile(UPLOAD_BIN):
                 path, name = UPLOAD_BIN, read_text(UPLOAD_BIN + ".name").strip() or "upload.bin"
             else:
@@ -1195,7 +1202,17 @@ restarts by itself afterwards.</p></div>
                 pause = ('p="$1"; shift; mkdir -p /run/wavelens; echo "$p" >> /run/wavelens/spotter-pause; sleep 2; "$@"; rc=$?; '
                          'grep -vxF "$p" /run/wavelens/spotter-pause > /run/wavelens/spotter-pause.n 2>/dev/null; '
                          'mv -f /run/wavelens/spotter-pause.n /run/wavelens/spotter-pause; exit $rc')
-                argv = ["/bin/sh", "-c", pause, "sh", port] + tool + ["--chip", "esp32", "--port", port, "--baud", "460800", "write_flash", offset, path]
+                if path == "@installed":
+                    # ask the board what it is (esptool prints "Chip is ESP32-C6 …" / "Chip type: ESP32-C6 …"), then
+                    # flash the image built for that chip. A chip this release has no image for stops with a message.
+                    pick = ('c=$("$@" --port "$P" chip_id 2>&1 | grep -oE "ESP32-(S3|C3|C5|C6)" | head -1 | tr -d - | tr A-Z a-z); '
+                            '[ -n "$c" ] || c=esp32; f="$D/wavelens-$c.bin"; '
+                            'if [ ! -f "$f" ]; then echo "no Spotter firmware for $c on this Pi yet: download it, or use the browser flasher"; exit 2; fi; '
+                            'echo "chip: $c -> $f"; "$@" --chip "$c" --port "$P" --baud 460800 write_flash 0x10000 "$f"')
+                    inner = ["/bin/sh", "-c", pick, "pick"] + tool
+                    argv = ["/bin/sh", "-c", pause, "sh", port, "env", f"P={port}", f"D={FW_DIR}"] + inner
+                else:
+                    argv = ["/bin/sh", "-c", pause, "sh", port] + tool + ["--chip", "auto", "--port", port, "--baud", "460800", "write_flash", offset, path]
                 if FLASH_JOB.start("flash " + name, argv, timeout=600):
                     self.flash(sess, f"Flashing {name} at {offset} on {port}. Watch the progress box.")
                 else:
@@ -1210,11 +1227,18 @@ restarts by itself afterwards.</p></div>
         try:
             os.makedirs(FW_DIR, exist_ok=True)
             FLASH_JOB.lines.append(f"downloading {FW_URL}")
-            for url, dest in ((FW_URL, FW_BIN), (FW_VERSION_URL, FW_VERSION)):
-                req = urllib.request.Request(url, headers={"User-Agent": "wavelens-admin"})
-                with urllib.request.urlopen(req, timeout=60) as r, open(dest + ".tmp", "wb") as f:
-                    shutil.copyfileobj(r, f, 1 << 16)
-                os.replace(dest + ".tmp", dest)
+            base = FW_URL.rsplit("/", 1)[0]
+            pairs = [(FW_URL, FW_BIN)] + [(f"{base}/wavelens-{c}.bin", fw_bin_for(c)) for c in FW_CHIPS if c != "esp32"] + [(FW_VERSION_URL, FW_VERSION)]
+            for url, dest in pairs:
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "wavelens-admin"})
+                    with urllib.request.urlopen(req, timeout=60) as r, open(dest + ".tmp", "wb") as f:
+                        shutil.copyfileobj(r, f, 1 << 16)
+                    os.replace(dest + ".tmp", dest)
+                except Exception as e:  # noqa: BLE001
+                    if dest in (FW_BIN, FW_VERSION):
+                        raise          # the classic image and VERSION must arrive
+                    FLASH_JOB.lines.append(f"no {os.path.basename(dest)} in this release ({e}); skipped")
             FLASH_JOB.lines.append(f"downloaded firmware {read_text(FW_VERSION).strip() or '?'} ({os.path.getsize(FW_BIN) // 1024} KB)")
         except Exception as e:  # noqa: BLE001
             FLASH_JOB.lines.append(f"download failed: {e}")

@@ -33,6 +33,7 @@
 #include <algorithm>
 #include "esp_wifi.h"
 #include "esp_mac.h"
+#include "soc/soc_caps.h"
 #include <Update.h>
 
 static void candAdd(float mhz);               // a carrier the spectrum sweep found: Follow may tune it (SA818)
@@ -45,8 +46,15 @@ static void subghzInit();
 #endif
 #define FW_NAME     "wavelens-esp32 " WL_VERSION
 #ifndef LED_PIN
-#define LED_PIN     2            // on-board LED on most DevKit boards; set -1 if yours has none
+  #if defined(RGB_BUILTIN)
+    #define LED_PIN RGB_BUILTIN  // C3 / C5 / C6 / S3 dev kits: an addressable RGB LED; Arduino core 3 drives it with digitalWrite
+  #else
+    #define LED_PIN 2            // on-board LED on most DevKit boards; set -1 if yours has none
+  #endif
 #endif
+// Which chip this image was built for ("esp32", "esp32s3", "esp32c3", "esp32c5", "esp32c6"): sent in the
+// hello so the phone and the Pi only ever push this board the matching update.
+#define WL_CHIP     CONFIG_IDF_TARGET
 #define SVC_UUID    "57617665-6c65-6e73-0100-000000000001"
 #define TX_UUID     "57617665-6c65-6e73-0100-000000000002"
 #define RX_UUID     "57617665-6c65-6e73-0100-000000000003"
@@ -105,13 +113,19 @@ static bool     hopping = true;
 static char     devName[24] = "Wavelens-0000";   // "Wavelens-" + last 4 hex of the BT address
 static char     pairCode[5] = "0000";
 static uint32_t blinkUntil = 0;
-static uint8_t  chList[32];
+static uint8_t  chList[48];   // 13 at 2.4 GHz + 25 at 5 GHz on a C5
 static uint8_t  chCount = 0;
 static uint8_t  chIdx = 0;
 static uint32_t lastHop = 0;
 static uint8_t  curCh = 1;
 
 static const uint8_t CH_24[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+#if SOC_WIFI_SUPPORT_5G
+// ESP32-C5: the 20 MHz 5 GHz channels (UNII-1 to UNII-3); the country setting limits what is legal to send,
+// and this firmware only listens.
+static const uint8_t CH_5[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128,
+                               132, 136, 140, 144, 149, 153, 157, 161, 165};
+#endif
 
 static NimBLEServer*         server = nullptr;
 static NimBLECharacteristic* txChar = nullptr;
@@ -126,7 +140,7 @@ static volatile bool         usbHost = false;
 // Output ring: the Wi-Fi callback runs in the Wi-Fi task, so lines are queued and
 // drained from loop() where it is safe to notify.
 #define QN 24
-#define QL 384   // hello with dated version + hw is ~310 B
+#define QL 416   // hello with dated version + chip + hw is ~330 B
 static char     q[QN][QL];
 static volatile uint8_t qh = 0, qt = 0;
 
@@ -211,8 +225,13 @@ static void hello() {
   hwJson(hw, sizeof hw);
   char line[QL];
   snprintf(line, sizeof line,
-           "{\"t\":\"hello\",\"fw\":\"%s\",\"ver\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\"%s%s%s%s]%s,\"hw\":%s}\n",
-           FW_NAME, WL_VERSION, devName, pairCode,
+           "{\"t\":\"hello\",\"fw\":\"%s\",\"ver\":\"%s\",\"chip\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\"%s%s%s%s%s]%s,\"hw\":%s}\n",
+           FW_NAME, WL_VERSION, WL_CHIP, devName, pairCode,
+#if SOC_WIFI_SUPPORT_5G
+           ",\"5g\"",
+#else
+           "",
+#endif
 #if defined(HAS_RX5808) || defined(HAS_SPECTRUM)
            ",\"rf\"",
 #else
@@ -251,9 +270,13 @@ static void setChannel(uint8_t ch) {
 
 static void applyChannels() {
   if (hopping || chCount == 0) {
-    // hop: every channel for the band (2.4 GHz only on classic ESP32 / S3 / C3)
-    chCount = sizeof CH_24;
-    memcpy(chList, CH_24, chCount);
+    // hop: every channel for the band. 5 GHz exists only on an ESP32-C5; everything else is 2.4 GHz.
+    chCount = 0;
+    if (strcmp(band, "5g") != 0) { memcpy(chList, CH_24, sizeof CH_24); chCount = sizeof CH_24; }
+#if SOC_WIFI_SUPPORT_5G
+    if (strcmp(band, "2g") != 0) { memcpy(chList + chCount, CH_5, sizeof CH_5); chCount += sizeof CH_5; }
+#endif
+    if (chCount == 0) { memcpy(chList, CH_24, sizeof CH_24); chCount = sizeof CH_24; }
   }
   chIdx = 0;
   setChannel(chList[0]);
@@ -292,6 +315,9 @@ static void IRAM_ATTR sniff(void* buf, wifi_promiscuous_pkt_type_t type) {
 static void wifiStart() {
   WiFi.mode(WIFI_MODE_STA);
   WiFi.disconnect(true);
+#if SOC_WIFI_SUPPORT_5G
+  esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);   // let set_channel reach 5 GHz channels
+#endif
   esp_wifi_set_promiscuous(false);
   wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
   esp_wifi_set_promiscuous_filter(&filt);
@@ -359,7 +385,11 @@ static void bleScanStart() {
   s->setScanCallbacks(&scanCb, false);
   s->setActiveScan(true);
   s->setInterval(100);
+#if CONFIG_FREERTOS_UNICORE
+  s->setWindow(60);              // single-core chips (C3 / C5 / C6): leave the CPU and radio room for Wi-Fi sniffing
+#else
   s->setWindow(99);
+#endif
   s->setMaxResults(0);           // do not store; we stream
   s->setDuplicateFilter(false);  // repeats are the point: RSSI over time
   s->start(0, false, true);      // forever
@@ -1097,7 +1127,12 @@ static void applyCommand(const char* line) {
   } else if (!strncmp(c, "band", 4)) {
     if (strstr(v, "5g")) strcpy(band, "5g"); else if (strstr(v, "2g")) strcpy(band, "2g"); else strcpy(band, "all");
     // 5 GHz is only real on an ESP32-C5; everything else keeps sniffing 2.4 GHz and says so.
+    if (hopping) applyChannels();
+#if SOC_WIFI_SUPPORT_5G
+    status("band set");
+#else
     status(strcmp(band, "5g") == 0 ? "5 GHz requested; this chip is 2.4 GHz only" : "band set");
+#endif
   } else if (!strncmp(c, "ch", 2)) {
     if (strstr(v, "hop")) { hopping = true; applyChannels(); status("hopping"); return; }
     const char* b = strchr(v, '[');
