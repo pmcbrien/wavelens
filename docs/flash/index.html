@@ -19,7 +19,7 @@
   code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 14px; background: #1b1f24; padding: 1px 5px; border-radius: 4px; }
   ol li { margin: 4px 0; }
 </style>
-<script type="module" src="https://unpkg.com/esp-web-tools@10.1.1/dist/web/install-button.js?module"></script>
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
 </head>
 <body>
 <main>
@@ -28,9 +28,9 @@
 
   <div class="box">
     <ol>
-      <li>Plug the Spotter (or any ESP32-WROOM-32 dev board) into the computer with a <strong>data</strong> USB cable.</li>
-      <li>Click the button, pick the serial port that appears (usually <code>USB Serial</code> / <code>CP210x</code> / <code>CH340</code>), and let it run — about a minute.</li>
-      <li>When it says done, unplug and plug it back in. The LED blinks twice and it advertises as <code>Wavelens-XXXX</code>; pair it in the app.</li>
+      <li>Plug the Spotter, or any of these dev boards, into the computer with a <strong>data</strong> USB cable: classic ESP32 (ESP32-WROOM-32 / -32U), ESP32-S3, ESP32-C3, ESP32-C6 or ESP32-C5. The page reads which chip it is and installs the matching firmware. On boards with two USB ports, use the one marked <strong>USB</strong> (not UART) on a C3, C5 or C6.</li>
+      <li>Click the button, pick the serial port that appears (usually <code>USB Serial</code>, <code>USB JTAG/serial debug unit</code>, <code>CP210x</code> or <code>CH340</code>), and let it run — about a minute.</li>
+      <li>When it says done, unplug and plug it back in. The LED blinks twice (white on boards with a colour LED) and it advertises as <code>Wavelens-XXXX</code>; pair it in the app.</li>
     </ol>
     <esp-web-install-button manifest="manifest.json">
       <span slot="unsupported" class="nope">This browser can't talk to USB serial. Use Chrome or Edge on a computer.</span>
@@ -42,16 +42,16 @@
   <ul>
     <li>Try another cable; many are charge-only.</li>
     <li>Windows may need the CP210x or CH340 driver for the board's USB chip (the board's maker links it).</li>
-    <li>Some boards need <strong>BOOT</strong> held while the connection starts; the Spotter we ship doesn't.</li>
+    <li>Some boards need <strong>BOOT</strong> held while the connection starts (common on C3 SuperMini and XIAO boards: hold BOOT, tap RESET, let go of BOOT); the Spotter we ship doesn't.</li>
   </ul>
 
   <h2>Other ways to update</h2>
   <ul>
     <li><strong>From the phone, no computer:</strong> Wavelens app → <em>More → Companion radio → Update firmware</em>. The app carries the firmware inside it; the update goes over Bluetooth in about a minute.</li>
     <li><strong>From a Scanner Pi:</strong> plug the Spotter into the Pi's USB and use the admin page (<code>http://wavelens.local:8080</code> → Spotter).</li>
-    <li><strong>Command line:</strong> <code>pip install esptool</code>, then <code>esptool.py --chip esp32 write_flash 0x0 wavelens-esp32-merged.bin</code> (the image is on the <a href="https://github.com/pmcbrien/wavelens/releases/tag/firmware">firmware release</a>).</li>
+    <li><strong>Command line:</strong> <code>pip install esptool</code>, then <code>esptool.py --chip esp32 write_flash 0x0 wavelens-esp32-merged.bin</code> (for another chip swap both names, e.g. <code>--chip esp32c6</code> and <code>wavelens-esp32c6-merged.bin</code>) (the image is on the <a href="https://github.com/pmcbrien/wavelens/releases/tag/firmware">firmware release</a>).</li>
   </ul>
-  <p class="ver">Receive-only firmware; it transmits nothing. Source: <a href="https://github.com/pmcbrien/wavelens/tree/main/companion/esp32">companion/esp32</a>. Updates are free for life.</p>
+  <p class="ver">Receive-only firmware; it transmits nothing. A C3, C5 or C6 shares one core between Wi-Fi and Bluetooth, so it hears a little less than a classic ESP32; the C5 is the only one that also hears 5&nbsp;GHz Wi-Fi. Source: <a href="https://github.com/pmcbrien/wavelens/tree/main/companion/esp32">companion/esp32</a>. Updates are free for life.</p>
 </main>
 </body>
 </html>
