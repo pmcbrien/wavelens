@@ -144,12 +144,23 @@ static volatile bool         usbHost = false;
 static char     q[QN][QL];
 static volatile uint8_t qh = 0, qt = 0;
 
-static bool enqueue(const char* s) {
-  uint8_t n = (qh + 1) % QN;
-  if (n == qt) return false;                  // full: drop; the next packet will come
-  strncpy(q[qh], s, QL - 1); q[qh][QL - 1] = 0;
-  qh = n;
-  return true;
+// Two producers (the Wi-Fi task and the NimBLE host task) write this ring, so the head moves under a lock.
+static portMUX_TYPE qMux = portMUX_INITIALIZER_UNLOCKED;
+// Slots BLE may not use: in a busy street BLE adverts arrive far faster than Wi-Fi beacons and used to fill
+// the ring, so beacons (the only Wi-Fi an iPhone ever sees) were the lines that got dropped.
+#define Q_BLE_RESERVE 8
+
+static bool enqueue(const char* s, uint8_t reserve = 0) {
+  bool ok = false;
+  portENTER_CRITICAL(&qMux);
+  uint8_t used = (uint8_t)((qh + QN - qt) % QN);
+  if (used + 1 + reserve < QN) {              // otherwise full (for this kind of line): drop; the next packet will come
+    strncpy(q[qh], s, QL - 1); q[qh][QL - 1] = 0;
+    qh = (qh + 1) % QN;
+    ok = true;
+  }
+  portEXIT_CRITICAL(&qMux);
+  return ok;
 }
 
 static void drain() {
@@ -375,7 +386,7 @@ class ScanCB : public NimBLEScanCallbacks {
     snprintf(line, sizeof line,
              "{\"t\":\"ble\",\"id\":\"%s\",\"n\":\"%s\",\"r\":%d,\"pub\":%s,\"svc\":[%s],\"mfg\":{%s},\"src\":\"esp32\"}\n",
              ms, name, d->getRSSI(), d->getAddress().getType() == BLE_ADDR_PUBLIC ? "true" : "false", svc, mfg);
-    enqueue(line);
+    enqueue(line, Q_BLE_RESERVE);
   }
 };
 static ScanCB scanCb;
@@ -385,14 +396,23 @@ static void bleScanStart() {
   s->setScanCallbacks(&scanCb, false);
   s->setActiveScan(true);
   s->setInterval(100);
-#if CONFIG_FREERTOS_UNICORE
-  s->setWindow(60);              // single-core chips (C3 / C5 / C6): leave the CPU and radio room for Wi-Fi sniffing
-#else
-  s->setWindow(99);
-#endif
+  // Wi-Fi and Bluetooth share one 2.4 GHz radio. A 99% scan window left the Wi-Fi sniffer almost no air time,
+  // which an Android phone hides (it scans Wi-Fi itself) but an iPhone, which only has the Spotter, does not.
+  // 60% is what the single-core chips already used and they hear Wi-Fi fine.
+  s->setWindow(60);
   s->setMaxResults(0);           // do not store; we stream
   s->setDuplicateFilter(false);  // repeats are the point: RSSI over time
+  if (mode == M_WIFI || mode == M_RF) return;   // Wi-Fi-only / RF-only: the radio is all the sniffer's
   s->start(0, false, true);      // forever
+}
+
+// "Wi-Fi only" used to keep the BLE scan running and just discard the results, so it never gave the sniffer
+// the radio back. Start or stop the scan to match the mode.
+static void applyMode() {
+  NimBLEScan* s = NimBLEDevice::getScan();
+  bool want = !(mode == M_WIFI || mode == M_RF);
+  if (want && !s->isScanning()) s->start(0, false, true);
+  else if (!want && s->isScanning()) s->stop();
 }
 
 // ------------------------------------------------------------------ RX5808 5.8 GHz sweep (optional)
@@ -1123,6 +1143,7 @@ static void applyCommand(const char* line) {
     Mode m = M_BOTH;
     if (strstr(v, "wifi")) m = M_WIFI; else if (strstr(v, "ble")) m = M_BLE; else if (strstr(v, "\"rf\"")) m = M_RF;
     mode = m;
+    if (!otaOn) applyMode();
     status("mode set");
   } else if (!strncmp(c, "band", 4)) {
     if (strstr(v, "5g")) strcpy(band, "5g"); else if (strstr(v, "2g")) strcpy(band, "2g"); else strcpy(band, "all");
