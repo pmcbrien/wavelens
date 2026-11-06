@@ -28,7 +28,8 @@ What the app needs: **Android 8.0+**, Bluetooth LE for the companions, Wi-Fi and
 - **Two companions.** Holding a Pi link and a Spotter link at once is normal BLE; every Android 10+ phone we've tried does it. A phone that already streams to Bluetooth earbuds and a watch is holding four links — still fine, but audio may stutter on the oldest chipsets.
 - **Wi-Fi scanning throttle.** Android 9+ limits an app to four Wi-Fi scans in two minutes unless *Developer options → Wi-Fi scan throttling* is off. The app lives with the limit; a Spotter doesn't have it, which is one reason to add one.
 - **GPS.** Any phone GPS; a car mount by the windscreen gets fixes faster than a pocket.
-- **Not supported:** iPhones (an iOS build is a separate project), Android TV/Auto head units, and phones without location services.
+- **iPhone and iPad:** the iOS app (beta, free, iOS 17+) works only through a companion — a Spotter or any ESP32 with the Wavelens firmware. iOS has no Wi-Fi scan API and hides Bluetooth addresses. The Pi Scanner doesn't pair with the iOS app yet.
+- **Not supported:** Android TV/Auto head units, and phones without location services.
 
 ## The scanner computer
 
