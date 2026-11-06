@@ -122,7 +122,7 @@ def overview():
     d.lines(235, 222, ["one JSON line per hit", "band / channel commands back"], 10, BLE, 13, "middle")
 
     y = 90
-    d.box(310, y, 300, 96, "ESP32 (S3 / C3 / classic, -U = u.FL antenna)",
+    d.box(310, y, 300, 96, "ESP32 (classic or S3, -U = u.FL antenna)",
           ["hears: 2.4 GHz Wi-Fi beacons, BLE adverts", "optional: RX5808 → 5.8 GHz video carriers", "honours: park on channels 1·6·11, mode wifi/ble"], RF)
     d.yagi(650, y + 48, "2.4 GHz Yagi / panel", RF, 0.9)
     d.arrow(610, y + 48, 648, y + 48, RF, width=2)
@@ -160,7 +160,7 @@ def overview():
 
 def esp32():
     d = D(980, 700, "ESP32 companion with an external directional antenna")
-    d.lines(24, 56, ["Use a board with a u.FL / IPEX connector (ESP32-S3-WROOM-1U, ESP32-WROOM-32U, Seeed XIAO ESP32-C3).",
+    d.lines(24, 56, ["Use a board with a u.FL / IPEX connector (ESP32-WROOM-32U, or ESP32-S3-WROOM-1U).",
                      "Boards with only a PCB antenna cannot take an external one without surgery."], 12, MUTED, 16)
 
     # Board

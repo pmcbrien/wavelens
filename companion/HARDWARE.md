@@ -73,7 +73,7 @@ The single most common cause of "a dongle vanished" / "rtl_433 can't open device
 - **ESP32-WROOM-32U** dev board (the *-U* has a u.FL socket for an external antenna; that is the whole point) with a **CP2102** / CP2102N or **CH9102** USB-serial chip. Flashes without holding BOOT; shows up as `/dev/ttyUSB0` on the Pi and as a COM port on Windows without extra drivers (CH9102 may want one on older Windows).
 - **CH340** boards work; Windows needs the WCH driver, and some need BOOT held while flashing.
 - **ESP32-WROOM-32** with the PCB antenna: works, hears less, no antenna upgrade path.
-- **ESP32-S3**: supported build (`[env:esp32s3]`), no classic Bluetooth needed, works. **ESP32-C3 / S2 / C6**: not supported (single core, no BLE+Wi-Fi sniff budget / no BLE on the S2).
+- **ESP32-S3**: supported build (`[env:esp32s3]`), no classic Bluetooth needed, works. **ESP32-C3 / C5 / C6 / S2**: not supported yet (single core, so Wi-Fi sniffing and Bluetooth scanning would have to take turns; no BLE at all on the S2). The browser flasher installs the classic ESP32 build only; flash an S3 with PlatformIO.
 - 4 MB flash minimum (every WROOM-32 has it); the OTA partition scheme needs it.
 - Power: any USB port, 150 mA. A charge-only cable is fine for running it; a data cable is needed only to flash from a computer.
 - Antenna: a 2.4 GHz panel or Yagi on a u.FL → SMA pigtail; the stealth stub we fit on the Spotter hears about a block further than a phone and doesn't look like anything.
