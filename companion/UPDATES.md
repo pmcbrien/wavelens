@@ -12,13 +12,14 @@ Companion screen shows the companion's version next to its name.
 
 | Way | Needs | How |
 |---|---|---|
-| **From the phone** (the usual way) | nothing but the app | *More → Companion radio*. When the app carries a newer firmware than the Spotter reports, an **Update firmware** button appears. Tap it; the image goes over Bluetooth in about a minute, the Spotter reboots into it and reconnects by itself. Don't unplug it while the bar is moving. |
-| **From a browser** | a computer with Chrome or Edge, a data USB cable | https://pmcbrien.github.io/wavelens/flash/ — plug in, click *Install*, pick the port. Also the way to put Wavelens on a blank ESP32 board, and the way to bring a Spotter with pre-2026.11 firmware (no Bluetooth updates yet) up to date once. |
-| **From a Scanner Pi** | a Scanner, a USB cable | Plug the Spotter into the Pi's USB, open the Pi's admin page (`http://wavelens.local:8080` → *Spotter*), *Flash*. The Pi keeps the current firmware image from its own updates. |
+| **From the phone** (the usual way) | nothing but the app | *More → Companion radio*. When the app carries a newer firmware for the Spotter's chip than the Spotter reports, an **Update firmware** button appears (the app carries one image per chip: classic ESP32, S3, C3, C5, C6; the Spotter's hello says which it is). Tap it; the image goes over Bluetooth in about a minute, the Spotter reboots into it and reconnects by itself. Don't unplug it while the bar is moving. |
+| **From a browser** | a computer with Chrome or Edge, a data USB cable | https://pmcbrien.github.io/wavelens/flash/ — plug in, click *Install*, pick the port. It reads the chip and installs the matching build. Also the way to put Wavelens on a blank ESP32 board, and the way to bring a Spotter with pre-2026.11 firmware (no Bluetooth updates yet) up to date once. |
+| **From a Scanner Pi** | a Scanner, a USB cable | Plug the Spotter into the Pi's USB, open the Pi's admin page (`http://wavelens.local:8080` → *Spotter*), *Flash*. The Pi keeps every chip's current image from its own updates, asks the board which chip it is, and flashes the matching one. |
 
 Command line, if you'd rather: `pip install esptool`, then
 `esptool.py --chip esp32 write_flash 0x0 wavelens-esp32-merged.bin` (image on the
-[firmware release](https://github.com/pmcbrien/wavelens/releases/tag/firmware)).
+[firmware release](https://github.com/pmcbrien/wavelens/releases/tag/firmware)). For another chip swap both names:
+`--chip esp32c6` and `wavelens-esp32c6-merged.bin`, and so on.
 
 How the Bluetooth update is safe: the firmware has two slots (OTA partitions). The new image is written to
 the spare slot and verified before the board switches to it; if it ever fails to boot, the bootloader
@@ -27,8 +28,8 @@ place.
 
 Where the firmware comes from: every change to `companion/esp32/` on `main` is built by CI
 (`.github/workflows/firmware.yml`) and published as the rolling **firmware** release on this repo, plus a
-`firmware-<version>` tag you can go back to. The Android build downloads the same image into the app, so a
-new app release carries the newest firmware.
+`firmware-<version>` tag you can go back to. The Android build downloads every chip's image into the app, so a
+new app release carries the newest firmware for each board.
 
 ## Scanner (Raspberry Pi): four ways
 
