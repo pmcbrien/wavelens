@@ -77,7 +77,12 @@ For the Play test to count, install from the Play Store after accepting the invi
 
 ## Install
 
-Wavelens is distributed only through Google Play. While it is in closed testing:
+Two ways to get it:
+
+- **Google Play** (recommended: updates arrive by themselves). While it is in closed testing, follow the steps below.
+- **Sideload APK** (no Google account needed, free): download `wavelens-sideload.apk` from the [sideload release](https://github.com/pmcbrien/wavelens/releases/tag/sideload) on your phone, open it, and allow "Install unknown apps" when Android asks. It installs as *Wavelens (sideload)* beside a Play install. It doesn't update itself: install the newer APK from the same page over the old one. Then continue from step 3.
+
+From Google Play:
 
 1. Email **[wavelensapp@gmail.com](mailto:wavelensapp@gmail.com?subject=Wavelens%20beta%20tester)** with the Google account on your phone. You'll get an opt-in link and a code that makes the app free.
 2. Open the link on your phone, tap **Become a tester**, redeem the code, and install from the Play Store.
@@ -88,7 +93,7 @@ Wavelens is distributed only through Google Play. While it is in closed testing:
 
 The first scan takes a few seconds to populate. In a city you'll see hundreds of emitters within a minute; the Live screen hides the boring ones by default (see *Main screen* in Setup).
 
-Updates arrive through the Play Store like any other app. If you installed an early test build from a download link, uninstall it before installing from Play — Android will not update across signing keys.
+Play installs update through the Play Store like any other app. If you installed an early test build from a download link, uninstall it before installing from Play — Android will not update across signing keys.
 
 ---
 
