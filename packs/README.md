@@ -51,7 +51,7 @@ The app ships one built-in pack (US settings) and uses it by default. Anyone can
 |---|---|
 | `units` | `metric` (km/h, road mode from 25 km/h) or `imperial` |
 | `scanner_idle` | `null`, or `[lo, hi]` MHz shown on the Scanner tab when nothing is tuned |
-| `rules` | Device rules in the same format as the app's signature pack. Add `"regions": ["NZ"]`. Every rule needs a `source`. OUI rules need `"publicAddr": true` and only 6-hex IEEE MA-L assignments; check the registrant really is that company |
+| `rules` | Device rules in the same format as the app's signature pack. Add `"regions": ["NZ"]`. A `source` note (where the identifier comes from) is optional. OUI rules need `"publicAddr": true` and only 6-hex IEEE MA-L assignments; check the registrant really is that company |
 | `disable_rules` | Ids of built-in rules to switch off in this pack (unlawful or meaningless there) |
 | `companion.drop_us_bands` | Forget the band names that come from the US allocation table, so an unnamed frequency shows as a plain carrier, not a wrong US label |
 | `companion.bands` | `lo`/`hi` in MHz, `name` shown on the phone, `cat` a device category, `kind` `""` (report), `persist`, `bg` (background, once a minute) or `video`; optional `steady` `{name, cat}` for a carrier that stays on. First match wins, before the built-in table |

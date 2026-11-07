@@ -48,7 +48,6 @@ def check(pack: dict, fname: str, pack_ids) -> list:
         seen.add(rid)
         if r.get("category") not in CATEGORIES: p.append(f"{rid}: unknown category {r.get('category')}")
         if r.get("confidence", "POSSIBLE") not in ("POSSIBLE", "LIKELY", "CONFIRMED"): p.append(f"{rid}: bad confidence")
-        if not r.get("source"): p.append(f"{rid}: \"source\" (where the identifier comes from) is required")
         m = r.get("match") or {}
         if not set(m) & PREDICATES: p.append(f"{rid}: match needs at least one predicate")
         for k in m:
