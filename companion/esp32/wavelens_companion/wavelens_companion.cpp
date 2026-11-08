@@ -400,8 +400,12 @@ static void IRAM_ATTR sniff(void* buf, wifi_promiscuous_pkt_type_t type) {
 }
 
 static void wifiStart() {
+  // STA mode starts the Wi-Fi driver, which the sniffer needs running. Never WiFi.disconnect(true): its "wifioff"
+  // argument stops the driver again (enableSTA(false) / STA.end() in both Arduino cores), and every promiscuous
+  // and channel call after it failed silently, so the Spotter sent no Wi-Fi lines at all. Android hid that
+  // because the phone scans Wi-Fi itself; an iPhone or iPad has only the Spotter.
   WiFi.mode(WIFI_MODE_STA);
-  WiFi.disconnect(true);
+  WiFi.disconnect(false);                         // drop any association; keep the driver up
 #if SOC_WIFI_SUPPORT_5G
   esp_wifi_set_band_mode(WIFI_BAND_MODE_AUTO);   // let set_channel reach 5 GHz channels
 #endif
@@ -409,7 +413,8 @@ static void wifiStart() {
   wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
   esp_wifi_set_promiscuous_filter(&filt);
   esp_wifi_set_promiscuous_rx_cb(&sniff);
-  esp_wifi_set_promiscuous(wifiWanted());
+  esp_err_t e = esp_wifi_set_promiscuous(wifiWanted());
+  if (e != ESP_OK) Serial.printf("wifi: sniffer did not start: %s\n", esp_err_to_name(e));
   applyChannels();
 }
 
