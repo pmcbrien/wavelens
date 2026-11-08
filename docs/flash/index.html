@@ -13,6 +13,7 @@
   a { color: #f2b705; } p, li { color: #c9cfd8; }
   .box { background: #15181b; border: 1px solid #262b31; border-radius: 12px; padding: 18px 20px; margin: 18px 0; }
   .ver { color: #8c96a3; font-size: 14px; }
+  .fw { margin: 0 0 10px; font-size: 15px; } .fw strong { color: #f2b705; font-family: ui-monospace, Menlo, Consolas, monospace; }
   esp-web-install-button { --esp-tools-button-color: #f2b705; --esp-tools-button-text-color: #111; --esp-tools-button-border-radius: 8px; }
   esp-web-install-button button { font-size: 16px; padding: 10px 18px; font-weight: 600; }
   .nope { color: #f2b705; }
@@ -24,7 +25,8 @@
 <body>
 <main>
   <h1>Flash a Wavelens Spotter</h1>
-  <p class="ver">Installs the current Spotter firmware (<a href="VERSION">version</a>) onto an ESP32 over USB, from this page. Works in Chrome and Edge on Windows, macOS, Linux and ChromeOS. Phones can't do this (no Web Serial): on Android, update from inside the Wavelens app instead — <em>More → Companion radio → Update firmware</em>, over Bluetooth.</p>
+  <p class="fw">Current firmware: <strong id="fwver"><a href="VERSION">see VERSION</a></strong></p>
+  <p class="ver">Installs the current Spotter firmware onto an ESP32 over USB, from this page. Works in Chrome and Edge on Windows, macOS, Linux and ChromeOS. Phones can't do this (no Web Serial): on Android, update from inside the Wavelens app instead — <em>More → Companion radio → Update firmware</em>, over Bluetooth.</p>
 
   <div class="box">
     <ol>
@@ -53,5 +55,12 @@
   </ul>
   <p class="ver">Receive-only firmware; it transmits nothing. A C3, C5 or C6 shares one core between Wi-Fi and Bluetooth, so it hears a little less than a classic ESP32; the C5 is the only one that also hears 5&nbsp;GHz Wi-Fi. Source: <a href="https://github.com/pmcbrien/wavelens/tree/main/companion/esp32">companion/esp32</a>. Updates are free for life.</p>
 </main>
+<script>
+  // VERSION sits next to this page (the firmware workflow writes both), so the line always matches what the button installs.
+  fetch("VERSION", { cache: "no-store" }).then(r => r.ok ? r.text() : null).then(v => {
+    v = v && v.trim();
+    if (v && /^[0-9][0-9.]*$/.test(v)) document.getElementById("fwver").textContent = v;
+  }).catch(() => {});
+</script>
 </body>
 </html>
