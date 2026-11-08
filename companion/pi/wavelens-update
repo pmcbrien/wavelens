@@ -74,7 +74,9 @@ export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$S
 installed() { cat "$LIB/VERSION" 2>/dev/null || echo "unknown"; }
 checkout_version() { cat "$SRC/companion/VERSION" 2>/dev/null || echo "unknown"; }
 remote_version() { git -C "$SRC" show origin/main:companion/VERSION 2>/dev/null || echo "unknown"; }
-linked() { python3 -c "import json,sys; print(1 if json.load(open('$RUN/status.json')).get('linked') else 0)" 2>/dev/null || echo 0; }
+# A phone counts as linked only if the bridge said so recently: while linked it rewrites status.json with every
+# hello (the app pings every 15 s), so a "linked" older than 2 minutes is left over from a bridge that died.
+linked() { python3 -c "import json,sys,time; d=json.load(open(sys.argv[1])); print(1 if d.get('linked') and time.time() - float(d.get('at') or 0) < 120 else 0)" "$RUN/status.json" 2>/dev/null || echo 0; }
 auto_enabled() { grep -qE '^WAVELENS_AUTO_UPDATE="?1"?' "$DEFAULTS" 2>/dev/null; }
 
 write_state() {   # write_state <available|null> <last_result>
@@ -128,25 +130,24 @@ install_files() {   # from $SRC into $LIB (same list as install-service.sh)
 }
 
 fetch_firmware() {   # the Spotter firmware that matches this release, for the admin page's USB flasher; best effort
-    local v
+    # All or nothing: every chip's image lands in a staging folder first, and only a complete set replaces the
+    # installed one and its VERSION. A release missing one chip's image used to leave that chip's old .bin in
+    # place under the new VERSION, so the admin page flashed stale firmware it called current.
+    local v c fw=$LIB/firmware stage
     v=$(curl -fsSL --max-time 20 "$FW_URL/VERSION" 2>/dev/null | tr -d '[:space:]') || return 0
     [ -n "$v" ] || return 0
-    [ "$(cat "$LIB/firmware/VERSION" 2>/dev/null)" = "$v" ] && return 0
-    # one image per chip; the classic ESP32 one must arrive, the others are best effort (a release may lack one)
-    if curl -fsSL --max-time 120 -o "$LIB/firmware/wavelens-esp32.bin.part" "$FW_URL/wavelens-esp32.bin"; then
-        mv "$LIB/firmware/wavelens-esp32.bin.part" "$LIB/firmware/wavelens-esp32.bin"
-        for c in esp32s3 esp32c3 esp32c5 esp32c6; do
-            if curl -fsSL --max-time 120 -o "$LIB/firmware/wavelens-$c.bin.part" "$FW_URL/wavelens-$c.bin"; then
-                mv "$LIB/firmware/wavelens-$c.bin.part" "$LIB/firmware/wavelens-$c.bin"
-            else
-                rm -f "$LIB/firmware/wavelens-$c.bin.part"
-            fi
-        done
-        echo "$v" > "$LIB/firmware/VERSION"
-        log "Spotter firmware $v downloaded"
-    else
-        rm -f "$LIB/firmware/wavelens-esp32.bin.part"
-    fi
+    [ "$(cat "$fw/VERSION" 2>/dev/null)" = "$v" ] && return 0
+    stage=$fw/.new; rm -rf "$stage"; mkdir -p "$stage" || return 0
+    for c in esp32 esp32s3 esp32c3 esp32c5 esp32c6; do
+        if ! curl -fsSL --max-time 120 -o "$stage/wavelens-$c.bin" "$FW_URL/wavelens-$c.bin" || [ ! -s "$stage/wavelens-$c.bin" ]; then
+            log "Spotter firmware $v has no wavelens-$c.bin; keeping $(cat "$fw/VERSION" 2>/dev/null || echo 'what is installed')"
+            rm -rf "$stage"; return 0
+        fi
+    done
+    for c in esp32 esp32s3 esp32c3 esp32c5 esp32c6; do mv -f "$stage/wavelens-$c.bin" "$fw/wavelens-$c.bin"; done
+    echo "$v" > "$stage/VERSION" && mv -f "$stage/VERSION" "$fw/VERSION"
+    rm -rf "$stage"
+    log "Spotter firmware $v downloaded"
 }
 
 restarts() { systemctl show -p NRestarts --value wavelens-bridge 2>/dev/null || echo 0; }
@@ -275,6 +276,13 @@ case "${1:-}" in
     rollback) if do_rollback; then write_state "" "rolled back to $(installed)"; else write_state "" "rolled back to $(installed), but the bridge is not running"; exit 1; fi ;;
     status) cat "$STATE" 2>/dev/null || echo '{"installed":"'"$(installed)"'","available":null}'; echo; [ "$(installed)" = "$(checkout_version)" ] && exit 0 || exit 10 ;;
     auto)
+        # the same lock apply/rollback take: a nightly run must not fetch, reset the checkout or install while one
+        # started from the phone or the admin page is half-way through (or the other way round)
+        exec 9>"$LOCKF"
+        flock -n 9 || { log "an update is already running; next time"; exit 0; }
+        # this run already holds the lock and is not a child of the services it restarts, so if do_apply
+        # re-execs the new updater, that must carry on here rather than start a detached job of its own
+        export WAVELENS_UPDATE_DETACHED=1
         do_check; rc=$?
         if [ $rc -eq 10 ] && auto_enabled; then
             if [ "$(linked)" = "1" ]; then log "update available but a phone is connected; next time"; exit 0; fi

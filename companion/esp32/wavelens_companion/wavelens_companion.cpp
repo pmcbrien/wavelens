@@ -45,12 +45,30 @@ static void subghzInit();
 #define WL_VERSION  "dev"        // platformio.ini injects companion/VERSION; Arduino IDE builds say "dev"
 #endif
 #define FW_NAME     "wavelens-esp32 " WL_VERSION
+// Status LED. digitalWrite() on RGB_BUILTIN drives an addressable (WS2812) LED as a NeoPixel; that is only
+// right where the boards this image goes on really have one. The one esp32c3 image is built for the
+// C3-DevKitM-1 (whose variant defines RGB_BUILTIN, a WS2812 on GPIO 8) but mostly lands on C3 SuperMini-class
+// boards, where GPIO 8 is a plain blue LED, active low: NeoPixel pulses only made it flicker. So the C3 drives
+// GPIO 8 as a plain LED (on the DevKitM-1's WS2812 that just stays dark); the S3 / C5 / C6 dev kits keep their
+// RGB LED. Your own board: -DLED_PIN=<gpio> (add -DLED_ACTIVE_LOW if it lights on LOW), or -DLED_PIN=-1 for none.
 #ifndef LED_PIN
-  #if defined(RGB_BUILTIN)
-    #define LED_PIN RGB_BUILTIN  // C3 / C5 / C6 / S3 dev kits: an addressable RGB LED; Arduino core 3 drives it with digitalWrite
+  #if defined(CONFIG_IDF_TARGET_ESP32C3)
+    #define LED_PIN 8
+    #ifndef LED_ACTIVE_LOW
+      #define LED_ACTIVE_LOW
+    #endif
+  #elif defined(RGB_BUILTIN)
+    #define LED_PIN RGB_BUILTIN  // S3 / C5 / C6 dev kits: an addressable RGB LED; the Arduino core drives it with digitalWrite
   #else
     #define LED_PIN 2            // on-board LED on most DevKit boards; set -1 if yours has none
   #endif
+#endif
+#ifdef LED_ACTIVE_LOW
+  #define LED_ON  LOW
+  #define LED_OFF HIGH
+#else
+  #define LED_ON  HIGH
+  #define LED_OFF LOW
 #endif
 // Which chip this image was built for ("esp32", "esp32s3", "esp32c3", "esp32c5", "esp32c6"): sent in the
 // hello so the phone and the Pi only ever push this board the matching update.
@@ -140,7 +158,7 @@ static volatile bool         usbHost = false;
 // Output ring: the Wi-Fi callback runs in the Wi-Fi task, so lines are queued and
 // drained from loop() where it is safe to notify.
 #define QN 24
-#define QL 416   // hello with dated version + chip + hw is ~330 B
+#define QL 512   // the longest line is the hello: see HELLO_WORST below (the compiler checks it fits)
 static char     q[QN][QL];
 static volatile uint8_t qh = 0, qt = 0;
 
@@ -163,6 +181,8 @@ static bool enqueue(const char* s, uint8_t reserve = 0) {
   return ok;
 }
 
+// The ring's only consumer: called from loop() and nowhere else. A second caller (the OTA "end" handler, which
+// runs in the NimBLE host task) could send a slot twice or skip one while both moved qt.
 static void drain() {
   while (qt != qh) {
     if (usbHost) {
@@ -231,8 +251,25 @@ static void status(const char* msg) {
 
 static void hwJson(char* out, size_t cap);   // defined with the radio modules below
 
+// Buffer sizes for the hello, checked at compile time. HW_WORST / HELLO_WORST spell out the longest line each
+// can produce, every field at its maximum at once (more than any one build can: e.g. both the sub-GHz name and
+// "no sub-GHz radio"; both SA818s fitted and silent, -DHAS_SA818_U -DHAS_SA818_V). '·' is 2 bytes in UTF-8 and
+// '—' 3. An SA818 that is fitted but silent used to push hw past its old 160 bytes, so the hello lost its tail
+// — "}\n" included — and the phone never parsed it.
+#define HW_CAP 256
+#define HW_WORST "{\"radio\":\"CC1101\",\"radioUp\":false,\"sa818u\":\"fitted\",\"sa818v\":\"fitted\",\"rx5808\":false," \
+                 "\"line\":\"no sub-GHz radio · SA818-U (silent) · SA818-V (silent) · RX5808 — " \
+                 "SA818-U not answering; SA818-V not answering; \",\"missing\":[\"radio module not answering\"]}"
+static_assert(sizeof(HW_WORST) <= HW_CAP, "hwJson() can overflow its buffer: raise HW_CAP");
+// devName is at most 23 characters, pairCode 4, the chip name ("esp32c5", …) 7.
+#define HELLO_WORST "{\"t\":\"hello\",\"fw\":\"" FW_NAME "\",\"ver\":\"" WL_VERSION "\",\"chip\":\"esp32c5\"," \
+                    "\"name\":\"XXXXXXXXXXXXXXXXXXXXXXX\",\"code\":\"XXXX\"," \
+                    "\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\",\"5g\",\"rf\",\"subghz\",\"sweep\",\"listen\",\"scan\"]," \
+                    "\"spec\":[" SPEC_RANGE_STR "]" ",\"hw\":" HW_WORST "}\n"
+static_assert(sizeof(HELLO_WORST) <= QL, "the hello can be longer than a queue line: raise QL");
+
 static void hello() {
-  char hw[160];
+  char hw[HW_CAP];
   hwJson(hw, sizeof hw);
   char line[QL];
   snprintf(line, sizeof line,
@@ -293,7 +330,10 @@ static void applyChannels() {
   setChannel(chList[0]);
 }
 
+static inline bool wifiWanted() { return mode == M_BOTH || mode == M_WIFI; }
+
 static void IRAM_ATTR sniff(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (!wifiWanted()) return;                  // Bluetooth-only / RF-only: no Wi-Fi lines (applyMode also stops promiscuous)
   if (type != WIFI_PKT_MGMT) return;
   const wifi_promiscuous_pkt_t* p = (const wifi_promiscuous_pkt_t*)buf;
   const uint8_t* f = p->payload;
@@ -333,7 +373,7 @@ static void wifiStart() {
   wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT };
   esp_wifi_set_promiscuous_filter(&filt);
   esp_wifi_set_promiscuous_rx_cb(&sniff);
-  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_promiscuous(wifiWanted());
   applyChannels();
 }
 
@@ -408,11 +448,13 @@ static void bleScanStart() {
 
 // "Wi-Fi only" used to keep the BLE scan running and just discard the results, so it never gave the sniffer
 // the radio back. Start or stop the scan to match the mode.
+// Same for Wi-Fi: Bluetooth-only mode used to keep the sniffer streaming Wi-Fi lines.
 static void applyMode() {
   NimBLEScan* s = NimBLEDevice::getScan();
   bool want = !(mode == M_WIFI || mode == M_RF);
   if (want && !s->isScanning()) s->start(0, false, true);
   else if (!want && s->isScanning()) s->stop();
+  esp_wifi_set_promiscuous(wifiWanted());
 }
 
 // ------------------------------------------------------------------ RX5808 5.8 GHz sweep (optional)
@@ -1041,6 +1083,13 @@ static void listenCommand(const char*, const char*) {
 static const uint32_t OTA_WIN = 16384;
 static bool     otaOn = false;
 static uint32_t otaSize = 0, otaGot = 0, otaAcked = 0;
+static volatile uint32_t otaRebootAt = 0;   // non-zero: the update is verified; loop() sends "done", then restarts
+// An update the phone stops feeding — it disconnected, or the app was closed mid-transfer — must not leave the
+// Spotter deaf (sniffing stopped) with a half-written slot open until someone power-cycles it. onDisconnect
+// asks loop() to abort it; loop() also gives up after OTA_IDLE_MS without a chunk.
+static const uint32_t OTA_IDLE_MS = 30000;
+static volatile bool     otaAbortReq = false;
+static volatile uint32_t otaLastData = 0;
 static NimBLECharacteristic* otaChar = nullptr;
 
 static void otaStatus(const char* st, const char* extra = "") {
@@ -1065,7 +1114,8 @@ static void otaCommand(const char* line, const char* v) {
       char ex[96]; snprintf(ex, sizeof ex, ",\"msg\":\"cannot start: %s (no OTA partition?)\"", Update.errorString());
       otaStatus("error", ex); otaStop(true); return;
     }
-    otaOn = true; otaGot = otaAcked = 0;
+    otaGot = otaAcked = 0; otaAbortReq = false; otaLastData = millis();
+    otaOn = true;
     Serial.printf("ota: begin, %u bytes\n", otaSize);
     otaStatus("ready");
     return;
@@ -1075,8 +1125,9 @@ static void otaCommand(const char* line, const char* v) {
     bool ok = otaGot == otaSize && Update.end(true);
     if (ok) {
       Serial.println("ota: done, rebooting");
-      otaStop(false); otaStatus("done"); drain();
-      delay(400); ESP.restart();
+      otaStop(false); otaStatus("done");
+      otaRebootAt = millis() + 400;           // loop() drains "done" to the phone first (drain has one caller)
+      if (!otaRebootAt) otaRebootAt = 1;
     } else {
       char ex[96]; snprintf(ex, sizeof ex, ",\"msg\":\"%s (%u of %u bytes)\"", Update.errorString(), otaGot, otaSize);
       Update.abort(); otaStop(true); otaStatus("error", ex);
@@ -1095,6 +1146,7 @@ static void otaCommand(const char* line, const char* v) {
 class OtaCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo&) override {
     if (!otaOn) return;
+    otaLastData = millis();
     std::string v = ch->getValue();
     size_t n = Update.write((uint8_t*)v.data(), v.size());
     otaGot += n;
@@ -1109,7 +1161,10 @@ static OtaCB otaCb;
 
 // ------------------------------------------------------------------ commands from the phone
 
-static char cmdBuf[256]; static size_t cmdLen = 0;
+// A command line from the phone. The longest real one is a channel list, which on a C5 (2.4 + 5 GHz) can run
+// to ~870 B as the app writes it: past the old 256 B, so it was cut and the tail run as a command. 1024 B, the
+// same as the USB line buffer; a longer line is dropped whole (cmdOver) rather than cut.
+static char cmdBuf[1024]; static size_t cmdLen = 0; static bool cmdOver = false;
 
 static void applyCommand(const char* line) {
   // Tiny parser: enough for {"c":"band","v":"2g"} / {"c":"ch","v":[1,6,11]} / {"c":"mode","v":"ble"} / {"c":"ping"}
@@ -1176,9 +1231,15 @@ class RxCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo&) override {
     std::string v = ch->getValue();
     for (char b : v) {
-      if (b == '\n') { cmdBuf[cmdLen] = 0; applyCommand(cmdBuf); cmdLen = 0; }
+      if (b == '\n') {
+        cmdBuf[cmdLen] = 0;
+        if (!cmdOver) applyCommand(cmdBuf);
+        else Serial.println("cmd: line longer than 1023 bytes dropped");
+        cmdLen = 0; cmdOver = false;
+      }
+      else if (cmdOver) continue;                     // skip the rest of an over-long line
       else if (cmdLen < sizeof cmdBuf - 1) cmdBuf[cmdLen++] = b;
-      else cmdLen = 0;
+      else { cmdOver = true; cmdLen = 0; }
     }
   }
 };
@@ -1193,6 +1254,7 @@ class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer*, NimBLEConnInfo&) override { linked = true; hello(); }
   void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
     linked = false; mtu = 23;
+    if (otaOn) otaAbortReq = true;                     // the update came over this link: loop() throws it away
     if (!usbHost) NimBLEDevice::startAdvertising();   // a Pi-hosted board stays off the phone's list
   }
   void onMTUChange(uint16_t m, NimBLEConnInfo&) override { mtu = m; }
@@ -1202,6 +1264,7 @@ static ServerCB serverCb;
 // ------------------------------------------------------------------ commands from the Pi over USB
 
 static char serBuf[1024]; static size_t serLen = 0;   // a channel list for a parked radio can be long
+static bool serOver = false;                          // the line overflowed serBuf: drop it whole at its '\n'
 
 static void serialTick() {
   while (Serial.available() > 0) {
@@ -1209,10 +1272,12 @@ static void serialTick() {
     if (b < 0) break;
     if (b == '\r') continue;
     if (b != '\n') {
-      if (serLen < sizeof serBuf - 1) serBuf[serLen++] = (char)b; else serLen = 0;
+      if (serOver) continue;
+      if (serLen < sizeof serBuf - 1) serBuf[serLen++] = (char)b; else { serOver = true; serLen = 0; }
       continue;
     }
     serBuf[serLen] = 0;
+    if (serOver) { serOver = false; serLen = 0; continue; }
     if (serLen && serBuf[0] == '{') {
       if (strstr(serBuf, "\"c\":\"host\"")) {
         if (!usbHost) {
@@ -1239,12 +1304,12 @@ static void serialTick() {
 static void ledTick(uint32_t now) {
   if (LED_PIN < 0) return;
   bool on = (int32_t)(blinkUntil - now) > 0 && ((now / 150) & 1);
-  digitalWrite(LED_PIN, on ? HIGH : LOW);
+  digitalWrite(LED_PIN, on ? LED_ON : LED_OFF);
 }
 
 void setup() {
   Serial.begin(115200);
-  if (LED_PIN >= 0) { pinMode(LED_PIN, OUTPUT); for (int i = 0; i < 2; i++) { digitalWrite(LED_PIN, HIGH); delay(120); digitalWrite(LED_PIN, LOW); delay(120); } }
+  if (LED_PIN >= 0) { pinMode(LED_PIN, OUTPUT); for (int i = 0; i < 2; i++) { digitalWrite(LED_PIN, LED_ON); delay(120); digitalWrite(LED_PIN, LED_OFF); delay(120); } }
   // Name and pair code from the Bluetooth MAC, so two boards in one car are told apart.
   uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_BT);
   snprintf(pairCode, sizeof pairCode, "%02X%02X", mac[4], mac[5]);
@@ -1280,7 +1345,25 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
-  if (otaOn) { ledTick(now); drain(); delay(2); return; }   // firmware coming in: nothing else touches the radio
+  if (otaRebootAt) {                            // a verified update: tell the phone, then boot into it
+    drain();
+    if ((int32_t)(now - otaRebootAt) >= 0) { delay(100); ESP.restart(); }
+    delay(2); return;
+  }
+  if (otaOn) {                                  // firmware coming in: nothing else touches the radio
+    bool gone = otaAbortReq;
+    if (gone || (int32_t)(now - otaLastData) > (int32_t)OTA_IDLE_MS) {
+      otaAbortReq = false;
+      otaOn = false;                            // first, so a late chunk is ignored rather than written
+      Update.abort();
+      Serial.printf("ota: abandoned (%s) after %u of %u bytes; the old firmware stays\n",
+                    gone ? "phone disconnected" : "no data for 30 s", otaGot, otaSize);
+      otaStop(true);
+      otaStatus("aborted", gone ? ",\"msg\":\"phone disconnected\"" : ",\"msg\":\"no data for 30 s\"");
+    } else {
+      ledTick(now); drain(); delay(2); return;
+    }
+  }
   serialTick();
   wifiTick(now);
   rfTick(now);

@@ -2368,6 +2368,10 @@ LOCKOUT_TOL = 0.02                         # a hit within this of a locked-out f
 def locked_out(mhz: float) -> bool:
     return any(abs(mhz - f) <= LOCKOUT_TOL for f in LISTEN["lockout"])
 LISTEN_CV = threading.Condition()
+# LISTEN["recent"] / LISTEN["played"] are touched by the sweep reader (follow hits), follow_watch and the phone's
+# commands (lockout), each on its own thread: iterating one while another adds or deletes raised "dictionary
+# changed size during iteration". Hold this around every read or write of the two. Never held while tuning.
+FOLLOW_LOCK = threading.RLock()
 
 # Follow: a scanner. Every fresh sweep hit in a band where voice is analog and legal to hear gets tuned
 # and played; the dongle stays while the squelch is open, hangs on FOLLOW_HANG_S after it closes, then
@@ -3131,7 +3135,8 @@ def follow_hit(obj: dict) -> None:
     if lic and abs(lic - mhz) <= max(tol, 0.0125):
         mhz, tol = lic, 0.0
     now = time.time()
-    LISTEN["recent"][follow_key(mhz)] = (now, mhz, mode, tol)
+    with FOLLOW_LOCK:
+        LISTEN["recent"][follow_key(mhz)] = (now, mhz, mode, tol)
     if LISTEN["req"] is not None:
         if abs(LISTEN["mhz"] - mhz) < 0.02:
             LISTEN["until"] = now + LISTEN_MAX_S
@@ -3143,15 +3148,16 @@ def follow_hit(obj: dict) -> None:
 
 def follow_next(now: float) -> bool:
     """Tune the newest candidate that hasn't just been played. False when nothing is waiting."""
-    recent, played = LISTEN["recent"], LISTEN["played"]
-    for k in [k for k, (seen, _, _, _) in recent.items() if now - seen > FOLLOW_RECENT_S]:
-        del recent[k]
-    for k in [k for k, left in played.items() if now - left > FOLLOW_COOLDOWN_S]:
-        del played[k]
-    if HUNT["on"]:
-        return False                             # the hunt is reading the sweep; a listen now would pause it and stall the hunt
-    cur = follow_key(LISTEN["mhz"]) if LISTEN["req"] is not None else None
-    cands = [(seen, k, mhz, mode, tol) for k, (seen, mhz, mode, tol) in recent.items() if k not in played and k != cur]
+    with FOLLOW_LOCK:
+        recent, played = LISTEN["recent"], LISTEN["played"]
+        for k in [k for k, (seen, _, _, _) in recent.items() if now - seen > FOLLOW_RECENT_S]:
+            del recent[k]
+        for k in [k for k, left in played.items() if now - left > FOLLOW_COOLDOWN_S]:
+            del played[k]
+        if HUNT["on"]:
+            return False                         # the hunt is reading the sweep; a listen now would pause it and stall the hunt
+        cur = follow_key(LISTEN["mhz"]) if LISTEN["req"] is not None else None
+        cands = [(seen, k, mhz, mode, tol) for k, (seen, mhz, mode, tol) in recent.items() if k not in played and k != cur]
     if not cands:
         return False
     _, _, mhz, mode, tol = max(cands)
@@ -3162,7 +3168,8 @@ def follow_next(now: float) -> bool:
 def follow_leave(now: float, why: str) -> None:
     """Done with the current channel: remember it so it isn't returned to at once, then move on or wait."""
     if LISTEN["req"] is not None:
-        LISTEN["played"][follow_key(LISTEN["mhz"])] = now
+        with FOLLOW_LOCK:
+            LISTEN["played"][follow_key(LISTEN["mhz"])] = now
     if not follow_next(now):
         if TRUNK["auto"] and LISTEN["follow"] and not HUNT["on"] and "trunked system" not in why and trunk_resume():
             listen_status(f"follow: {why}; back to the trunked system")
@@ -3189,42 +3196,51 @@ def trunk_resume() -> bool:
 
 
 def follow_watch() -> None:
+    """Follow's 1 s supervisor thread. One bad pass (a field a racing command just cleared, a tool that
+    died mid-call) must not end Follow for the rest of the run: log it and carry on with the next second."""
     while True:
         time.sleep(1)
-        now = time.time()
-        if not LISTEN["follow"]:
-            continue
-        if now > LISTEN["follow_until"]:
-            LISTEN["follow"] = False
-            listen_stop("follow timed out (5 min without the app renewing it)", cancel_hunt=True)
-            listen_status("follow ended")
-            continue
-        if LISTEN["proc"] is None:
-            continue
-        if LISTEN["mode"] in TRUNK_MODES:
-            proc = LISTEN["proc"]
-            if LISTEN["detected"] and not LISTEN.get("call") and getattr(proc, "enc_cmds", 0) >= 3 \
-                    and now - LISTEN["chan_at"] >= 15.0:
-                # The control channel keeps issuing encryption commands and no clear call has come: an
-                # encrypted system (a Harris-encrypted agency, say). Nothing to hear; on to the next, and
-                # don't come back to it for a while.
-                cc_forget(LISTEN["mhz"])
-                listen_status(f"trunked: {LISTEN['mhz']:.4f} MHz is an encrypted system; skipping it")
-                if not trunk_next_system(now):
-                    follow_leave(now, "encrypted system")
-                continue
-            if LISTEN["detected"] and now - max(LISTEN["chan_at"], LISTEN.get("call_at", 0.0)) >= TRUNK_IDLE_S:
-                if not trunk_next_system(now):
-                    follow_leave(now, f"no call on the trunked system for {TRUNK_IDLE_S:.0f} s")
-            continue
-        if now - LISTEN["chan_at"] >= FOLLOW_MAX_S:
-            follow_leave(now, f"{FOLLOW_MAX_S:.0f} s on {LISTEN['mhz']:.4f} MHz is enough")
-        elif not follow_busy(now):
-            # It went quiet: take the newest waiting signal, if any. The channel just left gets the same
-            # cooldown as one that used its 30 s, or two dead carriers would be tuned turn and turn about.
+        try:
+            _follow_tick(time.time())
+        except Exception as e:  # noqa: BLE001
+            print(f"bridge: follow: {type(e).__name__}: {e}", file=sys.stderr)
+
+
+def _follow_tick(now: float) -> None:
+    if not LISTEN["follow"]:
+        return
+    if now > LISTEN["follow_until"]:
+        LISTEN["follow"] = False
+        listen_stop("follow timed out (5 min without the app renewing it)", cancel_hunt=True)
+        listen_status("follow ended")
+        return
+    if LISTEN["proc"] is None:
+        return
+    if LISTEN["mode"] in TRUNK_MODES:
+        proc = LISTEN["proc"]
+        if LISTEN["detected"] and not LISTEN.get("call") and getattr(proc, "enc_cmds", 0) >= 3 \
+                and now - LISTEN["chan_at"] >= 15.0:
+            # The control channel keeps issuing encryption commands and no clear call has come: an
+            # encrypted system (a Harris-encrypted agency, say). Nothing to hear; on to the next, and
+            # don't come back to it for a while.
+            cc_forget(LISTEN["mhz"])
+            listen_status(f"trunked: {LISTEN['mhz']:.4f} MHz is an encrypted system; skipping it")
+            if not trunk_next_system(now):
+                follow_leave(now, "encrypted system")
+            return
+        if LISTEN["detected"] and now - max(LISTEN["chan_at"], LISTEN.get("call_at", 0.0)) >= TRUNK_IDLE_S:
+            if not trunk_next_system(now):
+                follow_leave(now, f"no call on the trunked system for {TRUNK_IDLE_S:.0f} s")
+        return
+    if now - LISTEN["chan_at"] >= FOLLOW_MAX_S:
+        follow_leave(now, f"{FOLLOW_MAX_S:.0f} s on {LISTEN['mhz']:.4f} MHz is enough")
+    elif not follow_busy(now):
+        # It went quiet: take the newest waiting signal, if any. The channel just left gets the same
+        # cooldown as one that used its 30 s, or two dead carriers would be tuned turn and turn about.
+        with FOLLOW_LOCK:
             if LISTEN["req"] is not None and LISTEN["recent"] and any(k != follow_key(LISTEN["mhz"]) and k not in LISTEN["played"] for k in LISTEN["recent"]):
                 LISTEN["played"][follow_key(LISTEN["mhz"])] = now
-            follow_next(now)
+        follow_next(now)
 
 
 def listen_busy(dev: str) -> bool:
@@ -4292,7 +4308,10 @@ def run_peripheral(name: str) -> None:
         os._exit(1)
 
     def ad_ok():
+        # Only now is the companion findable. "advertising as" is what wavelens-update's health check waits
+        # for, so it must not be printed before BlueZ has accepted the advert (it used to be, before publish).
         print("Advertisement registered", file=sys.stderr)
+        print(f"{FW}: advertising as {name!r} on {dongle.address}  (pair code {code})", file=sys.stderr)
         try:
             os.remove(ADVERT_MARK)
         except OSError:
@@ -4402,8 +4421,9 @@ def run_peripheral(name: str) -> None:
                 except (TypeError, ValueError):
                     lst = []
                 LISTEN["lockout"] = lst
-                for k in [k for k, (_, m, _, _) in LISTEN["recent"].items() if locked_out(m)]:
-                    del LISTEN["recent"][k]
+                with FOLLOW_LOCK:
+                    for k in [k for k, (_, m, _, _) in LISTEN["recent"].items() if locked_out(m)]:
+                        del LISTEN["recent"][k]
                 if LISTEN["follow"] and LISTEN["req"] is not None and locked_out(LISTEN["mhz"]):
                     follow_leave(time.time(), f"{LISTEN['mhz']:.4f} MHz locked out")
                 emit({"t": "status", "msg": f"lockout: {len(lst)} frequencies Follow will skip", "band": state["band"],
@@ -4643,7 +4663,7 @@ def run_peripheral(name: str) -> None:
                 time.sleep(0.004)
 
     threading.Thread(target=pump, daemon=True).start()
-    print(f"{FW}: advertising as {name!r} on {dongle.address}  (pair code {code})", file=sys.stderr)
+    print(f"{FW}: registering the Bluetooth advert as {name!r} on {dongle.address}", file=sys.stderr)
     # systemd stops the service with SIGTERM. bluezero only withdraws its advert on Ctrl+C, so a
     # restart would leave BlueZ holding the old advert and the next start fails to register one.
     # Withdraw it ourselves; GLib's own signal hook, because the GLib main loop owns the thread.

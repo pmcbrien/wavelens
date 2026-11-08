@@ -42,8 +42,11 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -66,7 +69,10 @@ FW_CHIPS = ("esp32", "esp32s3", "esp32c3", "esp32c5", "esp32c6")
 def fw_bin_for(chip: str) -> str:
     return os.path.join(FW_DIR, f"wavelens-{chip}.bin")
 FW_VERSION_URL = "https://github.com/pmcbrien/wavelens/releases/download/firmware/VERSION"
-UPLOAD_BIN = "/tmp/wavelens-upload.bin"
+# An uploaded .bin waits here for the flash. Not /tmp: a fixed name there let any local user plant the file
+# (or a symlink) that root then flashed or overwrote. A root-only directory on tmpfs; gone after a reboot.
+UPLOAD_DIR = "/run/wavelens/admin-upload"
+UPLOAD_BIN = os.path.join(UPLOAD_DIR, "upload.bin")
 DEFAULTS_FILE = "/etc/default/wavelens-bridge"
 ADMIN_JSON = "/etc/wavelens/admin.json"
 STATUS_JSON = "/run/wavelens/status.json"
@@ -151,6 +157,37 @@ def hostname():
     return read_text("/etc/hostname").strip() or run(["hostname"])[1] or "wavelens"
 
 
+LINK_STALE = 120   # s; the bridge rewrites status.json with every hello (every 15 s while a phone is linked)
+
+
+def status_linked(st):
+    """A phone is linked per status.json only if the bridge said so recently: a "linked" left behind by a
+    bridge that stopped or crashed would otherwise show (and hold off auto-updates) forever."""
+    try:
+        return bool(st.get("linked")) and time.time() - float(st.get("at") or 0) < LINK_STALE
+    except (TypeError, ValueError):
+        return False
+
+
+def host_ok(host_header):
+    """Is the request's Host this Pi (its name, name.local, one of its IPs, or localhost)? Guards the first-run
+    form against DNS rebinding: a web page on some other name that resolves to the Pi gets refused."""
+    h = (host_header or "").strip().lower()
+    if h.startswith("["):                       # [IPv6]:port
+        h = h[1:h.find("]")] if "]" in h else ""
+    elif h.count(":") == 1:                     # name:port / IPv4:port
+        h = h.split(":", 1)[0]
+    h = h.rstrip(".")
+    if not h:
+        return False
+    name = hostname().lower()
+    allowed = {"localhost", "127.0.0.1", "::1", name, name + ".local"}
+    rc, ips = run(["hostname", "-I"], timeout=5)
+    if rc == 0:
+        allowed.update(ip.lower() for ip in ips.split())
+    return h in allowed
+
+
 def installed_version():
     return read_text(VERSION_FILE).strip() or "unknown"
 
@@ -194,6 +231,7 @@ class Sessions:
         self.lock = threading.Lock()
         self.table = {}
         self.fails = collections.defaultdict(list)   # ip -> [timestamps of failed logins]
+        self.setup = {}   # first-run setup form: cookie token -> {expires, csrf}; never a login session
 
     def new(self):
         tok = secrets.token_urlsafe(32)
@@ -212,6 +250,24 @@ class Sessions:
                 return None
             return s
 
+    def new_setup(self):
+        """A short-lived token pair for the first-run password form (cookie + hidden field)."""
+        tok, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(24)
+        now = time.time()
+        with self.lock:
+            self.setup = {k: v for k, v in self.setup.items() if v["expires"] > now}
+            if len(self.setup) >= 256:          # someone is reloading in a loop: start over rather than grow
+                self.setup.clear()
+            self.setup[tok] = {"expires": now + 3600, "csrf": csrf}
+        return tok, csrf
+
+    def get_setup(self, tok):
+        if not tok:
+            return None
+        with self.lock:
+            s = self.setup.get(tok)
+            return s if s and s["expires"] > time.time() else None
+
     def drop(self, tok):
         with self.lock:
             self.table.pop(tok, None)
@@ -220,16 +276,27 @@ class Sessions:
         with self.lock:
             self.table.clear()
 
-    def login_blocked(self, ip):
+    def login_begin(self, ip):
+        """Check the rate limit and count this attempt as a failure in one step, under the lock: checking first
+        and recording after the (slow) password check let many parallel guesses all pass the check. Returns the
+        attempt's timestamp, for login_ok() when the password is right, or None when the IP is blocked."""
         now = time.time()
         with self.lock:
             recent = [t for t in self.fails[ip] if now - t < LOGIN_WINDOW]
+            if len(recent) >= LOGIN_MAX_FAILS:
+                self.fails[ip] = recent
+                return None
+            recent.append(now)
             self.fails[ip] = recent
-            return len(recent) >= LOGIN_MAX_FAILS
+            return now
 
-    def login_failed(self, ip):
+    def login_ok(self, ip, stamp):
+        """The password was right: take back the failure login_begin() counted."""
         with self.lock:
-            self.fails[ip].append(time.time())
+            try:
+                self.fails[ip].remove(stamp)
+            except ValueError:
+                pass
 
 
 SESSIONS = Sessions()
@@ -257,8 +324,15 @@ def defaults_read():
     return out
 
 
+# Anything str.splitlines() (and so this file's own reader) or systemd would treat as the end of a line, plus
+# NUL. Inside the value it would end KEY="… early and start a new line — e.g. a second WAVELENS_AUTO_UPDATE=1.
+LINE_BREAKS_RE = re.compile("[\x00\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
 def sh_quote(value):
-    """Double-quote a value for the EnvironmentFile (systemd reads it, run-bridge.sh word-splits it)."""
+    """Double-quote a value for the EnvironmentFile (systemd reads it, run-bridge.sh word-splits it). Every value
+    here is one shell line, so line breaks become spaces; then \\ " $ ` are escaped. Always exactly one line."""
+    value = LINE_BREAKS_RE.sub(" ", str(value))
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'
 
 
@@ -350,7 +424,9 @@ class Job:
         self.exit = None
         self.seq = 0   # bumps on every start so pollers can tell a new run from the old
 
-    def start(self, title, argv, timeout=1800):
+    def start(self, title, argv, timeout=1800, on_kill=None):
+        """on_kill: called after the job had to be killed for running too long (e.g. undo what its own
+        cleanup would have done)."""
         with self.lock:
             if self.running:
                 return False
@@ -358,26 +434,47 @@ class Job:
             self.seq += 1
             self.lines.clear()
             self.lines.append(f"$ {shlex.join(argv)}")
-        threading.Thread(target=self._run, args=(argv, timeout), daemon=True).start()
+        threading.Thread(target=self._run, args=(argv, timeout, on_kill), daemon=True).start()
         return True
 
-    def _run(self, argv, timeout):
+    def _run(self, argv, timeout, on_kill=None):
+        timer, killed = None, threading.Event()
         try:
-            self.proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         text=True, errors="replace", bufsize=1)
-            deadline = time.time() + timeout
-            for line in self.proc.stdout:
+            # its own process group, so the kill reaches what a /bin/sh wrapper started (esptool) too, and
+            # the stdout pipe they hold closes
+            self.proc = proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                text=True, errors="replace", bufsize=1, start_new_session=True)
+
+            def kill():
+                # on a timer, not on the next output line: a job that hangs silently is killed on time too
+                killed.set()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+            timer = threading.Timer(timeout, kill)
+            timer.daemon = True
+            timer.start()
+            for line in proc.stdout:
                 self.lines.append(line.rstrip("\n"))
-                if time.time() > deadline:
-                    self.proc.kill()
-                    self.lines.append(f"killed: ran longer than {timeout}s")
-            rc = self.proc.wait()
+            rc = proc.wait()
+            if killed.is_set():
+                self.lines.append(f"killed: ran longer than {timeout}s")
+                if on_kill:
+                    try:
+                        on_kill()
+                    except Exception as e:  # noqa: BLE001
+                        self.lines.append(f"cleanup after the kill failed: {e}")
         except FileNotFoundError:
             self.lines.append(f"{argv[0]}: not found")
             rc = 127
         except Exception as e:  # noqa: BLE001
             self.lines.append(f"error: {e}")
             rc = 1
+        finally:
+            if timer:
+                timer.cancel()
         self.lines.append(f"done (exit 0)" if rc == 0 else f"failed (exit {rc})")
         with self.lock:
             self.exit, self.running = rc, False
@@ -586,6 +683,14 @@ def page(title, body, active="", nav=True, flash=None):
 </body></html>"""
 
 
+def csrf_ok(given, expected):
+    """Constant-time token check. hmac.compare_digest on two str raises TypeError when either holds a
+    non-ASCII character (a crafted form value), so compare the UTF-8 bytes instead."""
+    if not isinstance(given, str) or not isinstance(expected, str) or not expected:
+        return False
+    return hmac.compare_digest(given.encode("utf-8", "surrogatepass"), expected.encode("utf-8", "surrogatepass"))
+
+
 def csrf_field(sess):
     return f'<input type="hidden" name="csrf" value="{esc(sess["csrf"])}">'
 
@@ -614,9 +719,75 @@ POLL_JS = """
 # --------------------------------------------------------------------------------------------
 # The HTTP handler
 # --------------------------------------------------------------------------------------------
+# The app images go to the first app slot (app0 at 0x10000). A Spotter that took a Bluetooth update from the
+# phone runs from the second slot (ota_1), and its otadata says so: flashing app0 alone left it booting the old
+# firmware. Blanking otadata (0xe000, 8 KB in every partition table we build: min_spiffs, huge_app, default)
+# in the same write makes the bootloader start app0 — the image just written. The merged images write it anyway.
+OTADATA_OFFSET, OTADATA_SIZE = 0xE000, 0x2000
+
+
+def otadata_reset():
+    """['0xe000', <8 KB of 0xFF>]: extra write_flash arguments that reset the boot slot to app0."""
+    blank = os.path.join(upload_dir(), "otadata-blank.bin")
+    if not (os.path.isfile(blank) and os.path.getsize(blank) == OTADATA_SIZE):
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(blank), prefix=".ota-")
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"\xff" * OTADATA_SIZE)
+        os.replace(tmp, blank)
+    return [hex(OTADATA_OFFSET), blank]
+
+
+SPOTTER_PAUSE = "/run/wavelens/spotter-pause"   # ports the bridge must leave alone (one per line) while we flash
+
+
+def spotter_unpause(port):
+    """Hand a port back to the bridge (what the flash wrapper does itself when esptool finishes)."""
+    try:
+        with open(SPOTTER_PAUSE, encoding="utf-8") as f:
+            keep = [l for l in f.read().splitlines() if l != port]
+    except FileNotFoundError:
+        return
+    with open(SPOTTER_PAUSE + ".n", "w", encoding="utf-8") as f:
+        f.write("".join(l + "\n" for l in keep))
+    os.replace(SPOTTER_PAUSE + ".n", SPOTTER_PAUSE)
+
+
+def upload_dir():
+    """UPLOAD_DIR, created root-only (0700); refuses a symlink or a directory someone else owns."""
+    os.makedirs(UPLOAD_DIR, mode=0o700, exist_ok=True)
+    st = os.lstat(UPLOAD_DIR)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise OSError(f"{UPLOAD_DIR} is not a private directory")
+    os.chmod(UPLOAD_DIR, 0o700)
+    return UPLOAD_DIR
+
+
+def save_upload(data, name):
+    """Write an uploaded image (and its original name, so a '…merged.bin' flashes at 0x0) atomically via
+    private temp files; nothing half-written is left behind on failure."""
+    d = upload_dir()
+    for dest, payload in ((UPLOAD_BIN, data), (UPLOAD_BIN + ".name", name.encode("utf-8", "replace"))):
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".up-")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+            os.replace(tmp, dest)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+
+class BadRequest(ValueError):
+    """A malformed request (answered 400, not 413)."""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "WavelensAdmin/1"
     protocol_version = "HTTP/1.1"
+    timeout = 30   # seconds per socket read: a client that stops sending mid-body can't hold a thread forever
 
     # ---- plumbing --------------------------------------------------------------------------
     def log_message(self, fmt, *args):   # keep the journal quiet; errors still go through log_error
@@ -673,19 +844,28 @@ class Handler(BaseHTTPRequestHandler):
         base = f"wl_session={tok}; Path=/; HttpOnly; SameSite=Strict"
         return base + ("; Max-Age=0" if expire else f"; Max-Age={SESSION_TTL}")
 
+    def body_length(self, limit, too_big):
+        """The request's Content-Length, checked: a negative, malformed or oversized one is refused (a -1
+        passed the size check and rfile.read(-1) then read until the client closed the connection)."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise BadRequest("bad Content-Length") from None
+        if n < 0:
+            raise BadRequest("bad Content-Length")
+        if n > limit:
+            raise ValueError(too_big)
+        return n
+
     def form(self, limit=MAX_FORM_BODY):
         """Parse a urlencoded POST body into {name: value} (first value wins)."""
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > limit:
-            raise ValueError("body too large")
+        n = self.body_length(limit, "body too large")
         raw = self.rfile.read(n).decode(errors="replace")
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
 
     def multipart(self):
         """Parse a multipart/form-data POST: returns ({field: value}, {field: (filename, bytes)})."""
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > MAX_UPLOAD_BODY:
-            raise ValueError("upload larger than 4 MB")
+        n = self.body_length(MAX_UPLOAD_BODY, "upload larger than 4 MB")
         raw = self.rfile.read(n)
         msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
             b"Content-Type: " + self.headers.get("Content-Type", "").encode() + b"\r\n\r\n" + raw)
@@ -713,6 +893,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urllib.parse.urlsplit(self.path)
         path, q = url.path, urllib.parse.parse_qs(url.query)
         if not admin_exists():
+            if not host_ok(self.headers.get("Host")):
+                return self.bad_host()
             return self.page_setup()
         tok, sess = self.session()
         if path == "/login" or not sess:
@@ -740,6 +922,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         try:
             if not admin_exists():
+                if not host_ok(self.headers.get("Host")):
+                    return self.bad_host()
                 return self.post_setup()
             tok, sess = self.session()
             if path == "/login":
@@ -750,7 +934,7 @@ class Handler(BaseHTTPRequestHandler):
                 form, files = self.multipart()
             else:
                 form, files = self.form(), {}
-            if not hmac.compare_digest(form.get("csrf", ""), sess["csrf"]):
+            if not csrf_ok(form.get("csrf"), sess["csrf"]):
                 return self.send_html(page("Rejected", "<p>Form token mismatch — go back, reload the page and try again.</p>"), 403)
             handlers = {"/logout": self.post_logout, "/account": self.post_account, "/settings": self.post_settings,
                         "/update": self.post_update, "/wifi": self.post_wifi, "/spotter": self.post_spotter,
@@ -762,27 +946,51 @@ class Handler(BaseHTTPRequestHandler):
             self.send_html(page("Not found", "<p>No such action.</p>"), 404)
         except ValueError as e:
             self.close_connection = True   # the body may be unread; don't reuse this connection
-            self.send_html(page("Rejected", f"<p>{esc(e)}</p>"), 413)
+            self.send_html(page("Rejected", f"<p>{esc(e)}</p>"), 400 if isinstance(e, BadRequest) else 413)
 
     # ---- first-run setup and login ---------------------------------------------------------
+    def bad_host(self):
+        self.close_connection = True
+        name = esc(hostname())
+        self.send_html(page("Rejected", f"<p>Open this page by the Pi's own address: <code>http://{name}.local:{PORT}</code> "
+                                        "or its IP address.</p>", nav=False), 403)
+
+    def setup_token(self):
+        c = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        tok = c["wl_setup"].value if "wl_setup" in c else None
+        return tok, SESSIONS.get_setup(tok)
+
     def page_setup(self, err=""):
+        tok, st = self.setup_token()
+        cookie = None
+        if not st:
+            tok, csrf = SESSIONS.new_setup()
+            cookie = f"wl_setup={tok}; Path=/; HttpOnly; SameSite=Strict; Max-Age=3600"
+        else:
+            csrf = st["csrf"]
         body = f"""<div class="card"><p>This Pi has no admin password yet. Choose one now; you'll need it every time you
 open this page. If you forget it: <code>sudo wavelens-admin --reset-password</code> over SSH, or delete
 <code>/etc/wavelens/admin.json</code> on the SD card.</p>
 {f'<div class="warn">{esc(err)}</div>' if err else ''}
-<form method="post" action="/"><label>Password (at least 8 characters)</label><input type="password" name="p1" autocomplete="new-password">
+<form method="post" action="/"><input type="hidden" name="csrf" value="{esc(csrf)}">
+<label>Password (at least 8 characters)</label><input type="password" name="p1" autocomplete="new-password">
 <label>Type it again</label><input type="password" name="p2" autocomplete="new-password">
 <button class="btn" type="submit">Set admin password</button></form></div>"""
-        self.send_html(page("Set an admin password", body, nav=False))
+        self.send_html(page("Set an admin password", body, nav=False), cookie=cookie)
 
     def post_setup(self):
         f = self.form()
+        _, st = self.setup_token()
+        if not st or not csrf_ok(f.get("csrf"), st["csrf"]):
+            return self.page_setup("The form expired — try again.")
         p1, p2 = f.get("p1", ""), f.get("p2", "")
         if len(p1) < 8:
             return self.page_setup("Password must be at least 8 characters.")
         if p1 != p2:
             return self.page_setup("The two passwords don't match.")
         admin_set_password(p1)
+        with SESSIONS.lock:
+            SESSIONS.setup.clear()
         tok = SESSIONS.new()
         SESSIONS.get(tok)["flash"] = "Admin password set. You're logged in."
         self.redirect("/", cookie=self.cookie(tok))
@@ -798,13 +1006,14 @@ open this page. If you forget it: <code>sudo wavelens-admin --reset-password</co
 
     def post_login(self):
         ip = self.client_address[0]
-        if SESSIONS.login_blocked(ip):
-            return self.page_login("Too many failed logins. Wait 10 minutes and try again.")
         f = self.form()
+        stamp = SESSIONS.login_begin(ip)
+        if stamp is None:
+            return self.page_login("Too many failed logins. Wait 10 minutes and try again.")
         if not admin_check_password(f.get("password", "")):
-            SESSIONS.login_failed(ip)
-            time.sleep(0.5)
+            time.sleep(0.5)                     # the failure is already counted
             return self.page_login("Wrong password.")
+        SESSIONS.login_ok(ip, stamp)
         tok = SESSIONS.new()
         self.redirect("/", cookie=self.cookie(tok))
 
@@ -877,7 +1086,7 @@ Support: wavelensapp@gmail.com — attach the downloaded log.</p></div>"""
         missing = ""
         if st.get("hw_missing"):
             missing = '<div class="warn">Missing hardware: ' + ", ".join(esc(x) for x in st["hw_missing"]) + "</div>"
-        linked = "" if not st else ('<span class="ok">phone connected</span>' if st.get("linked") else '<span class="mut">phone not connected</span>')
+        linked = "" if not st else ('<span class="ok">phone connected</span>' if status_linked(st) else '<span class="mut">phone not connected</span>')
         bridge = f"""<table>
 <tr><th>Service</th><td>{state_html}</td></tr>
 <tr><th>Phone</th><td>{linked or '<span class="mut">no live status yet</span>'}</td></tr>
@@ -947,7 +1156,7 @@ Support: wavelensapp@gmail.com — attach the downloaded log.</p></div>"""
             return self.redirect("/settings")
         args = args_set_name(args, name)
         defaults_write({"WAVELENS_AUTO": "1" if form.get("auto") == "1" else "0",
-                        "WAVELENS_RTL433": form.get("rtl433", "").strip(),
+                        "WAVELENS_RTL433": " ".join(form.get("rtl433", "").split()),   # one shell line, like args
                         "WAVELENS_ARGS": args})
         rc, out = run(["systemctl", "restart", BRIDGE_UNIT], timeout=30)
         self.flash(sess, "Settings saved; bridge restarted." if rc == 0 else f"Saved, but restart failed: {out}")
@@ -1173,13 +1382,11 @@ restarts by itself afterwards.</p></div>
             elif len(data) > 4 * 1024 * 1024:
                 self.flash(sess, "File is larger than 4 MB.")
             else:
-                with open(UPLOAD_BIN + ".tmp", "wb") as f:
-                    f.write(data)
-                os.replace(UPLOAD_BIN + ".tmp", UPLOAD_BIN)
-                # remember the original name so a '…merged.bin' flashes at offset 0x0
-                with open(UPLOAD_BIN + ".name", "w", encoding="utf-8") as f:
-                    f.write(os.path.basename(fname))
-                self.flash(sess, f"Uploaded {os.path.basename(fname)} ({len(data) // 1024} KB).")
+                try:
+                    save_upload(data, os.path.basename(fname))
+                    self.flash(sess, f"Uploaded {os.path.basename(fname)} ({len(data) // 1024} KB).")
+                except OSError as e:
+                    self.flash(sess, f"Could not save the upload: {e}")
         elif do == "flash":
             port, src = form.get("port", ""), form.get("src", "")
             if port not in glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*"):
@@ -1197,6 +1404,11 @@ restarts by itself afterwards.</p></div>
                 self.flash(sess, "esptool is not installed: sudo apt install esptool")
             elif path:
                 offset = "0x0" if "merged" in name.lower() else "0x10000"
+                try:
+                    ota = otadata_reset() if offset == "0x10000" else []
+                except OSError as e:
+                    self.flash(sess, f"Could not prepare the flash: {e}")
+                    return self.redirect("/spotter")
                 # The bridge drives Spotters plugged in here (spotters.py): ask it to let go of this port for the
                 # flash, and take the request back afterwards whatever esptool's result.
                 pause = ('p="$1"; shift; mkdir -p /run/wavelens; echo "$p" >> /run/wavelens/spotter-pause; sleep 2; "$@"; rc=$?; '
@@ -1208,41 +1420,56 @@ restarts by itself afterwards.</p></div>
                     pick = ('c=$("$@" --port "$P" chip_id 2>&1 | grep -oE "ESP32-(S3|C3|C5|C6)" | head -1 | tr -d - | tr A-Z a-z); '
                             '[ -n "$c" ] || c=esp32; f="$D/wavelens-$c.bin"; '
                             'if [ ! -f "$f" ]; then echo "no Spotter firmware for $c on this Pi yet: download it, or use the browser flasher"; exit 2; fi; '
-                            'echo "chip: $c -> $f"; "$@" --chip "$c" --port "$P" --baud 460800 write_flash 0x10000 "$f"')
+                            'echo "chip: $c -> $f"; "$@" --chip "$c" --port "$P" --baud 460800 write_flash $OTA 0x10000 "$f"')
                     inner = ["/bin/sh", "-c", pick, "pick"] + tool
-                    argv = ["/bin/sh", "-c", pause, "sh", port, "env", f"P={port}", f"D={FW_DIR}"] + inner
+                    argv = ["/bin/sh", "-c", pause, "sh", port, "env", f"P={port}", f"D={FW_DIR}",
+                            "OTA=" + " ".join(ota)] + inner
                 else:
-                    argv = ["/bin/sh", "-c", pause, "sh", port] + tool + ["--chip", "auto", "--port", port, "--baud", "460800", "write_flash", offset, path]
-                if FLASH_JOB.start("flash " + name, argv, timeout=600):
-                    self.flash(sess, f"Flashing {name} at {offset} on {port}. Watch the progress box.")
+                    argv = ["/bin/sh", "-c", pause, "sh", port] + tool + ["--chip", "auto", "--port", port, "--baud", "460800",
+                                                                         "write_flash"] + ota + [offset, path]
+                if FLASH_JOB.start("flash " + name, argv, timeout=600, on_kill=lambda: spotter_unpause(port)):
+                    self.flash(sess, f"Flashing {name} at {offset}{' (and resetting the boot slot)' if offset == '0x10000' else ''}"
+                                     f" on {port}. Watch the progress box.")
                 else:
                     self.flash(sess, "A flash is already running.")
         self.redirect("/spotter")
 
     @staticmethod
     def download_firmware():
-        """Fetch the latest Spotter firmware + VERSION into FW_DIR (atomic renames). Logged to the flash box."""
+        """Fetch the latest Spotter firmware (every chip) + VERSION into FW_DIR. Logged to the flash box.
+        All or nothing: everything goes to a staging folder first and only a complete set replaces the installed
+        images and VERSION — a release missing one chip's image used to leave that chip's old .bin under the new
+        VERSION, and the page then flashed stale firmware it called current."""
         if not DOWNLOAD_LOCK.acquire(blocking=False):
             return
+        stage = None
         try:
             os.makedirs(FW_DIR, exist_ok=True)
-            FLASH_JOB.lines.append(f"downloading {FW_URL}")
             base = FW_URL.rsplit("/", 1)[0]
-            pairs = [(FW_URL, FW_BIN)] + [(f"{base}/wavelens-{c}.bin", fw_bin_for(c)) for c in FW_CHIPS if c != "esp32"] + [(FW_VERSION_URL, FW_VERSION)]
-            for url, dest in pairs:
+            FLASH_JOB.lines.append(f"downloading {base}/ (every chip's image)")
+            stage = tempfile.mkdtemp(dir=FW_DIR, prefix=".dl-")
+            want = [(f"{base}/wavelens-{c}.bin", fw_bin_for(c)) for c in FW_CHIPS] + [(FW_VERSION_URL, FW_VERSION)]
+            got = []
+            for url, dest in want:
+                tmp = os.path.join(stage, os.path.basename(dest))
                 try:
                     req = urllib.request.Request(url, headers={"User-Agent": "wavelens-admin"})
-                    with urllib.request.urlopen(req, timeout=60) as r, open(dest + ".tmp", "wb") as f:
+                    with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
                         shutil.copyfileobj(r, f, 1 << 16)
-                    os.replace(dest + ".tmp", dest)
+                    if os.path.getsize(tmp) == 0:
+                        raise OSError("empty file")
                 except Exception as e:  # noqa: BLE001
-                    if dest in (FW_BIN, FW_VERSION):
-                        raise          # the classic image and VERSION must arrive
-                    FLASH_JOB.lines.append(f"no {os.path.basename(dest)} in this release ({e}); skipped")
+                    raise RuntimeError(f"no {os.path.basename(dest)} in this release ({e}); "
+                                       f"kept firmware {read_text(FW_VERSION).strip() or 'as it was'}") from None
+                got.append((tmp, dest))
+            for tmp, dest in got:            # VERSION is last in the list, so it only changes once every image is in
+                os.replace(tmp, dest)
             FLASH_JOB.lines.append(f"downloaded firmware {read_text(FW_VERSION).strip() or '?'} ({os.path.getsize(FW_BIN) // 1024} KB)")
         except Exception as e:  # noqa: BLE001
             FLASH_JOB.lines.append(f"download failed: {e}")
         finally:
+            if stage:
+                shutil.rmtree(stage, ignore_errors=True)
             DOWNLOAD_LOCK.release()
 
     # ---- /power ----------------------------------------------------------------------------
