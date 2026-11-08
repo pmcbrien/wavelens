@@ -1338,15 +1338,49 @@ class AuCB : public NimBLECharacteristicCallbacks {
 };
 static AuCB auCb;
 
+// Why a link ended, for the serial log: NimBLE reports HCI reasons as 0x200 + the HCI code.
+static const char* discReason(int r) {
+  switch (r & 0xFF) {
+    case 0x08: return "supervision timeout (radio starved or out of range)";
+    case 0x13: return "phone closed the link";
+    case 0x16: return "board closed the link";
+    case 0x3B: return "unacceptable connection parameters";
+    case 0x3D: return "MIC failure (pairing mismatch)";
+    case 0x3E: return "failed to establish";
+    case 0x22: return "LL response timeout";
+    case 0x05: return "authentication failure";
+    default:   return "other";
+  }
+}
+
+// iPhones open a link with a sub-second supervision timeout and keep it unless the board asks for another.
+// The Spotter shares one radio between the BLE scan, the Wi-Fi sniffer (hopping every HOP_MS) and this link,
+// so a short stall drops an iPhone while an Android phone (5-20 s timeout) rides through it. Ask for values
+// inside Apple's accessory rules: interval 30-50 ms (min >= 15 ms, max >= min + 15 ms), no latency,
+// 5 s timeout (2-6 s, and > 3 x max interval x (latency + 1)).
+static const uint16_t CP_MIN = 24, CP_MAX = 40, CP_LAT = 0, CP_TO = 500;   // 1.25 ms, 1.25 ms, events, 10 ms
+static uint32_t cpAskAt = 0; static uint16_t cpHandle = 0xFFFF;
+
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer*, NimBLEConnInfo& ci) override {
     linked = true; secured = false;
+    Serial.printf("ble: connected %s, interval %.2f ms, latency %u, timeout %u ms\n",
+                  ci.getAddress().toString().c_str(), ci.getConnInterval() * 1.25f,
+                  ci.getConnLatency(), ci.getConnTimeout() * 10u);
+    cpHandle = ci.getConnHandle();
+    cpAskAt = millis() + 1500;                  // ask after the phone has settled (loop() sends it)
     if (locked) NimBLEDevice::startSecurity(ci.getConnHandle());   // the phone shows its pairing prompt (or re-uses the bond)
     else hello();
+  }
+  void onConnParamsUpdate(NimBLEConnInfo& ci) override {
+    Serial.printf("ble: params now interval %.2f ms, latency %u, timeout %u ms\n",
+                  ci.getConnInterval() * 1.25f, ci.getConnLatency(), ci.getConnTimeout() * 10u);
   }
   uint32_t onPassKeyDisplay() override { return passkey; }
   void onAuthenticationComplete(NimBLEConnInfo& ci) override {
     secured = ci.isEncrypted() && ci.isAuthenticated() && ci.isBonded();
+    Serial.printf("ble: security encrypted=%d authenticated=%d bonded=%d\n",
+                  ci.isEncrypted(), ci.isAuthenticated(), ci.isBonded());
     if (locked && !secured) {                   // wrong passkey, or a phone that would only do Just Works
       Serial.println("lock: pairing failed or not authenticated; disconnecting");
       server->disconnect(ci.getConnHandle());
@@ -1354,12 +1388,14 @@ class ServerCB : public NimBLEServerCallbacks {
     }
     if (locked) hello();                        // the first thing a paired phone hears
   }
-  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
-    linked = false; secured = false; mtu = 23;
+  void onDisconnect(NimBLEServer*, NimBLEConnInfo& ci, int reason) override {
+    Serial.printf("ble: disconnected %s, reason 0x%03X %s\n",
+                  ci.getAddress().toString().c_str(), reason, discReason(reason));
+    linked = false; secured = false; mtu = 23; cpAskAt = 0; cpHandle = 0xFFFF;
     if (otaOn) otaAbortReq = true;                     // the update came over this link: loop() throws it away
     if (!usbHost) NimBLEDevice::startAdvertising();   // a Pi-hosted board stays off the phone's list
   }
-  void onMTUChange(uint16_t m, NimBLEConnInfo&) override { mtu = m; }
+  void onMTUChange(uint16_t m, NimBLEConnInfo&) override { mtu = m; Serial.printf("ble: mtu %u\n", m); }
 };
 static ServerCB serverCb;
 
@@ -1481,6 +1517,13 @@ void loop() {
   // state. Checked first and in OTA too, so an unlock always wins over an update in progress.
   if (rebootAt && (int32_t)(now - rebootAt) >= 0) { drain(); delay(100); ESP.restart(); }
   resetBtnTick(now);
+  if (cpAskAt && linked && (int32_t)(now - cpAskAt) >= 0) {   // see CP_* above ServerCB
+    cpAskAt = 0;
+    if (server && cpHandle != 0xFFFF) {
+      server->updateConnParams(cpHandle, CP_MIN, CP_MAX, CP_LAT, CP_TO);
+      Serial.printf("ble: asked for interval %.2f-%.2f ms, timeout %u ms\n", CP_MIN * 1.25f, CP_MAX * 1.25f, CP_TO * 10u);
+    }
+  }
   if (otaRebootAt) {                            // a verified update: tell the phone, then boot into it
     drain();
     if ((int32_t)(now - otaRebootAt) >= 0) { delay(100); ESP.restart(); }
