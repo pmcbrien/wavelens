@@ -1,7 +1,7 @@
 /*
  * Wavelens companion — ESP32 firmware
  *
- * A second radio for the Wavelens Android app. The ESP32 sniffs Wi-Fi management frames
+ * A second radio for the Wavelens Android and iPhone/iPad apps. The ESP32 sniffs Wi-Fi management frames
  * (beacons, probe responses) and BLE advertisements, and pushes every hit to the phone as
  * one JSON line over a BLE GATT notify characteristic. The phone can tell it which Wi-Fi
  * channels to park on. Optionally: an RX5808 5.8 GHz receiver sweeps for analog video carriers
@@ -35,6 +35,7 @@
 #include "esp_mac.h"
 #include "soc/soc_caps.h"
 #include <Update.h>
+#include <Preferences.h>
 
 static void candAdd(float mhz);               // a carrier the spectrum sweep found: Follow may tune it (SA818)
 static void subghzInit();
@@ -149,6 +150,27 @@ static NimBLEServer*         server = nullptr;
 static NimBLECharacteristic* txChar = nullptr;
 static NimBLECharacteristic* rxChar = nullptr;
 static volatile bool         linked = false;
+
+// Lock (opt-in, off by default). Locked, the board only talks to a phone that has paired with its 6-digit
+// passkey: the system pairing prompt appears on first connect, the bond is kept in flash, and an unpaired
+// connection gets no data and every command / firmware write is refused. The passkey is random, made on
+// first boot and kept in NVS; it is printed on the serial console at boot and told to the phone once, when
+// the phone locks the board. Unlock: {"c":"lock","v":false} from a paired phone, {"c":"unlock"} on the USB
+// serial port, or hold BOOT for 5 s — each forgets every paired phone and makes a new passkey.
+#ifndef RESET_BTN_PIN
+  #if defined(CONFIG_IDF_TARGET_ESP32C3) || defined(CONFIG_IDF_TARGET_ESP32C6)
+    #define RESET_BTN_PIN 9      // BOOT on C3 / C6 boards (C3 SuperMini, XIAO, DevKits)
+  #elif defined(CONFIG_IDF_TARGET_ESP32C5)
+    #define RESET_BTN_PIN 28     // BOOT on the C5-DevKitC-1
+  #else
+    #define RESET_BTN_PIN 0      // BOOT on classic ESP32 / S3 DevKit boards
+  #endif
+#endif                           // -DRESET_BTN_PIN=-1 disables the 5-s hold
+static bool          locked = false;
+static uint32_t      passkey = 0;
+static volatile bool secured = false;   // this connection is encrypted, authenticated and bonded
+static char          btId[13] = "";     // full BT address, sent in the sec line so the phone knows this board
+static volatile uint32_t rebootAt = 0;  // a lock change reboots once the reply has gone out (0 = none)
 static uint16_t              mtu = 23;
 // Hosted: plugged into a Wavelens Pi over USB. The Pi said {"c":"host"} on the serial port; lines then go out
 // on Serial with an '@' in front (so the Pi tells them from boot and debug text), commands come in on Serial,
@@ -192,7 +214,7 @@ static void drain() {
       Serial.write((const uint8_t*)s, len);
       if (len == 0 || s[len - 1] != '\n') Serial.write('\n');
     }
-    if (linked && txChar) {
+    if (linked && txChar && (!locked || secured)) {   // locked: nothing for a phone that hasn't paired
       const char* s = q[qt];
       size_t len = strlen(s);
       size_t chunk = mtu > 3 ? mtu - 3 : 20;
@@ -267,6 +289,13 @@ static_assert(sizeof(HW_WORST) <= HW_CAP, "hwJson() can overflow its buffer: rai
                     "\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\",\"5g\",\"rf\",\"subghz\",\"sweep\",\"listen\",\"scan\"]," \
                     "\"spec\":[" SPEC_RANGE_STR "]" ",\"hw\":" HW_WORST "}\n"
 static_assert(sizeof(HELLO_WORST) <= QL, "the hello can be longer than a queue line: raise QL");
+// The sec line that follows every hello, and the one-off sec line with the passkey a lock answers with. btId is
+// 12 hex digits; the passkey is kept to 100000..999999, so "%06lu" is always 6.
+#define SEC_CAP 128
+#define SEC_WORST    "{\"t\":\"sec\",\"lock\":false,\"paired\":false,\"id\":\"XXXXXXXXXXXX\"}\n"
+#define SEC_PK_WORST "{\"t\":\"sec\",\"lock\":true,\"paired\":false,\"id\":\"XXXXXXXXXXXX\",\"passkey\":\"999999\",\"reboot\":true}\n"
+static_assert(sizeof(SEC_WORST) <= SEC_CAP && sizeof(SEC_PK_WORST) <= SEC_CAP, "a sec line can overflow its buffer: raise SEC_CAP");
+static_assert(SEC_CAP <= QL, "a sec line can be longer than a queue line: raise QL");
 
 static void hello() {
   char hw[HW_CAP];
@@ -307,6 +336,13 @@ static void hello() {
 #endif
            , hw);
   enqueue(line);
+  // Security state on its own line: the hello is already near QL on a fully fitted board, and apps that
+  // don't know "sec" ignore it. "id" is the full Bluetooth address, so a phone that lost the board from its
+  // cache can tell it from another board that copied the name.
+  char sec[SEC_CAP];
+  snprintf(sec, sizeof sec, "{\"t\":\"sec\",\"lock\":%s,\"paired\":%s,\"id\":\"%s\"}\n",
+           locked ? "true" : "false", secured ? "true" : "false", btId);
+  enqueue(sec);
 }
 
 // ------------------------------------------------------------------ Wi-Fi sniffer
@@ -1145,7 +1181,7 @@ static void otaCommand(const char* line, const char* v) {
 
 class OtaCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo&) override {
-    if (!otaOn) return;
+    if (!otaOn || (locked && !secured)) return;   // locked: an unpaired link writes no firmware
     otaLastData = millis();
     std::string v = ch->getValue();
     size_t n = Update.write((uint8_t*)v.data(), v.size());
@@ -1166,12 +1202,63 @@ static OtaCB otaCb;
 // same as the USB line buffer; a longer line is dropped whole (cmdOver) rather than cut.
 static char cmdBuf[1024]; static size_t cmdLen = 0; static bool cmdOver = false;
 
+// ------------------------------------------------------------------ lock / passkey
+
+static void secLoad() {
+  Preferences p;
+  p.begin("wavelens", false);
+  locked = p.getBool("lock", false);
+  passkey = p.getUInt("pk", 0);
+  if (passkey < 100000 || passkey > 999999) {          // first boot (or after an unlock): a new random one
+    passkey = 100000 + esp_random() % 900000;
+    p.putUInt("pk", passkey);
+  }
+  p.end();
+}
+
+static void secSave(bool lock, bool newPasskey) {
+  Preferences p;
+  p.begin("wavelens", false);
+  p.putBool("lock", lock);
+  if (newPasskey) p.putUInt("pk", 100000 + esp_random() % 900000);
+  p.end();
+}
+
+// Unlock and forget: every paired phone has to pair again, and the old passkey stops working.
+static void secReset(const char* why) {
+  NimBLEDevice::deleteAllBonds();
+  secSave(false, true);
+  Serial.printf("lock: unlocked (%s); paired phones forgotten, new passkey on next boot\n", why);
+  status("unlocked; restarting");
+  rebootAt = millis() + 1200; if (!rebootAt) rebootAt = 1;
+}
+
+static void lockCommand(const char* v) {
+  bool on = v && !strncmp(v, "true", 4);
+  if (on) {
+    if (locked) { status("already locked"); return; }
+    secSave(true, false);
+    // Told once, on the link that asked for the lock, so the person can write it down before the reboot.
+    char line[SEC_CAP];
+    snprintf(line, sizeof line, "{\"t\":\"sec\",\"lock\":true,\"paired\":false,\"id\":\"%s\",\"passkey\":\"%06lu\",\"reboot\":true}\n",
+             btId, (unsigned long)passkey);
+    enqueue(line);
+    Serial.printf("lock: locked; passkey %06lu; restarting\n", (unsigned long)passkey);
+    status("locked; restarting");
+    rebootAt = millis() + 1500; if (!rebootAt) rebootAt = 1;
+  } else {
+    if (!locked) { status("not locked"); return; }
+    secReset("asked by a paired phone");
+  }
+}
+
 static void applyCommand(const char* line) {
   // Tiny parser: enough for {"c":"band","v":"2g"} / {"c":"ch","v":[1,6,11]} / {"c":"mode","v":"ble"} / {"c":"ping"}
   const char* c = strstr(line, "\"c\":\"");
   if (!c) return;
   c += 5;
   if (!strncmp(c, "ping", 4)) { hello(); status("ok"); return; }
+  if (!strncmp(c, "lock", 4)) { const char* lv = strstr(line, "\"v\":"); lockCommand(lv ? lv + 4 : nullptr); return; }
   if (!strncmp(c, "blink", 5)) {
     const char* bv = strstr(line, "\"v\":");
     int secs = bv ? atoi(bv + 4) : 5; if (secs < 1 || secs > 30) secs = 5;
@@ -1229,6 +1316,7 @@ static void applyCommand(const char* line) {
 
 class RxCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo&) override {
+    if (locked && !secured) return;             // the stack already asks for encryption; belt and braces
     std::string v = ch->getValue();
     for (char b : v) {
       if (b == '\n') {
@@ -1251,9 +1339,23 @@ class AuCB : public NimBLECharacteristicCallbacks {
 static AuCB auCb;
 
 class ServerCB : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer*, NimBLEConnInfo&) override { linked = true; hello(); }
+  void onConnect(NimBLEServer*, NimBLEConnInfo& ci) override {
+    linked = true; secured = false;
+    if (locked) NimBLEDevice::startSecurity(ci.getConnHandle());   // the phone shows its pairing prompt (or re-uses the bond)
+    else hello();
+  }
+  uint32_t onPassKeyDisplay() override { return passkey; }
+  void onAuthenticationComplete(NimBLEConnInfo& ci) override {
+    secured = ci.isEncrypted() && ci.isAuthenticated() && ci.isBonded();
+    if (locked && !secured) {                   // wrong passkey, or a phone that would only do Just Works
+      Serial.println("lock: pairing failed or not authenticated; disconnecting");
+      server->disconnect(ci.getConnHandle());
+      return;
+    }
+    if (locked) hello();                        // the first thing a paired phone hears
+  }
   void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
-    linked = false; mtu = 23;
+    linked = false; secured = false; mtu = 23;
     if (otaOn) otaAbortReq = true;                     // the update came over this link: loop() throws it away
     if (!usbHost) NimBLEDevice::startAdvertising();   // a Pi-hosted board stays off the phone's list
   }
@@ -1287,6 +1389,10 @@ static void serialTick() {
         }
         hello();
         status("hosted by the Pi over USB");
+      } else if (strstr(serBuf, "\"c\":\"unlock\"")) {
+        secReset("asked over USB");             // physical access: the recovery path
+      } else if (strstr(serBuf, "\"c\":\"passkey\"")) {
+        Serial.printf("passkey %06lu (%s)\n", (unsigned long)passkey, locked ? "locked" : "not locked");
       } else if (strstr(serBuf, "\"c\":\"unhost\"")) {
         usbHost = false;
         NimBLEDevice::startAdvertising();
@@ -1314,17 +1420,28 @@ void setup() {
   uint8_t mac[6]; esp_read_mac(mac, ESP_MAC_BT);
   snprintf(pairCode, sizeof pairCode, "%02X%02X", mac[4], mac[5]);
   snprintf(devName, sizeof devName, "Wavelens-%s", pairCode);
+  snprintf(btId, sizeof btId, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  secLoad();
+  if (RESET_BTN_PIN >= 0) pinMode(RESET_BTN_PIN, INPUT_PULLUP);
   NimBLEDevice::init(devName);
   NimBLEDevice::setMTU(247);
+  // Pairing is always offered with a passkey (bond, MITM protection, LE Secure Connections); it is only
+  // *required* when the board is locked. Unlocked, a phone that never pairs works exactly as before.
+  NimBLEDevice::setSecurityAuth(true, true, true);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
+  NimBLEDevice::setSecurityPasskey(passkey);
   server = NimBLEDevice::createServer();
   server->setCallbacks(&serverCb);
   NimBLEService* svc = server->createService(SVC_UUID);
+  // Locked: writes need an encrypted, authenticated link, so an unpaired phone's write is refused by the
+  // stack itself (and the phone's OS puts up its pairing prompt).
+  const uint32_t wsec = locked ? (NIMBLE_PROPERTY::WRITE_ENC | NIMBLE_PROPERTY::WRITE_AUTHEN) : 0;
   txChar = svc->createCharacteristic(TX_UUID, NIMBLE_PROPERTY::NOTIFY);
-  rxChar = svc->createCharacteristic(RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  rxChar = svc->createCharacteristic(RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | wsec);
   rxChar->setCallbacks(&rxCb);
   auChar = svc->createCharacteristic(AU_UUID, NIMBLE_PROPERTY::NOTIFY);
   auChar->setCallbacks(&auCb);
-  otaChar = svc->createCharacteristic(OTA_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  otaChar = svc->createCharacteristic(OTA_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | wsec);
   otaChar->setCallbacks(&otaCb);
   svc->start();
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -1341,10 +1458,29 @@ void setup() {
   subghzInit();
   listenInit();
   Serial.printf("%s up; advertising as %s  (pair code %s)\n", FW_NAME, devName, pairCode);
+  Serial.printf("passkey %06lu — %s\n", (unsigned long)passkey,
+                locked ? "locked: phones must pair with it" : "not locked (lock it from the app)");
+}
+
+// Hold BOOT for 5 s while running: unlock and forget every paired phone. (Holding it while powering on is
+// the ROM's download mode instead, so this only counts after boot.)
+static void resetBtnTick(uint32_t now) {
+  static uint32_t downSince = 0;
+  if (RESET_BTN_PIN < 0) return;
+  if (digitalRead(RESET_BTN_PIN) != LOW) { downSince = 0; return; }
+  if (!downSince) { downSince = now ? now : 1; return; }
+  if (now - downSince >= 5000 && !rebootAt) {
+    blinkUntil = now + 1500;
+    secReset("BOOT held 5 s");
+  }
 }
 
 void loop() {
   uint32_t now = millis();
+  // A lock change (lock, unlock, BOOT held 5 s): the reply has had its time to go out; restart into the new
+  // state. Checked first and in OTA too, so an unlock always wins over an update in progress.
+  if (rebootAt && (int32_t)(now - rebootAt) >= 0) { drain(); delay(100); ESP.restart(); }
+  resetBtnTick(now);
   if (otaRebootAt) {                            // a verified update: tell the phone, then boot into it
     drain();
     if ((int32_t)(now - otaRebootAt) >= 0) { delay(100); ESP.restart(); }

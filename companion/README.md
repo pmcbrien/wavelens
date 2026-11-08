@@ -420,6 +420,29 @@ screen off — the ESP32 never throttles).
 5. Pick where it listens: radio (Wi-Fi / BLE / both / other RF), Wi-Fi band, channels
    (hop or park). The choice is sent on every reconnect.
 
+### Locking a Spotter (optional)
+
+By default anyone in Bluetooth range can connect to a Spotter, read what it hears and send it
+commands — including a firmware update. **Lock** it and it only talks to phones that have paired
+with its 6-digit **passkey** (Bluetooth bonding with passkey entry, LE Secure Connections):
+
+- The passkey is random, made on the board's first boot and kept in its flash. It is printed on the
+  serial console at boot (`passkey 482913 — not locked`) and on the sticker of a Spotter bought from
+  wavelensapp.us. Ask for it again over USB with `{"c":"passkey"}`.
+- Lock from the app (iPhone/iPad: **Setup → Lock this Spotter**). The app shows the passkey once,
+  the board restarts, and the phone's own pairing prompt asks for it. Each phone pairs once; up to
+  three phones are remembered.
+- Locked, an unpaired connection gets no data, and the stack refuses every command and firmware
+  write until the link is encrypted and authenticated.
+- **Unlock** (forgets every paired phone and makes a new passkey): from a paired phone; or
+  `{"c":"unlock"}` on the USB serial port; or hold **BOOT** for 5 s while the board is running (the
+  LED blinks and it restarts). Holding BOOT while powering on is the ESP32's download mode, not this.
+- If a phone was forgotten on the board's side, iOS needs the old pairing removed too:
+  *Settings → Bluetooth → Wavelens-XXXX → ⓘ → Forget This Device*.
+
+Bonds need `-DCONFIG_BT_NIMBLE_NVS_PERSIST=1` (set in `platformio.ini`); an Arduino-IDE build
+without it forgets paired phones at every power-up.
+
 The link is Bluetooth only, on purpose: the app holds no INTERNET permission, and any
 Wi-Fi socket — even to a box on the dash — would need one. **Not showing up?** on the
 same screen covers the usual causes (held by another app, Bluetooth permission, error
@@ -444,6 +467,8 @@ an MTU of 247; assume 20-byte chunks if it fails.
 ```jsonc
 {"t":"hello","fw":"wavelens-esp32 0.3","name":"Wavelens-3F2A","code":"3F2A","caps":["wifi","ble","rf"],
  "hw":{"radio":"SX1276","sa818u":"up","sa818v":null,"rx5808":false,"line":"SX1276 · SA818-U","missing":[]}}
+{"t":"sec","lock":false,"paired":false,"id":"24DCC3A13F2A"}   // Spotter, right after every hello: lock state,
+                                     // whether this link is paired, and the full Bluetooth address
 // hw: what the companion found on its own bus at this connect, probed again on every hello (the phone
 // pings every 15 s). The Pi bridge sends {"rtl":[{"serial":"00000978","role":"listen"},{"serial":"00001090",
 // "role":"sensors"}],"hackrf":"ok"|"portapack"|"none","esp32":[...usb-serial boards...],"line":"2 RTL-SDR
@@ -488,6 +513,9 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 ```jsonc
 {"c":"ping"}                         // reply with hello + status
 {"c":"blink","v":5}                  // identify: flash the LED for v seconds (1–30)
+{"c":"lock","v":true}                // Spotter: require pairing with the passkey (answers a sec line with the
+                                     // passkey, then restarts). v false, from a paired phone: unlock + forget
+                                     // every phone. Over USB only: {"c":"unlock"}, {"c":"passkey"}
 {"c":"mode","v":"both"}              // wifi | ble | both | rf
 {"c":"band","v":"2g"}                // 2g | 5g | all     (say so in a status if the hardware can't)
 {"c":"ch","v":"hop"}                 // hop every channel of the band
