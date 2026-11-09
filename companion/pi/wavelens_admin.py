@@ -185,7 +185,8 @@ def host_ok(host_header):
     rc, ips = run(["hostname", "-I"], timeout=5)
     if rc == 0:
         allowed.update(ip.lower() for ip in ips.split())
-    return h in allowed
+    # Avahi renames the Pi to name-2.local (and so on) when another device on the network already has name.local.
+    return h in allowed or re.fullmatch(re.escape(name) + r"-\d{1,3}\.local", h) is not None
 
 
 def installed_version():
@@ -1448,10 +1449,12 @@ restarts by itself afterwards.</p></div>
             base = FW_URL.rsplit("/", 1)[0]
             FLASH_JOB.lines.append(f"downloading {base}/ (every chip's image)")
             stage = tempfile.mkdtemp(dir=FW_DIR, prefix=".dl-")
-            want = [(f"{base}/wavelens-{c}.bin", fw_bin_for(c)) for c in FW_CHIPS] + [(FW_VERSION_URL, FW_VERSION)]
+            # VERSION is fetched first and again at the end: the release is deleted and recreated on every
+            # publish, so a download that straddles one could otherwise put old images under the new VERSION.
+            want = [(FW_VERSION_URL, FW_VERSION)] + [(f"{base}/wavelens-{c}.bin", fw_bin_for(c)) for c in FW_CHIPS]
             got = []
-            for url, dest in want:
-                tmp = os.path.join(stage, os.path.basename(dest))
+
+            def fetch(url, tmp):
                 try:
                     req = urllib.request.Request(url, headers={"User-Agent": "wavelens-admin"})
                     with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as f:
@@ -1459,9 +1462,19 @@ restarts by itself afterwards.</p></div>
                     if os.path.getsize(tmp) == 0:
                         raise OSError("empty file")
                 except Exception as e:  # noqa: BLE001
-                    raise RuntimeError(f"no {os.path.basename(dest)} in this release ({e}); "
+                    raise RuntimeError(f"no {os.path.basename(tmp)} in this release ({e}); "
                                        f"kept firmware {read_text(FW_VERSION).strip() or 'as it was'}") from None
+
+            for url, dest in want:
+                tmp = os.path.join(stage, os.path.basename(dest))
+                fetch(url, tmp)
                 got.append((tmp, dest))
+            again = os.path.join(stage, "VERSION.check")
+            fetch(FW_VERSION_URL, again)
+            if read_text(again).strip() != read_text(got[0][0]).strip():
+                raise RuntimeError("a new firmware release was published during the download; "
+                                   f"kept firmware {read_text(FW_VERSION).strip() or 'as it was'} - try again")
+            got.append(got.pop(0))           # install VERSION last, once every image is in
             for tmp, dest in got:            # VERSION is last in the list, so it only changes once every image is in
                 os.replace(tmp, dest)
             FLASH_JOB.lines.append(f"downloaded firmware {read_text(FW_VERSION).strip() or '?'} ({os.path.getsize(FW_BIN) // 1024} KB)")

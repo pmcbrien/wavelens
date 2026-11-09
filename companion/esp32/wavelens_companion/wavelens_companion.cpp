@@ -35,6 +35,7 @@
 #include "esp_mac.h"
 #include "soc/soc_caps.h"
 #include <Update.h>
+#include "freertos/semphr.h"
 #include <Preferences.h>
 
 static void candAdd(float mhz);               // a carrier the spectrum sweep found: Follow may tune it (SA818)
@@ -150,6 +151,7 @@ static NimBLEServer*         server = nullptr;
 static NimBLECharacteristic* txChar = nullptr;
 static NimBLECharacteristic* rxChar = nullptr;
 static volatile bool         linked = false;
+static uint16_t              cpHandle = 0xFFFF;   // the phone's connection handle (0xFFFF = none)
 
 // Lock (opt-in, off by default). Locked, the board only talks to a phone that has paired with its 6-digit
 // passkey: the system pairing prompt appears on first connect, the bond is kept in flash, and an unpaired
@@ -349,7 +351,18 @@ static void hello() {
 
 static void setChannel(uint8_t ch) {
   curCh = ch;
-  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  esp_err_t e = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+  static bool told = false;                     // once: the hopper calls this every HOP_MS
+  if (e != ESP_OK && !told) { told = true; Serial.printf("wifi: set channel %u failed: %s\n", ch, esp_err_to_name(e)); }
+}
+
+// A channel this chip can tune: 2.4 GHz everywhere, 5 GHz only where the SoC has it (C5).
+static bool chOk(int n) {
+  for (uint8_t c : CH_24) if (c == n) return true;
+#if SOC_WIFI_SUPPORT_5G
+  for (uint8_t c : CH_5) if (c == n) return true;
+#endif
+  return false;
 }
 
 static void applyChannels() {
@@ -1132,6 +1145,9 @@ static const uint32_t OTA_IDLE_MS = 30000;
 static volatile bool     otaAbortReq = false;
 static volatile uint32_t otaLastData = 0;
 static NimBLECharacteristic* otaChar = nullptr;
+// Update.* is not thread-safe: chunks are written in the NimBLE host task while loop() can abandon the update
+// (and a USB "ota" command runs in loop()). Every Update call holds this, so an abort never lands mid-write.
+static SemaphoreHandle_t otaMx = nullptr;
 
 static void otaStatus(const char* st, const char* extra = "") {
   char line[QL];
@@ -1187,15 +1203,18 @@ static void otaCommand(const char* line, const char* v) {
 class OtaCB : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic* ch, NimBLEConnInfo&) override {
     if (!otaOn || (locked && !secured)) return;   // locked: an unpaired link writes no firmware
+    xSemaphoreTake(otaMx, portMAX_DELAY);
+    if (!otaOn || otaAbortReq) { xSemaphoreGive(otaMx); return; }   // loop() abandoned it while we waited
     otaLastData = millis();
     std::string v = ch->getValue();
     size_t n = Update.write((uint8_t*)v.data(), v.size());
     otaGot += n;
     if (n != v.size()) {
       char ex[96]; snprintf(ex, sizeof ex, ",\"msg\":\"write failed: %s\"", Update.errorString());
-      Update.abort(); otaStop(true); otaStatus("error", ex); return;
+      Update.abort(); otaStop(true); otaStatus("error", ex); xSemaphoreGive(otaMx); return;
     }
     if (otaGot - otaAcked >= OTA_WIN || otaGot >= otaSize) { otaAcked = otaGot; otaStatus("ack"); }
+    xSemaphoreGive(otaMx);
   }
 };
 static OtaCB otaCb;
@@ -1238,32 +1257,47 @@ static void secReset(const char* why) {
   rebootAt = millis() + 1200; if (!rebootAt) rebootAt = 1;
 }
 
-static void lockCommand(const char* v) {
+static volatile uint32_t lockPendingUntil = 0;   // a Bluetooth lock from an unpaired phone, waiting for a BOOT press
+
+static void doLock() {
+  lockPendingUntil = 0;
+  // Told once, on the link that asked for the lock, so the person can write it down before the reboot.
+  // Queued before anything is saved: a full ring would otherwise reboot it locked with the passkey unseen.
+  char line[SEC_CAP];
+  snprintf(line, sizeof line, "{\"t\":\"sec\",\"lock\":true,\"paired\":false,\"id\":\"%s\",\"passkey\":\"%06lu\",\"reboot\":true}\n",
+           btId, (unsigned long)passkey);
+  if (!enqueue(line)) { Serial.println("lock: queue full, not locked"); status("busy, try again"); return; }
+  secSave(true, false);
+  Serial.printf("lock: locked; passkey %06lu; restarting\n", (unsigned long)passkey);
+  status("locked; restarting");
+  rebootAt = millis() + 1500; if (!rebootAt) rebootAt = 1;
+}
+
+static void lockCommand(const char* v, bool usb) {
   bool on = v && !strncmp(v, "true", 4);
   if (on) {
     if (locked) { status("already locked"); return; }
-    secSave(true, false);
-    // Told once, on the link that asked for the lock, so the person can write it down before the reboot.
-    char line[SEC_CAP];
-    snprintf(line, sizeof line, "{\"t\":\"sec\",\"lock\":true,\"paired\":false,\"id\":\"%s\",\"passkey\":\"%06lu\",\"reboot\":true}\n",
-             btId, (unsigned long)passkey);
-    enqueue(line);
-    Serial.printf("lock: locked; passkey %06lu; restarting\n", (unsigned long)passkey);
-    status("locked; restarting");
-    rebootAt = millis() + 1500; if (!rebootAt) rebootAt = 1;
+    // A paired (passkey-authenticated) link or USB locks at once. Any other phone could be a stranger's, so
+    // the lock waits for someone at the board to press BOOT: a phone in range alone can't lock it.
+    if (usb || secured) { doLock(); return; }
+    lockPendingUntil = millis() + 30000; if (!lockPendingUntil) lockPendingUntil = 1;
+    Serial.println("lock: asked by an unpaired phone; press BOOT within 30 s to confirm");
+    status("press BOOT on the board within 30 s to lock");
   } else {
+    lockPendingUntil = 0;
     if (!locked) { status("not locked"); return; }
     secReset("asked by a paired phone");
   }
 }
 
-static void applyCommand(const char* line) {
+// usb: the line came in on the serial port (physical access), not over Bluetooth.
+static void applyCommand(const char* line, bool usb = false) {
   // Tiny parser: enough for {"c":"band","v":"2g"} / {"c":"ch","v":[1,6,11]} / {"c":"mode","v":"ble"} / {"c":"ping"}
   const char* c = strstr(line, "\"c\":\"");
   if (!c) return;
   c += 5;
   if (!strncmp(c, "ping", 4)) { hello(); status("ok"); return; }
-  if (!strncmp(c, "lock", 4)) { const char* lv = strstr(line, "\"v\":"); lockCommand(lv ? lv + 4 : nullptr); return; }
+  if (!strncmp(c, "lock", 4)) { const char* lv = strstr(line, "\"v\":"); lockCommand(lv ? lv + 4 : nullptr, usb); return; }
   if (!strncmp(c, "blink", 5)) {
     const char* bv = strstr(line, "\"v\":");
     int secs = bv ? atoi(bv + 4) : 5; if (secs < 1 || secs > 30) secs = 5;
@@ -1273,7 +1307,10 @@ static void applyCommand(const char* line) {
     return;
   }
   const char* v = strstr(line, "\"v\":");
-  if (!strncmp(c, "ota", 3)) { otaCommand(line, v ? v + 4 : nullptr); return; }
+  if (!strncmp(c, "ota", 3)) {                 // see otaMx: this can run in loop() (USB) or the NimBLE task
+    xSemaphoreTake(otaMx, portMAX_DELAY); otaCommand(line, v ? v + 4 : nullptr); xSemaphoreGive(otaMx);
+    return;
+  }
   if (!strncmp(c, "listen", 6)) { listenCommand(line, v ? v + 4 : nullptr); return; }
   if (!strncmp(c, "spec", 4)) {
     if (strstr(line, "\"on\":false")) { specStop(); return; }
@@ -1306,15 +1343,19 @@ static void applyCommand(const char* line) {
     const char* b = strchr(v, '[');
     if (!b) return;
     chCount = 0; hopping = false;
+    int skipped = 0;                            // e.g. 5 GHz channels sent to a 2.4 GHz-only chip
     const char* p = b + 1;
     while (*p && *p != ']' && chCount < sizeof chList) {
       while (*p == ' ' || *p == ',') p++;
-      int n = atoi(p); if (n >= 1 && n <= 177) chList[chCount++] = (uint8_t)n;
+      int n = atoi(p); if (chOk(n)) chList[chCount++] = (uint8_t)n; else if (n) skipped++;
       while (*p && *p != ',' && *p != ']') p++;
     }
     if (chCount == 0) hopping = true;
     applyChannels();
-    char m[40]; snprintf(m, sizeof m, "parked on %d channel%s", chCount, chCount == 1 ? "" : "s");
+    char m[64];
+    if (hopping) snprintf(m, sizeof m, "hopping%s", skipped ? " (channels not on this chip)" : "");
+    else snprintf(m, sizeof m, "parked on %d channel%s%s", chCount, chCount == 1 ? "" : "s",
+                  skipped ? " (some not on this chip)" : "");
     status(m);
   }
 }
@@ -1364,7 +1405,7 @@ static const char* discReason(int r) {
 // inside Apple's accessory rules: interval 30-50 ms (min >= 15 ms, max >= min + 15 ms), no latency,
 // 5 s timeout (2-6 s, and > 3 x max interval x (latency + 1)).
 static const uint16_t CP_MIN = 24, CP_MAX = 40, CP_LAT = 0, CP_TO = 500;   // 1.25 ms, 1.25 ms, events, 10 ms
-static uint32_t cpAskAt = 0; static uint16_t cpHandle = 0xFFFF;
+static uint32_t cpAskAt = 0;   // cpHandle (the link's handle) is declared with `linked`: the lock uses it too
 
 class ServerCB : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer*, NimBLEConnInfo& ci) override {
@@ -1439,7 +1480,7 @@ static void serialTick() {
         NimBLEDevice::startAdvertising();
         Serial.println("host: released; advertising again");
       } else {
-        applyCommand(serBuf);
+        applyCommand(serBuf, true);
       }
     }
     serLen = 0;
@@ -1463,6 +1504,7 @@ void setup() {
   snprintf(devName, sizeof devName, "Wavelens-%s", pairCode);
   snprintf(btId, sizeof btId, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   secLoad();
+  otaMx = xSemaphoreCreateMutex();             // before the BLE server: OtaCB / RxCB take it
   if (RESET_BTN_PIN >= 0) pinMode(RESET_BTN_PIN, INPUT_PULLUP);
   NimBLEDevice::init(devName);
   NimBLEDevice::setMTU(247);
@@ -1508,8 +1550,13 @@ void setup() {
 static void resetBtnTick(uint32_t now) {
   static uint32_t downSince = 0;
   if (RESET_BTN_PIN < 0) return;
+  if (lockPendingUntil && (int32_t)(now - lockPendingUntil) >= 0) {
+    lockPendingUntil = 0; Serial.println("lock: no BOOT press in 30 s; not locked"); status("lock cancelled: BOOT not pressed");
+  }
   if (digitalRead(RESET_BTN_PIN) != LOW) { downSince = 0; return; }
   if (!downSince) { downSince = now ? now : 1; return; }
+  // A pending lock: a short press (debounced) confirms it. rebootAt is then set, so the 5 s unlock can't follow.
+  if (lockPendingUntil && now - downSince >= 50 && !rebootAt) { blinkUntil = now + 1500; doLock(); return; }
   if (now - downSince >= 5000 && !rebootAt) {
     blinkUntil = now + 1500;
     secReset("BOOT held 5 s");
@@ -1539,7 +1586,7 @@ void loop() {
     if (gone || (int32_t)(now - otaLastData) > (int32_t)OTA_IDLE_MS) {
       otaAbortReq = false;
       otaOn = false;                            // first, so a late chunk is ignored rather than written
-      Update.abort();
+      xSemaphoreTake(otaMx, portMAX_DELAY); Update.abort(); xSemaphoreGive(otaMx);   // waits out a write in progress
       Serial.printf("ota: abandoned (%s) after %u of %u bytes; the old firmware stays\n",
                     gone ? "phone disconnected" : "no data for 30 s", otaGot, otaSize);
       otaStop(true);

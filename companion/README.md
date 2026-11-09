@@ -427,11 +427,15 @@ commands — including a firmware update. **Lock** it and it only talks to phone
 with its 6-digit **passkey** (Bluetooth bonding with passkey entry, LE Secure Connections):
 
 - The passkey is random, made on the board's first boot and kept in its flash. It is printed on the
-  serial console at boot (`passkey 482913 — not locked`) and on the sticker of a Spotter bought from
-  wavelensapp.us. Ask for it again over USB with `{"c":"passkey"}`.
-- Lock from the app (iPhone/iPad: **Setup → Lock this Spotter**). The app shows the passkey once,
-  the board restarts, and the phone's own pairing prompt asks for it. Each phone pairs once; up to
-  three phones are remembered.
+  serial console at boot (`passkey 482913 — not locked`); ask for it again over USB with `{"c":"passkey"}`.
+  The sticker of a Spotter bought from wavelensapp.us has the factory passkey, which holds only until
+  the first unlock: every unlock makes a new one, and after that only the serial console has it until
+  you lock again.
+- Lock from the app (iPhone/iPad: **Setup → Lock this Spotter**). Over Bluetooth the lock needs a
+  paired link: if the phone hasn't paired yet, the board refuses ("pair first") and the phone's pairing
+  prompt asks for the current passkey; then lock again. The app shows the passkey once, the board
+  restarts, and the phone carries on over its pairing. `{"c":"lock","v":true}` on the USB serial port
+  locks without pairing (physical access). Each phone pairs once; up to three phones are remembered.
 - Locked, an unpaired connection gets no data, and the stack refuses every command and firmware
   write until the link is encrypted and authenticated.
 - **Unlock** (forgets every paired phone and makes a new passkey): from a paired phone; or
