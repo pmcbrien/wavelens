@@ -15,7 +15,7 @@ It never connects to, pairs with or transmits to anything. It has **no network a
 
 <p align="center">
   <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-promo.mp4"><img src="docs/promo/wavelens-promo-poster.jpg" width="92%" alt="Night drive: Wavelens warns the driver of a drone overhead"></a><br>
-  <sub>Drone overhead, body cam ahead, a phone that keeps reappearing behind you, and a $49 Spotter on the dash that hears a plate reader a block sooner. <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-promo.mp4">Watch the 30-second spot</a>.</sub>
+  <sub>Drone overhead, body cam ahead, a phone that keeps reappearing behind you, and a $199 Spotter on the dash that hears a plate reader a block sooner. <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-promo.mp4">Watch the 30-second spot</a>.</sub>
 </p>
 
 ## Videos
@@ -27,7 +27,7 @@ Thirty seconds each, no jargon. Click a poster to play.
 | <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-layers.mp4"><img src="docs/promo/wavelens-layers-poster.jpg" alt="What a phone can't hear"></a><br><sub><b>What a phone can't hear.</b> The phone, then Spotter, then Scanner, each hearing more. 20 s.</sub> | <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-companion-promo.mp4"><img src="docs/promo/wavelens-companion-promo-poster.jpg" alt="Companion radios"></a><br><sub><b>Companion radios.</b> A second radio with a real antenna, and the three ready-made tiers. 30 s.</sub> |
 | <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-area.mp4"><img src="docs/promo/wavelens-area-poster.jpg" alt="Set up for where you drive"></a><br><sub><b>Set up for where you drive.</b> One line at checkout; the device arrives configured for your area. 15 s.</sub> | <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-spotter.mp4"><img src="docs/promo/wavelens-spotter-poster.jpg" alt="Spotter in 15 seconds" width="45%"></a><br><sub><b>Spotter in 15 seconds.</b> Plug in, two blinks, Find, Pair, listening.</sub> |
 
-**Buy one ready to go:** Spotter $49 · Scanner $199 · Full Spectrum $499, programmed and set up for your area. [wavelensapp.us/#shop](https://wavelensapp.us/#shop)
+**Buy one ready to go:** Spotter $199 · Full Spectrum $499, programmed and set up for your area. [wavelensapp.us/#shop](https://wavelensapp.us/#shop)
 
 <p align="center">
   <a href="https://youtu.be/09LMsqHtMFQ"><img src="https://img.youtube.com/vi/09LMsqHtMFQ/mqdefault.jpg" width="45%" alt="How Wavelens uses the location foreground-service permission"></a>
@@ -395,7 +395,7 @@ One version number (`companion/VERSION`, a date) covers the Pi bridge, the ESP32
 
 - **Spotter (ESP32):** the app pushes new firmware over Bluetooth — *More → Companion radio → Update firmware* when a newer one is available. Two OTA slots, so an interrupted update leaves the old firmware running. From a computer: the [browser flasher](https://pmcbrien.github.io/wavelens/flash/) (Chrome/Edge, USB), also for blank boards. Images: the [firmware release](https://github.com/pmcbrien/wavelens/releases/tag/firmware).
 - **Scanner (Raspberry Pi):** `sudo wavelens-update check | apply | rollback` on the Pi, or the same from the app's Companion screen, or the Pi's admin page at `http://wavelens.local:8080` (Wi-Fi, logs, settings, updates, flash a Spotter, power). A nightly timer checks; it installs only if you switch that on. A failed update rolls back by itself.
-- A fresh Pi: `sudo companion/pi/provision.sh`.
+- A fresh Pi: the [setup page](https://pmcbrien.github.io/wavelens/pi/) builds the one-line install command (it runs `companion/pi/provision.sh`).
 
 Details: [companion/UPDATES.md](companion/UPDATES.md), [companion/pi/ADMIN.md](companion/pi/ADMIN.md).
 

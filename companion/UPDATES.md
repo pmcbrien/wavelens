@@ -74,7 +74,7 @@ already-broken install — before anything reaches a Pi.
 
 ## A fresh Pi, the way we ship them
 
-`companion/pi/provision.sh` (run with sudo on a fresh Raspberry Pi OS) installs the packages, clones the public repo to `/opt/wavelens`, sets the hostname to `wavelens`, and runs `install-service.sh` — bridge, updater, nightly timer and admin page in one go. Digital voice is the separate `install-dsd.sh` (longer build, patent notice).
+The setup page, https://pmcbrien.github.io/wavelens/pi/, builds the one-line install command for a fresh Pi (hostname, RTL-SDR Blog V4 driver). It runs `companion/pi/provision.sh`, which checks the Pi model, power supply and internet, installs the packages, clones the public repo to `/opt/wavelens`, sets the hostname to `wavelens`, and runs `install-service.sh` — bridge, updater, nightly timer and admin page in one go. Digital voice is the separate `install-dsd.sh` (longer build, patent notice). With an RTL-SDR Blog V4 plugged in on an OS whose `rtl-sdr` is older than 2.0 it also builds the rtl-sdr-blog driver as packages that replace the stock ones (`WAVELENS_RTLSDR_BLOG=auto|1|0`).
 
 ## Everything else on the Pi
 
