@@ -462,7 +462,8 @@ RR_TAG_AGENCY = [
 RR_LISTEN = {"fm": "fm", "fmn": "fm", "am": "am", "dmr": "dmr", "dmre": "dmr", "p25": "p25", "p25e": "p25",
              "nxdn48": "nxdn", "nxdn96": "nxdn", "nxdn": "nxdn", "project 25": "p25", "telm": "fm",   # telemetry/paging: FM, the pager decoder reads it
              "edacs": "trunked", "ltr": "trunked"}
-RR_PUBLIC = ("county", "city", "sheriff", "police", "law", "state", "fire", "ems", "town", "village", "government")
+RR_PUBLIC = ("county", "city", "sheriff", "police", "law", "state", "fire", "ems", "town", "village", "government",
+             "public safety")     # "Michigan's Public Safety Communications System (MPSCS)" names no state or county
 RR_NEAR_KM = 80.0      # a trunked site this close to the phone counts as local when several systems share a frequency
 
 
