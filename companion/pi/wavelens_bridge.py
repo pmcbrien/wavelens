@@ -4703,11 +4703,22 @@ def probe_radios():
     try:
         out = subprocess.run(["rtl_test", "-t"], capture_output=True, text=True, timeout=15)
         for ln in (out.stdout + out.stderr).splitlines():
-            m = re.match(r"\s*(\d+):\s*(.+?),\s*(.+?),\s*SN:\s*(\S+)", ln)
+            # maker and product may be empty on a cheap dongle ("1:  , , SN: 00000001"): still a dongle
+            m = re.match(r"\s*(\d+):\s*(.*?),\s*(.*?),\s*SN:\s*(\S+)", ln)
             if m:
                 rtls.append((int(m.group(1)), m.group(4).strip(), f"{m.group(2)} {m.group(3)}".strip()))
     except (OSError, subprocess.TimeoutExpired):
         pass
+    # rtl_test can miss a dongle that the USB bus has (seen on a Pi 5 with two RTL2838s: one listed, the
+    # other left "free" for good, because the hot-plug watch only takes up dongles that appear later).
+    # The bus is the authority on what is plugged in: anything it has that rtl_test did not list is planned
+    # too, addressed by its serial.
+    listed = {r[1] for r in rtls}
+    for sn in usb_rtl_serials():
+        if sn and sn not in listed:
+            listed.add(sn)
+            rtls.append((len(rtls), sn, ""))
+            print(f"bridge: auto: RTL-SDR {sn} is on the USB bus but rtl_test did not list it; using it by serial", file=sys.stderr)
     hackrf = False
     ensure_hackrf_mode()
     if shutil.which("hackrf_info"):
