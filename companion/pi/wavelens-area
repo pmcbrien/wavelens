@@ -1,0 +1,3 @@
+#!/bin/sh
+# Where this companion is used: "sudo wavelens-area set US 49749", "status", "refresh", "clear". See area.py.
+exec python3 /usr/local/lib/wavelens/area.py "$@"

@@ -123,6 +123,8 @@ install_files() {   # from $SRC into $LIB (same list as install-service.sh)
     # never rewrite the running script in place: bash reads it as it goes
     install -m 0755 "$p/wavelens-update" /usr/local/bin/.wavelens-update.new && mv -f /usr/local/bin/.wavelens-update.new /usr/local/bin/wavelens-update
     [ -f "$p/wavelens-admin" ] && install -m 0755 "$p/wavelens-admin" /usr/local/bin/wavelens-admin
+    [ -f "$p/wavelens-area" ] && install -m 0755 "$p/wavelens-area" /usr/local/bin/wavelens-area
+    install -d /var/lib/wavelens/area /var/lib/wavelens/area/rr
     install -m 0644 "$p/wavelens-bridge.service" /etc/systemd/system/
     [ -f "$p/wavelens-admin.service" ] && install -m 0644 "$p/wavelens-admin.service" /etc/systemd/system/
     [ -f "$p/wavelens-update.service" ] && install -m 0644 "$p/wavelens-update.service" "$p/wavelens-update.timer" /etc/systemd/system/

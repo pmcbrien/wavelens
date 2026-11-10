@@ -180,10 +180,14 @@ def iter_records(zf: zipfile.ZipFile, member: str):
                 yield row
 
 
-def build(zips, state=None, counties=(), center=None, radius_km=None, include_mobiles=True):
+def build(zips, state=None, counties=(), center=None, radius_km=None, include_mobiles=True, states=None):
+    """states: a set of two-letter states to take whole (tools/area_packs.py builds the per-state packs the
+    Pi's area tool downloads). Entries then carry "areas": ["MI|CHEBOYGAN", ...], every state|county the
+    licence has a location in, so one pass can be split by state and filtered by county afterwards."""
     counties_u = {c.strip().upper() for c in counties}
     state_u = (state or "").strip().upper()
-    locs = {}           # call_sign → list of (lat, lon, city, county, dist_km or None)
+    states_u = {x.strip().upper() for x in (states or ())}
+    locs = {}           # call_sign → list of (lat, lon, city, county, dist_km or None, state)
     in_area = set()     # call signs with at least one location in the area
 
     # Pass 1: locations
@@ -202,10 +206,12 @@ def build(zips, state=None, counties=(), center=None, radius_km=None, include_mo
                     ok = dist <= (radius_km or 50)
                 if state_u and st == state_u and (not counties_u or county in counties_u):
                     ok = True                                   # area-wide mobile licenses land here
+                if st in states_u:
+                    ok = True
                 if not ok:
                     continue
                 in_area.add(call)
-                locs.setdefault(call, []).append((lat, lon, r[LO_CITY].strip().title(), county.title(), dist))
+                locs.setdefault(call, []).append((lat, lon, r[LO_CITY].strip().title(), county.title(), dist, st))
 
     if not in_area:
         return []
@@ -265,14 +271,15 @@ def build(zips, state=None, counties=(), center=None, radius_km=None, include_mo
             cat = acat
         bw = max(emis[c]) if emis.get(c) else 12.5
         sites = [(la, lo) for la, lo, *_ in locs.get(c, []) if la is not None and lo is not None]
-        place = next((f"{ci}, {co} Co." for _, _, ci, co, _ in locs.get(c, []) if ci or co), "")
+        place = next((f"{ci}, {co} Co." for _, _, ci, co, *_ in locs.get(c, []) if ci or co), "")
+        areas = sorted({f"{st}|{co.upper()}" for _, _, _, co, _, st in locs.get(c, []) if st}) if states_u else None
         seen = set()
         for f, upper, cls in fl:
             key = (round(f, 4), upper)
             if key in seen:
                 continue
             seen.add(key)
-            out.append({
+            e = {
                 "mhz": round(f, 4),
                 "mhz_hi": round(upper, 4) if upper else None,
                 "bw_khz": round(bw, 1),
@@ -285,7 +292,10 @@ def build(zips, state=None, counties=(), center=None, radius_km=None, include_mo
                 "agency": agency or svc_label,
                 "place": place,
                 "sites": [[round(la, 5), round(lo, 5)] for la, lo in sites[:8]],
-            })
+            }
+            if areas is not None:
+                e["areas"] = areas
+            out.append(e)
     out.sort(key=lambda e: (e["mhz"], e["call"]))
     return out
 
@@ -333,6 +343,10 @@ def selftest() -> int:
     tow = [e for e in by_county if e["call"] == "WQZZ002"][0]
     assert tow["cat"] == "VEHICLE" and tow["bw_khz"] == 20.0 and tow["sites"] == []   # 0/0 coords dropped
     assert sorted({e["call"] for e in by_radius}) == ["WQZZ001"]      # the mobile-only licence has no site
+    assert "areas" not in sheriff[0]                                  # only the per-state build adds them
+    z.seek(0)
+    whole = build([z], states={"FL", "TX"})
+    assert {e["call"]: e["areas"] for e in whole}["WQZZ001"] == ["FL|EXAMPLE"], whole
     assert sheriff[0]["agency"] == "Law enforcement" and tow["agency"] == "Towing / roadside"
     for nm, svc, want in [("Example County Fire Rescue", "PW", "Fire / rescue"),
                           ("Example County EMS", "PW", "EMS / ambulance"),

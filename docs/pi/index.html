@@ -50,6 +50,12 @@
     <p class="hint" id="hosthint">Its admin page will be at <code id="adminurl">http://wavelens.local:8080</code>. Change it if you run more than one.</p>
     <p class="err" id="hosterr" role="alert"></p>
 
+    <label for="country">Where you'll use it (optional)</label>
+    <input type="text" id="country" value="" maxlength="2" size="4" placeholder="US" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Two-letter country code" style="width:5em;display:inline-block">
+    <input type="text" id="postcode" value="" maxlength="12" placeholder="Postcode / ZIP" autocomplete="off" spellcheck="false" aria-label="Postcode or ZIP" aria-describedby="areahint areaerr" style="width:12em;display:inline-block">
+    <p class="hint" id="areahint">A two-letter country and a postcode, any country. The Scanner downloads the public licence records around that place, where a country publishes them (today the United States), so a hit reads as the licensee's name instead of a bare frequency. Leave it empty to set it later on the admin page's <em>Area</em> tab.</p>
+    <p class="err" id="areaerr" role="alert"></p>
+
     <label for="blog">RTL-SDR Blog V4 driver</label>
     <select id="blog" aria-describedby="bloghint">
       <option value="auto" selected>Install it if a V4 is plugged in (recommended)</option>
@@ -86,10 +92,12 @@
   <p class="ver">Receive-only; it transmits nothing. Updates are free for life: <code>sudo wavelens-update check</code>, the admin page, or the app's Companion screen. More: <a href="https://github.com/pmcbrien/wavelens/blob/main/companion/UPDATES.md">UPDATES.md</a>, <a href="https://github.com/pmcbrien/wavelens/blob/main/companion/pi/ADMIN.md">ADMIN.md</a>.</p>
 </main>
 <script>
-  // Builds the one-liner from the two options. Values are validated to a strict pattern before they go into the
+  // Builds the one-liner from the options. Values are validated to a strict pattern before they go into the
   // command, so nothing typed here can add shell syntax to what gets pasted into a root shell.
   var URL_ = "https://raw.githubusercontent.com/pmcbrien/wavelens/main/companion/pi/provision.sh";
   var host = document.getElementById("host"), blog = document.getElementById("blog");
+  var country = document.getElementById("country"), postcode = document.getElementById("postcode");
+  var COUNTRY_OK = /^[A-Z]{2}$/, POSTCODE_OK = /^[A-Z0-9]([A-Z0-9-]{0,10}[A-Z0-9])?$/;
   var cmd = document.getElementById("cmd"), copy = document.getElementById("copy"), copied = document.getElementById("copied");
   var HOST_OK = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
 
@@ -97,12 +105,18 @@
     var h = host.value.trim().toLowerCase(), b = blog.value;
     var ok = HOST_OK.test(h);
     document.getElementById("hosterr").textContent = ok ? "" : "Use lowercase letters, digits and hyphens (not at the start or end).";
-    copy.disabled = !ok;
+    // spaces are dropped: the Scanner stores postcodes without them, and none then goes into the command
+    var c = country.value.trim().toUpperCase(), p = postcode.value.toUpperCase().replace(/\s+/g, "");
+    var areaOk = (!c && !p) || ((!c || COUNTRY_OK.test(c)) && POSTCODE_OK.test(p));
+    document.getElementById("areaerr").textContent = areaOk ? "" : (p ? "Country is two letters (US, CA, AU, GB, DE …); the postcode is letters and digits." : "Add the postcode, or clear the country.");
+    copy.disabled = !ok || !areaOk;
     copied.textContent = "";
     if (!ok) { cmd.textContent = "Fix the name above to see the command."; return; }
+    if (!areaOk) { cmd.textContent = "Fix the country and postcode above to see the command."; return; }
     var env = [];
     if (h !== "wavelens") env.push("WAVELENS_HOSTNAME=" + h);
     if (b === "1" || b === "0") env.push("WAVELENS_RTLSDR_BLOG=" + b);
+    if (p) { env.push("WAVELENS_COUNTRY=" + (c || "US")); env.push("WAVELENS_POSTCODE=" + p); }
     cmd.textContent = "curl -fsSL " + URL_ + " | sudo " + (env.length ? "env " + env.join(" ") + " " : "") + "bash";
     var admin = "http://" + h + ".local:8080";
     document.getElementById("adminurl").textContent = admin;
@@ -110,6 +124,8 @@
   }
   host.addEventListener("input", build);
   blog.addEventListener("change", build);
+  country.addEventListener("input", build);
+  postcode.addEventListener("input", build);
   copy.addEventListener("click", function () {
     var text = cmd.textContent;
     function done() { copied.textContent = "Copied. Paste it into the Pi's terminal."; }

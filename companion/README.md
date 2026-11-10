@@ -722,7 +722,41 @@ Unknown commands are ignored. Every command may be answered with a `status` line
 `ALPR`, `ACOUSTIC`, `DRONE`, `TOOL`, `LE_GEAR`, `TRACKER`, `TRAFFIC_SENSOR`, `CAMERA`,
 `VEHICLE`, `PHONE`, `WEARABLE`, `IOT`, `BEACON`, `NETWORK`, `CELL_SITE`, `UNKNOWN`.
 
+## Area — set a postcode, get the local names
+
+A Pi companion is told where it is used once, and fetches its own local data:
+
+```
+sudo wavelens-area set US 49749          # country and postcode, any country GeoNames has a table for
+sudo wavelens-area set AU 2000 --radius-km 80
+sudo wavelens-area set --country DE --lat 52.52 --lon 13.40
+sudo wavelens-area status | refresh | clear
+```
+
+or the admin page's **Area** tab, or `WAVELENS_COUNTRY` / `WAVELENS_POSTCODE` on the install one-liner
+(the [setup page](https://pmcbrien.github.io/wavelens/pi/) fills them in). The area is one file,
+`/etc/wavelens/area.json`: country, postcode, position, radius (50 km unless you say otherwise) and the
+districts in range (in the US, the state and its counties).
+
+What it downloads comes from the public repo's `area` release, rebuilt weekly from public sources
+(`tools/area_packs.py`, `.github/workflows/area-packs.yml`):
+
+- **Postcode tables** for about a hundred countries (GeoNames, CC BY 4.0): the postcode becomes a position.
+- **Licence packs** where a country publishes its licence database. Today that is the United States (FCC):
+  the packs for the states in range are cut down to the counties in range and to licensed sites inside the
+  radius, and written to `/var/lib/wavelens/area/fcc-local.json`. Elsewhere the area is still set, and
+  carriers are named from the country's band table (`packs/<cc>.json`) until that country has a reader here.
+
+The bridge reads `/var/lib/wavelens/area/` at start by itself: `fcc-local.json`, and any RadioReference
+exports you put in `rr/` (trunked sites, talkgroups, county, statewide and nationwide frequency exports are
+told apart by their headers and ordered most local first; the counties in range rank a statewide export).
+Nothing is listed in `WAVELENS_ARGS`. `--fcc-pack` and `--rr-pack` still work and take precedence. A
+companion with no area set loads no local data. RadioReference data is never downloaded or published by any
+of this: those exports are the owner's own.
+
 ## Local FCC license pack — who owns that carrier
+
+The area setting above does this for you. The tool below is what builds the packs, and still works by hand.
 
 Everything a HackRF or RTL-SDR hears below about 1 GHz that is not an unlicensed ISM band is
 on a frequency somebody holds an FCC license for, with a name, a call sign and usually a

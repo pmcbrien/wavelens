@@ -17,6 +17,10 @@ WAVELENS_AUTO=0
 # bridge run rtl_433 itself on the dongle it picks (315 / 433.92 / 915 MHz, 30 s hops, gain 40).
 WAVELENS_RTL433=""
 
+# Local data needs no flags: set the area once (sudo wavelens-area set US 49749, or the admin page's Area tab)
+# and the bridge loads /var/lib/wavelens/area/ at each start: the licence pack downloaded for that postcode
+# and any RadioReference exports you put in its rr/ folder. --fcc-pack / --rr-pack below are the manual way.
+#
 # Extra bridge flags. Examples:
 #   --hackrf-sweep                          HackRF energy sweep of the whole 1 MHz–6 GHz range (~1 s a pass),
 #                                           every carrier labelled by band; see README "HackRF: what the full sweep labels"

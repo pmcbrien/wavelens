@@ -11,16 +11,20 @@ if [ "${1:-}" = "--remove" ]; then
     systemctl disable --now wavelens-bridge wavelens-admin wavelens-update.timer 2>/dev/null || true
     rm -f /etc/systemd/system/wavelens-bridge.service /etc/systemd/system/wavelens-admin.service \
           /etc/systemd/system/wavelens-update.service /etc/systemd/system/wavelens-update.timer \
-          /usr/local/bin/wavelens-update /usr/local/bin/wavelens-admin
+          /usr/local/bin/wavelens-update /usr/local/bin/wavelens-admin /usr/local/bin/wavelens-area
     rm -rf /usr/local/lib/wavelens
     systemctl daemon-reload
-    echo "Removed. /etc/default/wavelens-bridge was kept."
+    echo "Removed. /etc/default/wavelens-bridge, the area setting and /var/lib/wavelens/area were kept."
     exit 0
 fi
 
 install -d /usr/local/lib/wavelens /usr/local/lib/wavelens/packs /usr/local/lib/wavelens/firmware /etc/wavelens /var/lib/wavelens
+# The area folder: the licence pack wavelens-area downloads for the postcode set on this companion, and the
+# owner's own RadioReference exports in rr/. The bridge reads it at start; nothing ships in it.
+install -d /var/lib/wavelens/area /var/lib/wavelens/area/rr
 install -m 0755 wavelens_bridge.py smartnet.py run-bridge.sh /usr/local/lib/wavelens/
-install -m 0644 regions.py spotters.py /usr/local/lib/wavelens/
+install -m 0644 regions.py spotters.py area.py /usr/local/lib/wavelens/
+install -m 0755 wavelens-area /usr/local/bin/wavelens-area
 install -m 0644 ../../packs/??.json /usr/local/lib/wavelens/packs/ 2>/dev/null || true
 install -m 0644 ../VERSION /usr/local/lib/wavelens/VERSION
 install -m 0644 wavelens-bridge.default /usr/local/lib/wavelens/wavelens-bridge.default   # the admin page's help text
@@ -52,3 +56,4 @@ systemctl --no-pager --lines=5 status wavelens-bridge || true
 echo
 echo "Settings: /etc/default/wavelens-bridge   Logs: journalctl -u wavelens-bridge -f"
 echo "Admin page: http://$(hostname).local:8080   Updates: sudo wavelens-update check | apply | rollback"
+echo "Area (local licence names): sudo wavelens-area set US 49749   (any country: COUNTRY POSTCODE)"

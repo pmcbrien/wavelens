@@ -4856,6 +4856,10 @@ def main() -> None:
                          "Preferred over --fcc-pack where it has the frequency")
     ap.add_argument("--rr-county", metavar="NAME", action="append", default=[],
                     help="county (repeatable) whose rows in a statewide export rank ahead of other counties'")
+    ap.add_argument("--area-dir", metavar="DIR", default=os.environ.get("WAVELENS_AREA_DIR", "/var/lib/wavelens/area"),
+                    help="the area folder, read at start with nothing to list: fcc-local.json (written by wavelens-area for "
+                         "the postcode set on this companion) and RadioReference exports in rr/*.csv. --fcc-pack and "
+                         "--rr-pack still work and come first. 'none' turns it off")
     ap.add_argument("--echo", action="store_true", help="print every line sent to the phone on stderr (see it with journalctl -u wavelens-bridge -f)")
     ap.add_argument("--region", default=os.environ.get("WAVELENS_REGION", "US"),
                     help="local pack to start with (its two-letter country code; the phone's choice replaces it on connect). "
@@ -4878,15 +4882,42 @@ def main() -> None:
     global FCC, RR, ECHO, HACKRF_ON
     ECHO = a.echo
     set_region(a.region, announce=False)
-    if a.fcc_pack:
-        FCC = FccPack(a.fcc_pack)
-        CAPS.append("fcc")
-        print(f"bridge: FCC pack loaded, {len(FCC.entries)} licensed frequencies", file=sys.stderr)
-    if a.rr_pack:
-        RR = RrPack(a.rr_pack, a.rr_county)
+    # The area folder: what wavelens-area downloaded for this companion's postcode, and the owner's own
+    # RadioReference exports. A file that will not load is logged and skipped; it never stops the bridge.
+    found = {"fcc": "", "rr": [], "counties": [], "area": {}}
+    if a.area_dir and a.area_dir != "none":
+        try:
+            import area as area_mod
+            found = area_mod.inputs_for_bridge(a.area_dir)
+            if found["area"]:
+                print(f"bridge: area {area_mod.describe(found['area'])}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            print(f"bridge: area folder not read: {e}", file=sys.stderr)
+    fcc_path = a.fcc_pack or found["fcc"]
+    if fcc_path:
+        try:
+            FCC = FccPack(fcc_path)
+            CAPS.append("fcc")
+            print(f"bridge: FCC pack loaded, {len(FCC.entries)} licensed frequencies from {fcc_path}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            if a.fcc_pack:
+                raise                    # a file named by hand that is missing is a settings mistake: say so loudly
+            print(f"bridge: licence pack {fcc_path} skipped: {e}", file=sys.stderr)
+    rr_paths = list(a.rr_pack)
+    for path in found["rr"]:
+        if os.path.realpath(path) in {os.path.realpath(p) for p in rr_paths}:
+            continue
+        try:
+            RrPack([path])               # each area file on its own first, so one bad export costs only itself
+            rr_paths.append(path)
+        except Exception as e:  # noqa: BLE001
+            print(f"bridge: RadioReference export {path} skipped: {e}", file=sys.stderr)
+    rr_counties = list(a.rr_county) + [c for c in found["counties"] if c not in a.rr_county]
+    if rr_paths:
+        RR = RrPack(rr_paths, rr_counties)
         CAPS.append("rr")
         print(f"bridge: RadioReference overlay loaded, {len(RR.rows)} frequencies, {len(RR.sites)} trunked sites, "
-              f"{len(RR.controls)} control channels, {len(RR.talkgroups)} talkgroups from {len(a.rr_pack)} file(s)", file=sys.stderr)
+              f"{len(RR.controls)} control channels, {len(RR.talkgroups)} talkgroups from {len(rr_paths)} file(s)", file=sys.stderr)
 
     if a.kismet_json:
         CAPS.append("wifi")

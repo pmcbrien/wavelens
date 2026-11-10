@@ -12,6 +12,11 @@
 #                              rtl-sdr package is older than 2.0 (Bookworm): auto = build it when a V4 is plugged
 #                              in (default), 1 = build it anyway, 0 = never. Adds about five minutes.
 #   WAVELENS_SRC=/opt/wavelens where the checkout goes
+#   WAVELENS_COUNTRY=US        where it will be used: a two-letter country and a postcode (WAVELENS_ZIP works
+#   WAVELENS_POSTCODE=49749    too). Downloads the local licence names for that place, where a public licence
+#                              database exists (today the US), so hits read "Example County Road Commission"
+#                              rather than "151 MHz carrier". Any time later: sudo wavelens-area set US 49749,
+#                              or the admin page's Area tab. Without it the Scanner loads no local data.
 #
 # What it does: apt packages (rtl-sdr, rtl_433, BlueZ, NetworkManager, avahi, esptool, git), the Python bridge
 # dependency (bluezero), a checkout of the public repo at /opt/wavelens, hostname "wavelens" (so the admin page is
@@ -24,6 +29,8 @@ SRC=${WAVELENS_SRC:-/opt/wavelens}
 REPO=https://github.com/pmcbrien/wavelens
 HOST=${WAVELENS_HOSTNAME:-wavelens}
 BLOG=${WAVELENS_RTLSDR_BLOG:-auto}
+POSTCODE=${WAVELENS_POSTCODE:-${WAVELENS_ZIP:-}}
+COUNTRY=${WAVELENS_COUNTRY:-}
 WARNINGS=""
 warn() { echo "  !! $1"; WARNINGS="$WARNINGS
   - $1"; }
@@ -32,6 +39,8 @@ case "$HOST" in
     ""|-*|*-|*[!a-z0-9-]*) echo "WAVELENS_HOSTNAME must be lowercase letters, digits and hyphens: '$HOST'"; exit 1 ;;
 esac
 case "$BLOG" in auto|0|1) ;; *) echo "WAVELENS_RTLSDR_BLOG must be auto, 0 or 1: '$BLOG'"; exit 1 ;; esac
+case "$COUNTRY" in ""|[A-Za-z][A-Za-z]) ;; *) echo "WAVELENS_COUNTRY must be a two-letter country code: '$COUNTRY'"; exit 1 ;; esac
+case "$POSTCODE" in *[!A-Za-z0-9\ -]*) echo "WAVELENS_POSTCODE must be letters, digits, spaces and hyphens: '$POSTCODE'"; exit 1 ;; esac
 
 # RTL-SDR dongles on the USB bus, read from sysfs so it works before any package is installed.
 rtl_dongles() {
@@ -135,6 +144,13 @@ chmod +x "$SRC"/companion/pi/*.sh "$SRC"/companion/pi/wavelens-update "$SRC"/com
 mkdir -p /etc/wavelens && echo "$SRC" > /etc/wavelens/source
 /usr/local/bin/wavelens-update check || true
 
+if [ -n "$POSTCODE" ]; then
+    echo "== area ${COUNTRY:-US} $POSTCODE"
+    # the bridge is restarted by the tool once the data is in place; a failure here is not a failed install
+    /usr/local/bin/wavelens-area set --country "${COUNTRY:-US}" --postcode "$POSTCODE" \
+        || warn "The area was not set. Try again when the Pi is online: sudo wavelens-area set ${COUNTRY:-US} $POSTCODE"
+fi
+
 echo
 echo "== radios"
 FOUND=$(rtl_dongles)
@@ -152,5 +168,6 @@ echo
 echo "Done. Version $(cat /usr/local/lib/wavelens/VERSION 2>/dev/null || echo ?)."
 echo "  admin page:  http://$HOST.local:8080  (set the password on first visit)"
 echo "  bridge log:  journalctl -u wavelens-bridge -f"
+[ -n "$POSTCODE" ] || echo "  area:        sudo wavelens-area set US 49749   (COUNTRY POSTCODE; or the admin page's Area tab)"
 echo "  digital voice (P25/DMR):  sudo $SRC/companion/pi/install-dsd.sh   (10 min build, read its notice)"
 echo "  pair it:     Wavelens app → More → Companion radio → Find → Pair"

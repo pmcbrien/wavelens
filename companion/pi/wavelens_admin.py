@@ -488,6 +488,12 @@ class Job:
 
 UPDATE_JOB = Job("update")
 FLASH_JOB = Job("flash")
+AREA_JOB = Job("area")
+AREA_TOOL = os.path.join(LIB_DIR, "area.py")
+AREA_FILE = "/etc/wavelens/area.json"
+AREA_DIR = "/var/lib/wavelens/area"
+COUNTRY_RE = re.compile(r"^[A-Za-z]{2}$")
+POSTCODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 -]{0,11}$")
 DOWNLOAD_LOCK = threading.Lock()
 
 
@@ -666,7 +672,7 @@ footer{color:var(--mut);font-size:12px;text-align:center;padding:24px 16px}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}form.inline{display:inline}
 """
 
-NAV = [("/", "Status"), ("/logs", "Logs"), ("/settings", "Settings"), ("/update", "Update"),
+NAV = [("/", "Status"), ("/logs", "Logs"), ("/settings", "Settings"), ("/area", "Area"), ("/update", "Update"),
        ("/wifi", "Wi-Fi"), ("/spotter", "Spotter"), ("/power", "Power"), ("/account", "Account")]
 
 
@@ -901,7 +907,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/login" or not sess:
             return self.page_login()
         routes = {"/": self.page_status, "/logs": self.page_logs, "/settings": self.page_settings,
-                  "/update": self.page_update, "/wifi": self.page_wifi, "/spotter": self.page_spotter,
+                  "/area": self.page_area, "/update": self.page_update, "/wifi": self.page_wifi, "/spotter": self.page_spotter,
                   "/power": self.page_power, "/account": self.page_account}
         if path in routes:
             return routes[path](sess)
@@ -917,6 +923,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(bridge_health())
         if path == "/api/spotter/log":
             return self.send_json(FLASH_JOB.snapshot())
+        if path == "/api/area/log":
+            return self.send_json(AREA_JOB.snapshot())
         self.send_html(page("Not found", "<p>No such page.</p>", nav=True), 404)
 
     def do_POST(self):
@@ -938,7 +946,7 @@ class Handler(BaseHTTPRequestHandler):
             if not csrf_ok(form.get("csrf"), sess["csrf"]):
                 return self.send_html(page("Rejected", "<p>Form token mismatch — go back, reload the page and try again.</p>"), 403)
             handlers = {"/logout": self.post_logout, "/account": self.post_account, "/settings": self.post_settings,
-                        "/update": self.post_update, "/wifi": self.post_wifi, "/spotter": self.post_spotter,
+                        "/area": self.post_area, "/update": self.post_update, "/wifi": self.post_wifi, "/spotter": self.post_spotter,
                         "/bridge/restart": self.post_bridge_restart}
             if path in handlers:
                 return handlers[path](sess, form, files, tok)
@@ -1162,6 +1170,77 @@ Support: wavelensapp@gmail.com — attach the downloaded log.</p></div>"""
         rc, out = run(["systemctl", "restart", BRIDGE_UNIT], timeout=30)
         self.flash(sess, "Settings saved; bridge restarted." if rc == 0 else f"Saved, but restart failed: {out}")
         self.redirect("/settings")
+
+    # ---- /area -----------------------------------------------------------------------------
+    def page_area(self, sess):
+        """Where this Scanner is used. The work is done by area.py (wavelens-area): this page shows what it
+        stored and runs it."""
+        a = read_json(AREA_FILE) or {}
+        snap = AREA_JOB.snapshot()
+        dis = "disabled" if snap["running"] else ""
+        regions = a.get("regions") or {}
+        districts = "; ".join(f"{r or '—'}: {', '.join(d) or '—'}" for r, d in regions.items()) or "—"
+        try:
+            rr = sorted(n for n in os.listdir(os.path.join(AREA_DIR, "rr")) if n.lower().endswith(".csv"))
+        except OSError:
+            rr = []
+        if a:
+            where = " ".join(x for x in (a.get("country", ""), a.get("postcode", "")) if x)
+            place = ", ".join(x for x in (a.get("district", ""), a.get("region", "")) if x)
+            table = f"""<table>
+<tr><th>Area</th><td><b>{esc(where)}</b>{f' <span class="mut">({esc(place)})</span>' if place else ''}</td></tr>
+<tr><th>Position, radius</th><td>{esc(a.get('lat'))}, {esc(a.get('lon'))} · {esc(a.get('radius_km', 50))} km</td></tr>
+<tr><th>Districts in range</th><td>{esc(districts)}</td></tr>
+<tr><th>Licensed frequencies</th><td>{esc(a.get('licences', 0)) if a.get('licences') else '<span class="mut">none: no public licence data for this country yet</span>'}</td></tr>
+<tr><th>Data of</th><td>{esc(a.get('data_built') or '—')} <span class="mut">(set {esc(a.get('updated') or '—')})</span></td></tr></table>"""
+        else:
+            table = '<p><b>No area set.</b> The Scanner works without one; carriers are then named by band only.</p>'
+        body = f"""<div class="card">{table}
+<form method="post" action="/area">{csrf_field(sess)}
+<div class="row"><div><label>Country (two letters)</label><input type="text" name="country" value="{esc(a.get('country') or 'US')}" maxlength="2" size="4" style="width:5em"></div>
+<div><label>Postcode / ZIP</label><input type="text" name="postcode" value="{esc(a.get('postcode') or '')}" maxlength="12" placeholder="49749"></div>
+<div><label>Radius (km)</label><input type="number" name="radius" value="{esc(int(a.get('radius_km') or 50))}" min="5" max="300" style="width:6em"></div></div>
+<div class="row"><button class="btn" name="do" value="set" {dis}>Set area and download</button>
+<button class="btn sec" name="do" value="refresh" {dis}>Check for newer data</button>
+<button class="btn sec" name="do" value="clear" {dis}>Clear</button></div></form>
+<p class="note">Any country: a two-letter code (US, CA, AU, GB, DE …) and a postcode. The Scanner downloads the public licence
+records around that place and names what it hears from them. Licence records exist where a country publishes them, today the
+United States (FCC). Needs Wi-Fi; restarts the bridge for a few seconds. Postcode positions: GeoNames, CC BY 4.0.</p></div>
+<div class="card"><h2>Your own RadioReference exports</h2>
+<p>{esc(', '.join(rr)) if rr else '<span class="mut">none</span>'}</p>
+<p class="note">CSV exports you copy into <code>{esc(AREA_DIR)}/rr/</code> are loaded at the next bridge restart, with nothing to list
+in Settings: trunked sites, talkgroups, and county, statewide or nationwide frequencies are told apart by their headers.</p></div>
+<div class="card"><h2>Progress <span id="st" class="mut"></span></h2><pre id="out" data-url="/api/area/log">{esc(chr(10).join(snap['lines']))}</pre></div>{POLL_JS}"""
+        self.render(sess, "Area", body, "/area")
+
+    def post_area(self, sess, form, files, tok):
+        do = form.get("do", "")
+        if not os.path.isfile(AREA_TOOL):
+            self.flash(sess, "The area tool is not installed on this Pi: update the Scanner first.")
+            return self.redirect("/area")
+        argv = [sys.executable or "/usr/bin/python3", AREA_TOOL]
+        if do == "set":
+            country, postcode = form.get("country", "").strip().upper(), " ".join(form.get("postcode", "").upper().split())
+            try:
+                radius = float(form.get("radius", "50"))
+            except ValueError:
+                radius = -1.0
+            # checked here as well as in the tool: these go on a command line (as arguments, never through a shell)
+            if not COUNTRY_RE.match(country) or not POSTCODE_RE.match(postcode) or not 5 <= radius <= 300:
+                self.flash(sess, "Country is two letters, the postcode letters and digits, the radius 5 to 300 km.")
+                return self.redirect("/area")
+            argv += ["set", "--country", country, "--postcode", postcode, "--radius-km", f"{radius:g}"]
+        elif do == "refresh":
+            argv += ["refresh"]
+        elif do == "clear":
+            argv += ["clear"]
+        else:
+            return self.redirect("/area")
+        if AREA_JOB.start(f"area {do}", argv, timeout=900):
+            self.flash(sess, "Started. Watch the progress box; reload the page when it says done.")
+        else:
+            self.flash(sess, "An area task is already running.")
+        self.redirect("/area")
 
     # ---- /update ---------------------------------------------------------------------------
     def page_update(self, sess):
