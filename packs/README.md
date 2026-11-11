@@ -56,6 +56,9 @@ The app ships one built-in pack (US settings) and uses it by default. Anyone can
 | `companion.drop_us_bands` | Forget the band names that come from the US allocation table, so an unnamed frequency shows as a plain carrier, not a wrong US label |
 | `companion.bands` | `lo`/`hi` in MHz, `name` shown on the phone, `cat` a device category, `kind` `""` (report), `persist`, `bg` (background, once a minute) or `video`; optional `steady` `{name, cat}` for a carrier that stays on. First match wins, before the built-in table |
 | `companion.rtl433_args` | rtl_433 frequency flags for tyre sensors and remotes in that country |
+| `companion.sweeps` | optional: the ranges a Raspberry Pi's RTL-SDRs sweep, `{"vhf": ["144M:174M:12.5k"], "uhf": ["403M:430M:12.5k"], "ism": [...]}` (24–1766 MHz). Left out: the United States ranges |
+| `companion.cc_bands` | optional: where the scanner looks for trunked control channels, most likely band first, `[{"lo": 403, "hi": 430, "name": "400 MHz"}]` |
+| `companion.follow_bands` | optional: the voice bands the scanner's Follow may tune, `[{"lo": 476.4, "hi": 477.42, "mode": "auto"}]` (`am` or `auto`). Leave out bands that are data only (key fobs, telemetry) |
 
 Categories: ALPR, ACOUSTIC, DRONE, TOOL, LE_GEAR, TRACKER, TRAFFIC_SENSOR, CAMERA, FLEET, VEHICLE, PHONE, WEARABLE, IOT, BEACON, NETWORK, CELL_SITE, UNKNOWN.
 

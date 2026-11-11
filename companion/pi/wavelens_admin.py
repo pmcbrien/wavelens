@@ -560,7 +560,13 @@ KNOWN_FAULTS = [
     (re.compile(r"unsupported operand type\(s\) for \||SyntaxError|ModuleNotFoundError|ImportError"),
      "This version of the scanner software doesn't run on this Pi.",
      "rollback"),
-    (re.compile(r"No such file or directory: '/usr/local/lib/wavelens|run-bridge.sh: not found|can't open file"),
+    # A data file the settings name (--fcc-pack, --rr-pack) that is not there. Bridges from 2026.11.10.8 skip
+    # it and start; older ones stop here. Before the next entry, which used to claim it for itself and send
+    # people to reinstall software that was all present.
+    (re.compile(r"No such file or directory: '[^']+\.(?:json|csv)'"),
+     "The scanner's settings name a data file that isn't on this Pi.",
+     "settings"),
+    (re.compile(r"No such file or directory: '/usr/local/lib/wavelens/[^']*\.(?:py|sh)'|run-bridge.sh: not found|can't open file"),
      "Some of the scanner software's files are missing — usually an update that was interrupted.",
      "reinstall"),
     (re.compile(r"usb_claim_interface|Failed to open rtlsdr|No supported devices found|usb_open error"),
@@ -577,6 +583,9 @@ FIXES = {
     "rollback": "Tap <b>Put the previous version back</b>. If there's no previous version, tap <b>Install the latest update</b> — "
                 "fixes for problems like this are usually already out.",
     "reinstall": "Tap <b>Install the latest update</b>: it reinstalls every file and checks the result.",
+    "settings": "Copy that file to the path shown below, or open <b>Settings</b> and remove the <code>--fcc-pack</code> / "
+                "<code>--rr-pack</code> entry that names it. Then tap <b>Restart the scanner</b>. Installing an update will not help: "
+                "no software is missing.",
     "replug": "Unplug each USB radio, wait five seconds, plug it back in. The scanner picks it up by itself within ten seconds.",
     "reboot": "Tap <b>Reboot</b>. If it comes back the same, power the Pi off for ten seconds.",
 }
@@ -1093,8 +1102,11 @@ Support: wavelensapp@gmail.com — attach the downloaded log.</p></div>"""
         if st.get("at"):
             age = f'<tr><th>Reported</th><td>{int(time.time() - float(st["at"]))} s ago</td></tr>'
         missing = ""
+        if st.get("problems") and health["ok"]:
+            missing += ('<div class="warn">Running without some local data: ' + "; ".join(esc(x) for x in st["problems"][:6])
+                        + '. Copy the file to that path, or remove its entry in <a href="/settings">Settings</a>, then restart the scanner.</div>')
         if st.get("hw_missing"):
-            missing = '<div class="warn">Missing hardware: ' + ", ".join(esc(x) for x in st["hw_missing"]) + "</div>"
+            missing += '<div class="warn">Missing hardware: ' + ", ".join(esc(x) for x in st["hw_missing"]) + "</div>"
         linked = "" if not st else ('<span class="ok">phone connected</span>' if status_linked(st) else '<span class="mut">phone not connected</span>')
         bridge = f"""<table>
 <tr><th>Service</th><td>{state_html}</td></tr>

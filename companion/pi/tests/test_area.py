@@ -191,5 +191,100 @@ class AreaTest(unittest.TestCase):
         self.assertTrue(rrp.rows)
 
 
+class BridgeAreaCommandTest(AreaTest):
+    """The phone's {"c":"area",...} command, end to end against the same synthetic release: checked, run
+    through area.py, reported as progress lines, and followed by a restart request."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        argv, sys.argv = sys.argv, ["bridge"]
+        try:
+            spec = importlib.util.spec_from_file_location("wavelens_bridge_for_area_cmd_test", os.path.join(HERE, "..", "wavelens_bridge.py"))
+            cls.b = importlib.util.module_from_spec(spec)
+            with contextlib.redirect_stderr(io.StringIO()):
+                spec.loader.exec_module(cls.b)
+        finally:
+            sys.argv = argv
+
+    def setUp(self):
+        super().setUp()
+        b = self.b
+        self.sent, self.restarts = [], []
+        self._b = (b.emit, b.hello, b.subprocess.Popen, b.time.sleep, dict(os.environ), dict(b.state))
+        b.emit = self.sent.append
+        b.hello = lambda: self.sent.append({"t": "hello", "area": b.area_info()})
+        real_popen = b.subprocess.Popen
+
+        def popen(argv, *a, **k):
+            if argv[0] == "systemctl":
+                self.restarts.append(argv)
+                return None
+            return real_popen(argv, *a, **k)
+        b.subprocess.Popen = popen
+        b.time.sleep = lambda s: None
+        os.environ.update(WAVELENS_AREA_URL=self.base, WAVELENS_AREA_FILE=self.file)
+        b.AREA.update(dir=self.dir, busy=False, last="")
+
+    def tearDown(self):
+        b = self.b
+        b.emit, b.hello, b.subprocess.Popen, b.time.sleep = self._b[:4]
+        os.environ.clear(); os.environ.update(self._b[4])
+        b.state.clear(); b.state.update(self._b[5])
+        super().tearDown()
+
+    def run_cmd(self, **cmd):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.b.run_area(cmd)
+        return [m for m in self.sent if m.get("t") == "area"]
+
+    def test_postcode_sets_the_area_and_asks_for_a_restart(self):
+        self.assertEqual(self.b.area_info(), {"set": False, "busy": False})
+        lines = self.run_cmd(v="set", country="us", postcode="00001")
+        self.assertEqual(lines[-1]["state"], "done", lines)
+        self.assertTrue(all(m["state"] == "working" for m in lines[:-1]) and len(lines) > 2)
+        info = self.sent[-1]["area"]
+        self.assertEqual((info["set"], info["country"], info["postcode"], info["place"], info["licences"]),
+                         (True, "US", "00001", "Example, FL", 3))
+        self.assertEqual(self.restarts, [["systemctl", "restart", "--no-block", "wavelens-bridge"]])
+        self.assertEqual(len(self.pack()["entries"]), 3)
+
+    def test_position_is_rounded_and_negative_longitude_survives(self):
+        lines = self.run_cmd(v="set", country="US", lat=27.912345, lon=-82.806789, radius_km=30)
+        self.assertEqual(lines[-1]["state"], "done", lines)
+        stored = area.read_area()
+        self.assertEqual((stored["lat"], stored["lon"], stored["radius_km"], stored["postcode"]), (27.91, -82.81, 30.0, ""))
+        self.assertEqual(stored["district"], "Example")              # named from the nearest postcode
+
+    def test_here_uses_the_position_the_phone_is_sharing(self):
+        self.b.state.update(lat=27.9, lon=-82.8, pos_at=self.b.time.time())
+        self.assertEqual(self.run_cmd(v="set", country="US", here=True)[-1]["state"], "done")
+        self.sent.clear()
+        self.b.state.update(pos_at=self.b.time.time() - 600)          # stale: not used
+        self.assertEqual(self.run_cmd(v="set", country="US", here=True)[-1]["state"], "failed")
+
+    def test_bad_requests_never_reach_the_tool(self):
+        for cmd in (dict(v="set", country="USA", postcode="00001"), dict(v="set", country="US", postcode="1; reboot"),
+                    dict(v="set", country="US", postcode="00001", radius_km=5000), dict(v="set", country="US"),
+                    dict(v="set", country="US", lat=95, lon=0), dict(v="format")):
+            self.sent.clear()
+            lines = self.run_cmd(**cmd)
+            self.assertEqual([m["state"] for m in lines], ["failed"], cmd)
+        self.assertEqual((self.restarts, area.read_area()), ([], {}))
+
+    def test_failure_is_reported_and_nothing_restarts(self):
+        lines = self.run_cmd(v="set", country="US", postcode="99999")
+        self.assertEqual(lines[-1]["state"], "failed")
+        self.assertIn("not in the US table", lines[-1]["msg"])
+        self.assertEqual(self.restarts, [])
+        self.assertFalse(self.sent[-1]["area"]["set"])
+        self.assertFalse(self.b.AREA["busy"])
+
+    def test_clear(self):
+        self.run_cmd(v="set", country="US", postcode="00001")
+        self.assertEqual(self.run_cmd(v="clear")[-1]["state"], "done")
+        self.assertFalse(self.b.area_info()["set"])
+
+
 if __name__ == "__main__":
     unittest.main()

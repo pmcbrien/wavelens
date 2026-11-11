@@ -12,6 +12,8 @@
 #                              rtl-sdr package is older than 2.0 (Bookworm): auto = build it when a V4 is plugged
 #                              in (default), 1 = build it anyway, 0 = never. Adds about five minutes.
 #   WAVELENS_SRC=/opt/wavelens where the checkout goes
+#   WAVELENS_BT_AUTOPAIR=1     accept a phone's or computer's Bluetooth pairing request without a prompt (the Pi
+#                              has no screen to confirm on). 0 leaves that off.
 #   WAVELENS_COUNTRY=US        where it will be used: a two-letter country and a postcode (WAVELENS_ZIP works
 #   WAVELENS_POSTCODE=49749    too). Downloads the local licence names for that place, where a public licence
 #                              database exists (today the US), so hits read "Example County Road Commission"

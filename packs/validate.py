@@ -88,6 +88,29 @@ def check(pack, fname: str, pack_ids) -> list:
         p.append('"scanner_idle" must be null or [lo, hi] in MHz')
     comp = pack.get("companion") if isinstance(pack.get("companion"), dict) else {}
     if "bands" in comp and not isinstance(comp["bands"], list): p.append("companion.bands must be a list")
+    # the country's radio plan for a Raspberry Pi companion (all optional; see companion/pi/regions.py)
+    spec = re.compile(r"^\d+(\.\d+)?M:\d+(\.\d+)?M:\d+(\.\d+)?k$")
+    sw = comp.get("sweeps")
+    if sw is not None:
+        if not isinstance(sw, dict) or set(sw) - {"vhf", "uhf", "ism"}:
+            p.append('companion.sweeps must be {"vhf": [...], "uhf": [...], "ism": [...]}')
+        else:
+            for k, lst in sw.items():
+                for sp in lst if isinstance(lst, list) else [None]:
+                    ok = isinstance(sp, str) and spec.match(sp)
+                    if ok:
+                        lo, hi = (float(x[:-1]) for x in sp.split(":")[:2])
+                        ok = 24 <= lo < hi <= 1766
+                    if not ok: p.append(f'companion.sweeps.{k}: each range is "loM:hiM:stepk" within 24–1766 MHz, e.g. "403M:430M:12.5k"')
+    for key, modes in (("cc_bands", None), ("follow_bands", ("am", "auto"))):
+        lst = comp.get(key)
+        if lst is None: continue
+        if not isinstance(lst, list): p.append(f"companion.{key} must be a list"); continue
+        for i, b in enumerate(lst):
+            if not (isinstance(b, dict) and isinstance(b.get("lo"), (int, float)) and isinstance(b.get("hi"), (int, float)) and 24 <= b["lo"] < b["hi"] <= 1766):
+                p.append(f"companion.{key}[{i}]: needs lo < hi (MHz, 24–1766)")
+            elif modes and b.get("mode", "auto") not in modes:
+                p.append(f"companion.{key}[{i}]: mode must be am or auto")
     for i, b in enumerate(_list(comp.get("bands"))):
         if not isinstance(b, dict):
             p.append(f"companion.bands[{i}]: must be an object {{...}}"); continue

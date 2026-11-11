@@ -40,7 +40,8 @@ if [ "${WAVELENS_AUTO:-0}" = "1" ]; then
     eval "$(python3 $BRIDGE --plan)"
     WAVELENS_ARGS="${PLAN_ARGS:-} ${WAVELENS_ARGS:-}"
     if [ -n "${PLAN_RTL433_DEV:-}" ]; then
-        WAVELENS_RTL433="$PLAN_RTL433_DEV ${WAVELENS_RTL433:--f 315M -f 433.92M -f 915M -H 30 -g 40}"
+        # PLAN_RTL433_ARGS: the sensor frequencies for the country this companion is set up for
+        WAVELENS_RTL433="$PLAN_RTL433_DEV ${WAVELENS_RTL433:-${PLAN_RTL433_ARGS:--f 315M -f 433.92M -f 915M -H 30 -g 40}}"
     else
         WAVELENS_RTL433=""
     fi

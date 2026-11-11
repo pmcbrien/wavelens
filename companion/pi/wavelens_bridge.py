@@ -70,6 +70,8 @@ except ImportError:                  # an install that predates region packs: US
         def table(pack, base): return base
         @staticmethod
         def rtl433_args(pack, default): return default
+        @staticmethod
+        def radio_plan(pack): return {}
 try:
     import audioop                   # C-speed mixing/resampling; gone in Python 3.13 (the Pi images have it)
 except ImportError:
@@ -111,6 +113,170 @@ def update_info() -> dict:
     return info
 
 
+# Data files the settings name that would not load (missing, unreadable, not what they claim to be). The
+# scanner runs without them; the admin page and the phone say which, so the fix is a settings edit or a
+# file copy and not a guess.
+PACK_PROBLEMS: "list[str]" = []
+
+
+def load_local_packs(fcc_arg, rr_args, rr_county_args, found):
+    """(FccPack or None, RrPack or None, [problem, ...]) from --fcc-pack / --rr-pack and the area folder.
+
+    A local pack names what the radio hears; it is never needed to hear it. So a file that will not load,
+    whether named by hand in WAVELENS_ARGS or found in the area folder, is logged and left out, and the
+    bridge starts. It used to stop: one settings line pointing at a file not yet copied over put the whole
+    scanner into a restart loop, and the admin page blamed an interrupted update."""
+    problems, fcc, rr = [], None, None
+    for path, named in ((fcc_arg, True), (found.get("fcc") or "", False)):
+        if not path or fcc is not None:
+            continue
+        try:
+            fcc = FccPack(path)
+            print(f"bridge: FCC pack loaded, {len(fcc.entries)} licensed frequencies from {path}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            why = "is not on this Pi" if isinstance(e, FileNotFoundError) else f"could not be read ({type(e).__name__}: {e})"
+            problems.append(f"licence pack {path} {why}" + (" (named by --fcc-pack in the settings)" if named else ""))
+    rr_paths = []
+    for path, named in [(p, True) for p in rr_args] + [(p, False) for p in found.get("rr") or []]:
+        if os.path.realpath(path) in {os.path.realpath(p) for p in rr_paths}:
+            continue
+        try:
+            RrPack([path])               # each file on its own first, so one bad export costs only itself
+            rr_paths.append(path)
+        except Exception as e:  # noqa: BLE001
+            why = "is not on this Pi" if isinstance(e, FileNotFoundError) else f"could not be read ({type(e).__name__}: {e})"
+            problems.append(f"RadioReference export {path} {why}" + (" (named by --rr-pack in the settings)" if named else ""))
+    if rr_paths:
+        counties = list(rr_county_args) + [c for c in found.get("counties") or [] if c not in rr_county_args]
+        try:
+            rr = RrPack(rr_paths, counties)
+            print(f"bridge: RadioReference overlay loaded, {len(rr.rows)} frequencies, {len(rr.sites)} trunked sites, "
+                  f"{len(rr.controls)} control channels, {len(rr.talkgroups)} talkgroups from {len(rr_paths)} file(s)", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"RadioReference exports could not be combined ({type(e).__name__}: {e})")
+    for msg in problems:
+        print(f"bridge: left out: {msg}", file=sys.stderr)
+    return fcc, rr, problems
+
+
+# ---------------------------------------------------------------- area: where this companion is used
+# The app's set-up step ("Where will you use it?") and the Companion screen's Area row. The phone sends a
+# country and a postcode, or a position; the Pi does the downloading (area.py, the same tool as
+# `wavelens-area` and the admin page), because the app has no network permission. See area.py.
+AREA = {"dir": "/var/lib/wavelens/area", "busy": False, "last": "", "lock": threading.Lock()}
+AREA_COUNTRY_RE = re.compile(r"^[A-Za-z]{2}$")
+AREA_POSTCODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 -]{0,11}$")
+
+
+def area_info() -> dict:
+    """What the phone is told about the area in every hello: set or not, a label, and the last attempt."""
+    info = {"set": False, "busy": AREA["busy"]}
+    if AREA["last"]:
+        info["last"] = AREA["last"]
+    try:
+        import area as area_mod
+        a = area_mod.read_area()
+    except Exception:  # noqa: BLE001 - an unreadable area is "not set", never a bridge that will not start
+        a = {}
+    if a.get("country"):
+        place = ", ".join(x for x in (a.get("district", ""), a.get("region", "")) if x)
+        info.update(set=True, country=a.get("country", ""), postcode=a.get("postcode", ""), place=place,
+                    radius_km=a.get("radius_km"), licences=int(a.get("licences") or 0), built=a.get("data_built") or "")
+    return info
+
+
+def area_emit(st: str, msg: str) -> None:
+    """Progress of an area change, as its own line type (the set-up step shows it) and in the journal."""
+    AREA["last"] = msg
+    print("bridge: area: " + msg, file=sys.stderr)
+    emit({"t": "area", "state": st, "msg": msg})
+
+
+def area_argv(cmd: dict):
+    """The area.py arguments for a phone's {"c":"area",...} command, or a string saying what is wrong with it.
+    Every value is checked here and passed as its own argument; nothing reaches a shell."""
+    what = str(cmd.get("v") or "set")
+    if what in ("refresh", "clear"):
+        return [what] + (["--force"] if what == "refresh" and cmd.get("force") else [])
+    if what != "set":
+        return f"unknown action {what}"
+    country = str(cmd.get("country") or "").strip().upper()
+    if not AREA_COUNTRY_RE.match(country):
+        return "the country is a two-letter code, e.g. US, CA, AU, GB, DE"
+    try:
+        radius = float(cmd.get("radius_km") or 50)
+    except (TypeError, ValueError):
+        return "the radius is a number of kilometres"
+    if not 5 <= radius <= 300:
+        return "the radius is 5 to 300 km"
+    argv = ["set", "--country", country, "--radius-km", f"{radius:g}"]
+    postcode = " ".join(str(cmd.get("postcode") or "").upper().split())
+    if postcode:
+        if not AREA_POSTCODE_RE.match(postcode):
+            return "the postcode is letters and digits"
+        return argv + ["--postcode", postcode]
+    lat, lon = cmd.get("lat"), cmd.get("lon")
+    if lat is None and cmd.get("here") and state.get("lat") is not None and time.time() - state.get("pos_at", 0) < 120:
+        lat, lon = state["lat"], state["lon"]       # the position the phone is already sharing
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return "give a postcode, or a position"
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return "that position is not on the map"
+    # two decimals is about a kilometre: all an area of tens of kilometres needs, and all that is kept
+    return argv + [f"--lat={lat:.2f}", f"--lon={lon:.2f}"]
+
+
+def run_area(cmd: dict) -> None:
+    """Phone asked to set, refresh or clear the area: run area.py, pass its progress on, then restart to load it."""
+    argv = area_argv(cmd)
+    if isinstance(argv, str):
+        area_emit("failed", argv)
+        return
+    with AREA["lock"]:
+        if AREA["busy"]:
+            emit({"t": "area", "state": "working", "msg": AREA["last"] or "already working on it"})
+            return
+        AREA["busy"] = True
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "area.py")
+    ok, last = False, ""
+    try:
+        area_emit("working", "contacting the download server (the Pi needs to be online) …")
+        env = dict(os.environ, WAVELENS_AREA_DIR=AREA["dir"], PYTHONUNBUFFERED="1")
+        p = subprocess.Popen([sys.executable or "python3", tool] + argv + ["--no-restart"], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, env=env)
+        deadline = time.time() + 900
+        for line in p.stdout:
+            line = line.strip()
+            if line:
+                last = line
+                if len(line) < 200:
+                    area_emit("working", line)
+            if time.time() > deadline:
+                p.kill()
+                last = "timed out"
+                break
+        ok = p.wait(timeout=30) == 0 and last != "timed out"
+    except (OSError, subprocess.SubprocessError) as e:
+        last = f"could not run the area tool ({e})"
+    finally:
+        AREA["busy"] = False
+    if not ok:
+        area_emit("failed", last.replace("error: ", "") or "failed")
+        hello()
+        return
+    area_emit("done", last or "done")
+    hello()
+    # The new licence pack is read at start. Give the lines above a moment to reach the phone, then restart;
+    # the app reconnects by itself, as it does after an update.
+    time.sleep(2.5)
+    try:
+        subprocess.Popen(["systemctl", "restart", "--no-block", "wavelens-bridge"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        area_emit("done", (last or "done") + " — restart the bridge to load it")
+
+
 def write_run_status(hw: dict | None = None) -> None:
     """A small JSON the admin page shows and wavelens-update reads (no update while a phone is linked)."""
     try:
@@ -118,6 +284,7 @@ def write_run_status(hw: dict | None = None) -> None:
         doc = {"linked": bool(state.get("linked")), "name": state.get("name"), "code": state.get("code"),
                "hw_line": (hw or {}).get("line") or state.get("hw_line"), "hw_missing": (hw or {}).get("missing", []),
                "fw": FW, "at": int(time.time()), "update": update_info(),
+               "problems": list(PACK_PROBLEMS),
                "spotters": HUB.info() if HUB else []}
         tmp = RUN_STATUS + ".tmp"
         with open(tmp, "w") as f:
@@ -164,7 +331,7 @@ class Outbox:
     The pump sends the line at the head of a class in ≤180-byte chunks, and after every chunk looks at the
     audio clock again, so a long journal line can never hold an audio frame past its 40 ms slot."""
     BULK_MAX = 20000
-    CONTROL_T = ("hello", "status", "page")
+    CONTROL_T = ("hello", "status", "page", "area")
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -401,6 +568,8 @@ def hello() -> None:
         spec = None
     msg = {"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""),
            "caps": sorted(set(CAPS)), "hw": hw, "region": REGION["code"], "ver": VERSION, "update": update_info()}
+    if "area" in CAPS:
+        msg["area"] = area_info()
     if HUB:
         msg["spotters"] = HUB.info()
         msg["peer"] = HUB.phone_spotter          # what the Pi believes; the phone corrects it if wrong
@@ -411,6 +580,9 @@ def hello() -> None:
         msg["spec"] = spec
     emit(msg)
     write_run_status(hw)
+    if PACK_PROBLEMS and not state.get("problems_said"):     # once per start, when a phone is there to read it
+        state["problems_said"] = True
+        emit({"t": "status", "msg": "left out at start: " + "; ".join(PACK_PROBLEMS), "band": state["band"], "mode": state["mode"]})
     if hw["line"] != state.get("hw_line"):          # hello repeats every 15 s (the app's ping): say it when it changes
         state["hw_line"] = hw["line"]
         print(f"bridge: hardware: {hw['line']}", file=sys.stderr)
@@ -1205,7 +1377,7 @@ RTL_STALL_S = 20.0      # rtl_power reports every second or two; this long with 
 
 _band_cache = {}
 # The table band_of reads: BANDS, or the active region pack's bands ahead of it (regions.py).
-REGION = {"code": "US", "pack": None}
+REGION = {"code": "US", "pack": None, "home": ""}    # home: the country this companion's area is set to, when a pack exists for it
 ACTIVE_BANDS = BANDS
 
 
@@ -1227,6 +1399,7 @@ def set_region(code: str, announce: bool = True) -> None:
         code = "US"
     REGION["code"], REGION["pack"] = code, pack
     ACTIVE_BANDS = region_packs.table(pack, BANDS)
+    apply_radio_plan(pack)
     _band_cache.clear()
     print(f"bridge: region {code}" + (f" from {pack['_path']}" if pack else " (built-in US tables)"), file=sys.stderr)
     if region_packs.rtl433_args(pack, RTL433_DEFAULT_ARGS) != old_args:
@@ -2294,10 +2467,12 @@ CHANNEL_PLANS = [
     (156.0, 162.05, [(25, 0, 0), (12.5, 0, 1)]),                # marine: 25 kHz channels
     (137.0, 174.0, [(12.5, 0, 0), (7.5, 0, 1), (2.5, 0, 2)]),   # VHF land mobile: 12.5 kHz, with 7.5 kHz offsets
     (216.0, 225.0, [(12.5, 0, 0), (6.25, 0, 1)]),
+    (403.0, 420.0, [(12.5, 0, 0), (6.25, 0, 1)]),               # 400 MHz land mobile (government networks outside the US)
     (420.0, 450.0, [(25, 0, 0), (12.5, 0, 1), (5, 0, 2)]),      # 70 cm: 25 kHz repeaters, 5 kHz raster
     (462.5375, 462.7375, [(12.5, 0, 0)]),                       # FRS/GMRS: 462.5500 … 462.7250 on 12.5 kHz
     (467.5375, 467.7375, [(12.5, 0, 0)]),
     (450.0, 470.0, [(25, 0, 0), (12.5, 0, 1), (6.25, 0, 2), (2.5, 0, 3)]),  # UHF land mobile: 25 kHz primaries, then interstitials
+    (470.0, 520.0, [(12.5, 0, 0), (6.25, 0, 1)]),               # UHF land mobile above 470 (Australia: to 520, UHF CB at 476.4–477.4)
     (806.0, 824.0, [(12.5, 0, 0), (6.25, 0, 1)]),
     (851.0, 869.0, [(12.5, 0, 0), (6.25, 0, 1)]),
     (896.0, 902.0, [(12.5, 0, 0)]), (935.0, 941.0, [(12.5, 0, 0)]),
@@ -4287,7 +4462,7 @@ def hotplug_watch() -> None:
                     if "listen" not in CAPS:
                         CAPS.extend(["listen", "trunk"])
                     if a is not None and not any(sn in d for d in SWEEP_DEVS):
-                        specs = SWEEP_VHF + SWEEP_UHF + ["851M:869M:12.5k"]
+                        specs = SWEEP_VHF + SWEEP_UHF + ([] if sweep_specs_cover(SWEEP_VHF + SWEEP_UHF, CC_BANDS[0]) else [CC_BANDS[0][0]])
                         SWEEP_DEVS.add(sn)
                         for sp in specs:
                             SWEEP_RANGES.append((_mhz(sp.split(":")[0]), _mhz(sp.split(":")[1])))
@@ -4425,6 +4600,12 @@ def run_peripheral(name: str) -> None:
             # The Companion screen's Check / Install update / Roll back buttons. The Pi does the network
             # work (git pull from the public repo); the phone never needs a network permission for it.
             threading.Thread(target=run_update, args=(str(cmd.get("v") or "check"),), daemon=True).start()
+        elif c == "area":
+            # The set-up step and the Companion screen's Area row: country + postcode, or a position.
+            if "area" in CAPS:
+                threading.Thread(target=run_area, args=(dict(cmd),), daemon=True).start()
+            else:
+                emit({"t": "area", "state": "failed", "msg": "this Pi has no area tool: update it first"})
         elif c == "pos":
             # Opt-in from the phone: its GPS fix, so licensed sites can be ranked by distance.
             # Kept in memory only, never written anywhere, forgotten after two minutes.
@@ -4474,7 +4655,18 @@ def run_peripheral(name: str) -> None:
                 msg = "sweeping the full range"
             emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"], "park": state["park"]})
         elif c == "region":
-            set_region(str(cmd.get("v") or "US"))
+            want = str(cmd.get("v") or "US").upper()[:2]
+            if REGION["home"] and want != REGION["home"]:
+                # This Scanner's area is set to a country with its own pack; a phone that has not picked that
+                # pack (it sends US by default) must not put US band names and US sweeps' labels back.
+                if REGION["code"] != REGION["home"]:
+                    set_region(REGION["home"], announce=False)
+                name = (REGION["pack"] or {}).get("name") or REGION["home"]
+                emit({"t": "status", "msg": f"this Scanner is set up for {name}: keeping its band names "
+                                            f"(pick the {name} pack in the app to match)",
+                      "band": state["band"], "mode": state["mode"]})
+            else:
+                set_region(want)
         elif c == "pages":
             LISTEN["pages"] = bool(cmd.get("v", True))
             emit({"t": "status", "msg": "pager decoding " + ("on" if LISTEN["pages"] else "off"), "band": state["band"], "mode": state["mode"]})
@@ -4804,6 +4996,57 @@ def probe_radios():
 SWEEP_VHF = ["144M:174M:12.5k"]
 SWEEP_UHF = ["440M:470M:12.5k", "806M:824M:12.5k"]
 SWEEP_ISM = ["902M:928M:25k", "1240M:1300M:100k", "1559M:1610M:100k"]
+# The lists above, CC_BANDS and FOLLOW_BANDS are the United States plan. A country's pack may carry its own
+# (companion.sweeps / cc_bands / follow_bands, see regions.py); apply_radio_plan swaps them in place.
+_US_RADIO = {"vhf": list(SWEEP_VHF), "uhf": list(SWEEP_UHF), "ism": list(SWEEP_ISM), "cc": list(CC_BANDS),
+             "follow": list(FOLLOW_BANDS), "named_only": list(FOLLOW_NAMED_ONLY)}
+
+
+def apply_radio_plan(pack) -> None:
+    """Sweep ranges, control-channel hunt bands and Follow bands for this pack's country (None = United States).
+    The sweeps a running bridge already started are not moved: a change of plan takes effect at the next start."""
+    plan = region_packs.radio_plan(pack) if pack else {}
+    sw = plan.get("sweeps") or {}
+    SWEEP_VHF[:] = sw.get("vhf", []) if sw else _US_RADIO["vhf"]
+    SWEEP_UHF[:] = sw.get("uhf", []) if sw else _US_RADIO["uhf"]
+    SWEEP_ISM[:] = (sw.get("ism") or _US_RADIO["ism"]) if sw else _US_RADIO["ism"]
+    CC_BANDS[:] = plan.get("cc_bands") or _US_RADIO["cc"]
+    FOLLOW_BANDS[:] = plan.get("follow_bands") or _US_RADIO["follow"]
+    # low band is tuned only for a licence-list name; a country with its own Follow list has no such list yet
+    FOLLOW_NAMED_ONLY[:] = [] if plan.get("follow_bands") else _US_RADIO["named_only"]
+    if plan:
+        print("bridge: radio plan from the " + str((pack or {}).get("name") or "local") + " pack: sweeps "
+              + ", ".join(SWEEP_VHF + SWEEP_UHF) + "; control channels looked for in "
+              + ", ".join(label for _, _, _, label in CC_BANDS), file=sys.stderr)
+
+
+def sweep_specs_cover(specs: "list[str]", band) -> bool:
+    """Does any of these rtl_power ranges ("lo:hi:step", optionally "@serial") span this CC_BANDS entry?"""
+    _, lo, hi, _ = band
+    for sp in specs:
+        try:
+            a, b = sp.split("@")[0].split(":")[:2]
+            if _mhz(a) <= lo and _mhz(b) >= hi:
+                return True
+        except (ValueError, IndexError):
+            pass
+    return False
+
+
+def start_region(explicit: str, area_file: str = "") -> str:
+    """The country whose tables this companion starts with: --region / WAVELENS_REGION when given, else the
+    country its area is set to (wavelens-area), else US. An area country that has a pack is also remembered
+    as REGION["home"]: a phone still on its default (US) must not relabel a Scanner set up for Australia."""
+    home = ""
+    try:
+        import area as area_mod
+        home = str((area_mod.read_area(area_file) or {}).get("country") or "").upper()[:2]
+    except Exception as e:  # noqa: BLE001  a missing or broken area file never stops the bridge
+        print(f"bridge: area not read for the region: {e}", file=sys.stderr)
+    if home and home != "US" and region_packs.find(home) is None:
+        home = ""
+    REGION["home"] = home
+    return (explicit or home or "US").upper()[:2]
 
 
 def plan_radios(rtls, hackrf) -> dict:
@@ -4843,19 +5086,19 @@ def plan_radios(rtls, hackrf) -> dict:
         plan["rtl433"] = ""; plan["roles"] = []
         plan["sweeps"] += [f"{r}@{ids[0]}" for r in SWEEP_VHF + SWEEP_UHF]
         plan["listen"] = ids[1]
-        plan["roles"] += [(ids[0], "VHF + UHF + 800 sweep"), (ids[1], "listen / Follow / trunking"),
+        plan["roles"] += [(ids[0], "VHF + UHF sweep"), (ids[1], "listen / Follow / trunking"),
                           ("", "no rtl_433 sensors with two dongles (a third brings them back)")]
     elif n == 3:
         plan["sweeps"] += [f"{r}@{ids[1]}" for r in SWEEP_VHF + SWEEP_UHF]
         plan["listen"] = ids[2]
-        plan["roles"] += [(ids[1], "VHF + UHF + 800 sweep"), (ids[2], "listen / Follow / trunking")]
+        plan["roles"] += [(ids[1], "VHF + UHF sweep"), (ids[2], "listen / Follow / trunking")]
     elif n >= 4:
         plan["sweeps"] += [f"{r}@{ids[1]}" for r in SWEEP_VHF] + [f"{r}@{ids[2]}" for r in SWEEP_UHF]
         plan["listen"] = ids[3]
-        plan["roles"] += [(ids[1], "VHF sweep 144–174"), (ids[2], "UHF 440–470 + 806–824 sweep"), (ids[3], "listen / Follow / trunking")]
+        plan["roles"] += [(ids[1], "VHF sweep"), (ids[2], "UHF sweep"), (ids[3], "listen / Follow / trunking")]
         if n >= 5:
             plan["sweeps"] += [f"{r}@{ids[4]}" for r in SWEEP_ISM]
-            plan["roles"].append((ids[4], "900 MHz ISM / 1.2 GHz video / GNSS sweep"))
+            plan["roles"].append((ids[4], "ISM / 1.2 GHz video / GNSS sweep"))
         for extra in ids[5:]:
             plan["roles"].append((extra, "spare"))
     return plan
@@ -4880,6 +5123,9 @@ def print_plan_shell(extra_hackrf: str) -> None:
     if plan["rtl433"]:
         rtl433 = f"-d {':' + plan['rtl433'] if plan['by'] == 'serial' else plan['rtl433']}"
     print(f"PLAN_RTL433_DEV={shlex.quote(rtl433)}")
+    # the sensor frequencies of this companion's country (Australia: no 315 MHz); run-bridge.sh uses them
+    # unless WAVELENS_RTL433 says otherwise
+    print(f"PLAN_RTL433_ARGS={shlex.quote(region_packs.rtl433_args(REGION['pack'], RTL433_DEFAULT_ARGS))}")
     print(f"PLAN_ARGS={shlex.quote(' '.join(shlex.quote(x) for x in args))}")
 
 def main() -> None:
@@ -4946,8 +5192,9 @@ def main() -> None:
                          "the postcode set on this companion) and RadioReference exports in rr/*.csv. --fcc-pack and "
                          "--rr-pack still work and come first. 'none' turns it off")
     ap.add_argument("--echo", action="store_true", help="print every line sent to the phone on stderr (see it with journalctl -u wavelens-bridge -f)")
-    ap.add_argument("--region", default=os.environ.get("WAVELENS_REGION", "US"),
-                    help="local pack to start with (its two-letter country code; the phone's choice replaces it on connect). "
+    ap.add_argument("--region", default=os.environ.get("WAVELENS_REGION", ""),
+                    help="local pack to start with (its two-letter country code). Default: the country the area is set to "
+                         "(wavelens-area), else US. The phone's choice replaces it on connect, unless the area names a country with a pack. "
                          "Packs are read from /etc/wavelens/packs, ~/.config/wavelens/packs, packs/ beside this script and the repo's packs/")
     ap.add_argument("--name", default="", help="advertised name (default Wavelens-XXXX from the adapter address)")
     ap.add_argument("--no-spotters", action="store_true",
@@ -4960,7 +5207,9 @@ def main() -> None:
     CAPS.append("log")
     CAPS.append("update")
     globals()["PORTAPACK_TTY"] = a.portapack_port
+    a.region = start_region(a.region, os.environ.get("WAVELENS_AREA_FILE", ""))
     if a.plan:
+        set_region(a.region, announce=False)
         print_plan_shell("")
         return
 
@@ -4973,36 +5222,19 @@ def main() -> None:
     if a.area_dir and a.area_dir != "none":
         try:
             import area as area_mod
+            AREA["dir"] = a.area_dir
+            CAPS.append("area")          # the phone may set the area: its set-up step asks when none is set
             found = area_mod.inputs_for_bridge(a.area_dir)
             if found["area"]:
                 print(f"bridge: area {area_mod.describe(found['area'])}", file=sys.stderr)
         except Exception as e:  # noqa: BLE001
             print(f"bridge: area folder not read: {e}", file=sys.stderr)
-    fcc_path = a.fcc_pack or found["fcc"]
-    if fcc_path:
-        try:
-            FCC = FccPack(fcc_path)
-            CAPS.append("fcc")
-            print(f"bridge: FCC pack loaded, {len(FCC.entries)} licensed frequencies from {fcc_path}", file=sys.stderr)
-        except Exception as e:  # noqa: BLE001
-            if a.fcc_pack:
-                raise                    # a file named by hand that is missing is a settings mistake: say so loudly
-            print(f"bridge: licence pack {fcc_path} skipped: {e}", file=sys.stderr)
-    rr_paths = list(a.rr_pack)
-    for path in found["rr"]:
-        if os.path.realpath(path) in {os.path.realpath(p) for p in rr_paths}:
-            continue
-        try:
-            RrPack([path])               # each area file on its own first, so one bad export costs only itself
-            rr_paths.append(path)
-        except Exception as e:  # noqa: BLE001
-            print(f"bridge: RadioReference export {path} skipped: {e}", file=sys.stderr)
-    rr_counties = list(a.rr_county) + [c for c in found["counties"] if c not in a.rr_county]
-    if rr_paths:
-        RR = RrPack(rr_paths, rr_counties)
+    FCC, RR, problems = load_local_packs(a.fcc_pack, a.rr_pack, a.rr_county, found)
+    PACK_PROBLEMS[:] = problems
+    if FCC is not None:
+        CAPS.append("fcc")
+    if RR is not None:
         CAPS.append("rr")
-        print(f"bridge: RadioReference overlay loaded, {len(RR.rows)} frequencies, {len(RR.sites)} trunked sites, "
-              f"{len(RR.controls)} control channels, {len(RR.talkgroups)} talkgroups from {len(rr_paths)} file(s)", file=sys.stderr)
 
     if a.kismet_json:
         CAPS.append("wifi")
@@ -5054,13 +5286,13 @@ def main() -> None:
         CAPS.append("sweep")
         groups = group_sweeps(a.rtl_power, a.rtl_power_device)
         groups, a.listen_device = adapt_radios(groups, a.listen_device, a.hackrf_sweep)
-        # The control-channel hunt reads the sweep: make sure the listening dongle's sweep passes the 800 MHz
-        # trunking band (851–869, where most US public-safety control channels are) even if the config
-        # only lists the 806–824 input side.
+        # The control-channel hunt reads the sweep: make sure the listening dongle's sweep passes the first
+        # trunking band of this country's plan (US: 851–869, where most public-safety control channels are)
+        # even if the config only lists the 806–824 input side.
         ldev = a.listen_device or next((d for d in groups if d), "")
-        if ldev in groups and not any(_mhz(sp.split(":")[0]) <= 851.0 and _mhz(sp.split(":")[1].split("@")[0]) >= 869.0 for sp in groups[ldev]):
-            groups[ldev].append("851M:869M:12.5k")
-            print(f"bridge: sweep on {ldev}: added 851–869 MHz for the control-channel hunt", file=sys.stderr)
+        if ldev in groups and not sweep_specs_cover(groups[ldev], CC_BANDS[0]):
+            groups[ldev].append(CC_BANDS[0][0])
+            print(f"bridge: sweep on {ldev}: added {CC_BANDS[0][1]:g}–{CC_BANDS[0][2]:g} MHz for the control-channel hunt", file=sys.stderr)
         for specs in groups.values():
             for sp in specs:
                 try:

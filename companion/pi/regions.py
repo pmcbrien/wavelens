@@ -14,8 +14,14 @@ Only its "companion" section matters here:
     "companion": {
       "drop_us_bands": true,            # forget the band names that come from the US allocation table
       "bands": [ {"lo": 476.4, "hi": 477.4, "name": "UHF CB radio nearby", "cat": "VEHICLE", "kind": ""} ],
-      "rtl433_args": "-f 433.92M -f 915M -H 30 -g 40"
+      "rtl433_args": "-f 433.92M -f 915M -H 30 -g 40",
+      "sweeps": {"vhf": ["144M:174M:12.5k"], "uhf": ["403M:430M:12.5k", "450M:520M:12.5k"], "ism": ["915M:928M:25k"]},
+      "cc_bands": [{"lo": 403, "hi": 430, "name": "400 MHz"}],      # where trunked control channels are looked for
+      "follow_bands": [{"lo": 476.4, "hi": 477.42, "mode": "auto"}]  # what the scanner's Follow may tune (am | auto)
     }
+
+The last three are the country's radio plan: which ranges the RTL-SDRs sweep, where the control-channel
+hunt looks, and which bands Follow tunes. Each one left out keeps the built-in (United States) list.
 
 Bands from the pack are matched before the built-in table (first match wins). With drop_us_bands the
 US-only entries are skipped, so a frequency the pack does not name falls back to "N MHz carrier"
@@ -93,3 +99,39 @@ def rtl433_args(pack, default: str) -> str:
     if not pack:
         return default
     return str((pack.get("companion") or {}).get("rtl433_args") or default)
+
+
+_SPEC = __import__("re").compile(r"^(\d+(?:\.\d+)?)M:(\d+(?:\.\d+)?)M:(\d+(?:\.\d+)?)k$")
+
+
+def _spec_ok(sp) -> bool:
+    """An rtl_power range "403M:430M:12.5k" inside what an RTL-SDR tunes, low end first."""
+    m = _SPEC.match(sp) if isinstance(sp, str) else None
+    return bool(m) and 24.0 <= float(m.group(1)) < float(m.group(2)) <= 1766.0 and 1.0 <= float(m.group(3)) <= 1000.0
+
+
+def radio_plan(pack) -> dict:
+    """The pack's radio plan, checked: {"sweeps": {"vhf": [...], "uhf": [...], "ism": [...]}, "cc_bands":
+    [(spec, lo, hi, label)], "follow_bands": [(lo, hi, mode)]}. A key the pack leaves out, or gets wrong,
+    is absent from the result, and the bridge keeps its built-in list for it."""
+    comp = (pack or {}).get("companion") or {}
+    out = {}
+    sw = comp.get("sweeps")
+    if isinstance(sw, dict):
+        got = {k: [sp for sp in (sw.get(k) or []) if _spec_ok(sp)] for k in ("vhf", "uhf", "ism")}
+        if got["vhf"] or got["uhf"]:
+            out["sweeps"] = got
+    try:
+        cc = [(f"{float(b['lo']):g}M:{float(b['hi']):g}M:12.5k", float(b["lo"]), float(b["hi"]), str(b.get("name") or f"{float(b['lo']):g} MHz"))
+              for b in comp.get("cc_bands") or []]
+        if cc and all(_spec_ok(c[0]) for c in cc):
+            out["cc_bands"] = cc
+    except (KeyError, TypeError, ValueError):
+        print("bridge: pack cc_bands unreadable: keeping the built-in list", file=sys.stderr)
+    try:
+        fb = [(float(b["lo"]), float(b["hi"]), str(b.get("mode") or "auto")) for b in comp.get("follow_bands") or []]
+        if fb and all(lo < hi and mode in ("am", "auto") for lo, hi, mode in fb):
+            out["follow_bands"] = fb
+    except (KeyError, TypeError, ValueError):
+        print("bridge: pack follow_bands unreadable: keeping the built-in list", file=sys.stderr)
+    return out

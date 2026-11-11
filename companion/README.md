@@ -737,10 +737,20 @@ sudo wavelens-area set --country DE --lat 52.52 --lon 13.40
 sudo wavelens-area status | refresh | clear
 ```
 
-or the admin page's **Area** tab, or `WAVELENS_COUNTRY` / `WAVELENS_POSTCODE` on the install one-liner
+or the app's set-up step, or the admin page's **Area** tab, or `WAVELENS_COUNTRY` / `WAVELENS_POSTCODE` on the install one-liner
 (the [setup page](https://pmcbrien.github.io/wavelens/pi/) fills them in). The area is one file,
 `/etc/wavelens/area.json`: country, postcode, position, radius (50 km unless you say otherwise) and the
 districts in range (in the US, the state and its counties).
+
+**From the app.** A bridge that can be told its area lists `area` in its caps and reports it in every
+hello: `"area": {"set": false, "busy": false}` or `{"set": true, "country": "US", "postcode": "49749",
+"place": "Cheboygan, MI", "licences": 1357, "built": "2026-11-10", …}`. The app asks once after pairing
+when it is not set ("Where will you use it?") and keeps an Area row on the Companion screen. It sends
+`{"c":"area","v":"set","country":"US","postcode":"49749"}` or `{"c":"area","v":"set","country":"US",
+"lat":45.43,"lon":-84.6}` (the position is kept to two decimals), `"v":"refresh"` or `"v":"clear"`. The
+Pi runs the same tool, sends its progress as `{"t":"area","state":"working|done|failed","msg":"…"}`, and
+restarts itself to load the result; the app reconnects as after an update. The phone downloads nothing:
+the Pi has to be online for this step.
 
 What it downloads comes from the public repo's `area` release, rebuilt weekly from public sources
 (`tools/area_packs.py`, `.github/workflows/area-packs.yml`):

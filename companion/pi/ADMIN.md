@@ -87,3 +87,15 @@ Either of these makes the page ask for a new password on the next visit:
 page alongside the bridge: `wavelens_admin.py` into `/usr/local/lib/wavelens`, the `wavelens-admin` command
 into `/usr/local/bin`, and the `wavelens-admin` systemd service, started at boot. The port is 8080; set
 `WAVELENS_ADMIN_PORT` in `/etc/default/wavelens-bridge` to change it. Logs: `journalctl -u wavelens-admin -f`.
+
+## The Pi's name and Bluetooth pairing
+
+`provision.sh` names the Pi `wavelens` (or `WAVELENS_HOSTNAME`), so this page is at `http://wavelens.local:8080`.
+`install-service.sh` run by hand does the same for a Pi still on the factory name `raspberrypi` and keeps a
+name somebody chose; `WAVELENS_HOSTNAME=name` picks one and `WAVELENS_HOSTNAME=keep` never renames. The
+**Wi-Fi** tab can rename it later.
+
+The installer also enables `wavelens-bt-agent`, which accepts a phone's or computer's Bluetooth pairing
+request without a prompt, because the Pi has no screen to confirm on. Anyone in Bluetooth range can pair; the
+bridge already accepts connections from any phone running the app. Off: `sudo systemctl disable --now
+wavelens-bt-agent`, or install with `WAVELENS_BT_AUTOPAIR=0`.

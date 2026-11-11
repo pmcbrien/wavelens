@@ -2,14 +2,20 @@
 # Installs the Wavelens bridge as a systemd service so it starts when the Pi boots.
 # Run from this folder:  sudo ./install-service.sh
 # Undo:                  sudo ./install-service.sh --remove
+# Options (environment):
+#   WAVELENS_HOSTNAME=name   the Pi's hostname, so the admin page is http://name.local:8080. Unset: a Pi still
+#                            on the factory name "raspberrypi" becomes "wavelens"; a name somebody chose is kept.
+#                            "keep" never renames.
+#   WAVELENS_BT_AUTOPAIR=0   do not install the service that accepts Bluetooth pairing requests without a prompt
 set -eu
 cd "$(dirname "$0")"
 
 if [ "$(id -u)" -ne 0 ]; then echo "run with sudo"; exit 1; fi
 
 if [ "${1:-}" = "--remove" ]; then
-    systemctl disable --now wavelens-bridge wavelens-admin wavelens-update.timer 2>/dev/null || true
+    systemctl disable --now wavelens-bridge wavelens-admin wavelens-update.timer wavelens-bt-agent 2>/dev/null || true
     rm -f /etc/systemd/system/wavelens-bridge.service /etc/systemd/system/wavelens-admin.service \
+          /etc/systemd/system/wavelens-bt-agent.service \
           /etc/systemd/system/wavelens-update.service /etc/systemd/system/wavelens-update.timer \
           /usr/local/bin/wavelens-update /usr/local/bin/wavelens-admin /usr/local/bin/wavelens-area
     rm -rf /usr/local/lib/wavelens
@@ -45,7 +51,42 @@ fi
 # The SDR's kernel TV driver grabs the dongle before rtl_433 can.
 [ -f /etc/modprobe.d/rtlsdr.conf ] || echo "blacklist dvb_usb_rtl28xxu" > /etc/modprobe.d/rtlsdr.conf
 
+# The name the admin page is reached by. provision.sh sets it, but a hand install (git clone, then this
+# script) used to leave a new Pi as "raspberrypi", and the http://wavelens.local:8080 in every instruction
+# did not open.
+WANT=${WAVELENS_HOSTNAME:-}
+CUR=$(hostname)
+if [ -z "$WANT" ] && [ "$CUR" = "raspberrypi" ]; then WANT=wavelens; fi
+case "$WANT" in
+    ""|keep|"$CUR") ;;
+    -*|*-|*[!a-z0-9-]*)
+        echo "WAVELENS_HOSTNAME must be lowercase letters, digits and hyphens: '$WANT' (the name stays $CUR)" ;;
+    *)
+        if [ "${#WANT}" -le 63 ] && command -v hostnamectl >/dev/null 2>&1 && hostnamectl set-hostname "$WANT"; then
+            sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t$WANT/" /etc/hosts
+            grep -q "^127.0.1.1" /etc/hosts || printf '127.0.1.1\t%s\n' "$WANT" >> /etc/hosts
+            echo "Hostname: $CUR -> $WANT"
+        else
+            echo "Could not set the hostname to '$WANT' (the name stays $CUR)"
+        fi ;;
+esac
+# name.local only answers while avahi runs; restart it so a new name is announced now, not at the next boot
+systemctl enable -q avahi-daemon 2>/dev/null || true
+systemctl restart avahi-daemon 2>/dev/null || true
+
+# Bluetooth pairing without a prompt (see wavelens-bt-agent.service). Needs bt-agent from the bluez-tools
+# package, which provision.sh installs; without it the service is left out and pairing works as before.
+if [ "${WAVELENS_BT_AUTOPAIR:-1}" != "0" ] && [ -f wavelens-bt-agent.service ]; then
+    if command -v bt-agent >/dev/null 2>&1; then
+        install -m 0644 wavelens-bt-agent.service /etc/systemd/system/
+        BT_AGENT=1
+    else
+        echo "bt-agent not found (sudo apt install bluez-tools, then run this again): Bluetooth pairing without a prompt is off"
+    fi
+fi
+
 systemctl daemon-reload
+if [ "${BT_AGENT:-0}" = "1" ]; then systemctl enable -q --now wavelens-bt-agent || echo "wavelens-bt-agent did not start: journalctl -u wavelens-bt-agent"; fi
 systemctl enable wavelens-bridge
 systemctl enable --now wavelens-update.timer
 [ -f /etc/systemd/system/wavelens-admin.service ] && systemctl enable --now wavelens-admin && systemctl restart wavelens-admin || true
