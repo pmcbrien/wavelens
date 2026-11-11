@@ -1,0 +1,18 @@
+[Unit]
+Description=Wavelens: accept Bluetooth pairing requests without a prompt
+# A Pi has no screen or keyboard to confirm a pairing on. Without an agent, a phone or computer that asks
+# the system to pair (some do before they will connect) is refused or waits forever. This answers for the
+# Pi: "no input, no output", the same as any headless Bluetooth accessory. Installed by install-service.sh;
+# WAVELENS_BT_AUTOPAIR=0 leaves it out, and  sudo systemctl disable --now wavelens-bt-agent  turns it off.
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+# the leading "-": a controller that is not up yet must not stop the agent from starting
+ExecStartPre=-/usr/bin/bluetoothctl pairable on
+ExecStart=/usr/bin/bt-agent --capability=NoInputNoOutput
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=bluetooth.target

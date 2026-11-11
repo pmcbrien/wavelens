@@ -1,0 +1,77 @@
+# /etc/default/wavelens-bridge — settings for wavelens-bridge.service.
+# After editing: sudo systemctl restart wavelens-bridge
+
+# Radios: nothing to configure. With WAVELENS_AUTO=0 and no radio flags in WAVELENS_ARGS, the bridge itself
+# looks at the USB bus at start and assigns roles by what is there, whatever the serials — 1 RTL-SDR: sensors
+# (rtl_433, run by the bridge); 2: + VHF/UHF/800 sweep (listening borrows it); 3: + a dongle of its own for
+# listening; 4: VHF and UHF sweeps on separate dongles; HackRF: the 1–6000 MHz sweep when one is present —
+# and keeps watching: a dongle or HackRF plugged in later is taken up, one that is unplugged is handed off.
+# The Companion screen's hardware line shows the result. WAVELENS_ARGS then carries only the extras
+# (--rr-pack, --rr-county, --fcc-pack, --hackrf-mask, --name).
+#   WAVELENS_AUTO=1  does the same plan in the shell at each start (older way; no hot-plug)
+#   Naming radios in WAVELENS_ARGS (--rtl-power …@SERIAL, --listen-device, --hackrf-sweep) pins them by hand;
+#   a named dongle that isn't on the bus is still replaced by one that is.
+WAVELENS_AUTO=0
+
+# rtl_433 run by the shell on stdin (only with WAVELENS_AUTO=1 or a -d of your own). Leave empty to let the
+# bridge run rtl_433 itself on the dongle it picks (315 / 433.92 / 915 MHz, 30 s hops, gain 40).
+WAVELENS_RTL433=""
+
+# Local data needs no flags: set the area once (sudo wavelens-area set US 49749, or the admin page's Area tab)
+# and the bridge loads /var/lib/wavelens/area/ at each start: the licence pack downloaded for that postcode
+# and any RadioReference exports you put in its rr/ folder. --fcc-pack / --rr-pack below are the manual way.
+#
+# Extra bridge flags. Examples:
+#   --hackrf-sweep                          HackRF energy sweep of the whole 1 MHz–6 GHz range (~1 s a pass),
+#                                           every carrier labelled by band; see README "HackRF: what the full sweep labels"
+#   --hackrf-sweep --hackrf-range 5600:5950 HackRF on 5.8 GHz video only (faster passes)
+#   --portapack-port /dev/ttyACM0           HackRF with a PortaPack (Mayhem): the bridge switches it to HackRF
+#                                           mode by itself; set this only if it doesn't find the console
+#   --hackrf-park-range 450:470             where the HackRF parks when the app's "Body cams & radios"
+#                                           is on (default 796:816, 700/800 MHz public-safety radios)
+#   HackRF + two RTL-SDRs on one Pi: use a powered USB hub (diagrams/pi-hackrf-2sdr.svg)
+#   --rtl-power 902M:928M:25k --rtl-power 1240M:1300M:100k --rtl-power 1559M:1610M:100k --rtl-power-device 00001090 --rtl-power-dwell 6
+#                                           RTL-SDR sweeps: 900 MHz ISM, 1.2 GHz video links, GPS (jammer check)
+#   --rtl-power 150M:174M:12.5k --rtl-power 806M:815M:12.5k --rtl-power-device 00001090
+#                                           RTL-SDR sweeps, VHF and 800 MHz taking turns on the dongle
+#                                           with that serial (rtl_test lists serials); give rtl_433 the
+#                                           other one with -d :SERIAL in WAVELENS_RTL433
+#   --dump1090 localhost:30003              aircraft from dump1090 / readsb (needs a second dongle)
+#   --fcc-pack /usr/local/lib/wavelens/fcc-local.json
+#   --rr-pack /usr/local/lib/wavelens/rr/pinellas.csv --rr-pack /usr/local/lib/wavelens/rr/hillsborough.csv \
+#   --rr-pack /usr/local/lib/wavelens/rr/florida.csv --rr-pack /usr/local/lib/wavelens/rr/nationwide.csv \
+#   --rr-pack /usr/local/lib/wavelens/rr/trunked_sites.csv --rr-pack /usr/local/lib/wavelens/rr/talkgroups.csv \
+#   --rr-county Pinellas --rr-county Hillsborough
+#                                           RadioReference frequency exports (CSV) for your counties: hits are named
+#                                           by agency, description, alpha tag and mode; preferred over the FCC pack
+#                                           (a trunked-sites export gives trunk lock-on its control channels;
+#                                           a talkgroups export names the calls)
+#   --listen-device SERIAL                  the RTL-SDR the scanner listens with (default: the first @SERIAL sweep dongle);
+#                                           a plain R820T dongle, not an RTL-SDR Blog V4 unless its own driver is installed
+#   --trunk-idle 5 --trunk-min-db 18        scanner: leave a locked trunked system after 5 s without a call for the
+#                                           next strongest; only systems ≥ 18 dB over the band floor are candidates
+#   --moto-band 800                         Motorola Type II channel plan: 800 | 800r | 800s | 900 | obt:BASE:SPACING:OFFSET
+#   --hackrf-keep-sweeping                  keep the HackRF sweeping during digital voice (default: paused — it costs audio)
+#   --echo                                  every line sent to the phone also in the journal (verbose)
+#   --name Wavelens-Car                     the name the app lists under Find
+#
+# A known-good two-dongle scanner setup (WAVELENS_AUTO=0), a plain dongle on the sweeps + listening and the
+# other on sensors:
+#   WAVELENS_RTL433="-d :SERIAL_A -f 315M -f 433.92M -f 915M -H 30 -g 40"
+#   WAVELENS_ARGS="--listen-device SERIAL_B --rtl-power 144M:174M:12.5k@SERIAL_B --rtl-power 440M:470M:12.5k@SERIAL_B \
+#                  --rtl-power 806M:824M:12.5k@SERIAL_B --hackrf-sweep --hackrf-lna 16 --hackrf-bin 100000 \
+#                  --rr-pack /usr/local/lib/wavelens/rr/sites.csv --rr-pack /usr/local/lib/wavelens/rr/talkgroups.csv \
+#                  --rr-pack /usr/local/lib/wavelens/rr/county.csv --rr-county YourCounty"
+# (851–869 MHz is added to the listening dongle's sweep by the bridge for the control-channel hunt.)
+WAVELENS_ARGS=""
+
+# Wi-Fi setup from the app. The Companion screen can list the networks this Pi sees and join one over the
+# Bluetooth link, which is how a new Scanner gets onto the home network without a screen and keyboard. Like
+# every command on that link it is open to whoever connects to the Pi over Bluetooth, so once the Pi is on
+# your network you can turn it off here (0); the admin page's Wi-Fi tab keeps working either way.
+WAVELENS_WIFI_SETUP=1
+
+# Updates. "sudo wavelens-update check" / "apply" / "rollback" by hand, or from the app's Companion screen, or
+# the admin page (http://<hostname>.local:8080). A timer checks every night; with WAVELENS_AUTO_UPDATE=1 it also
+# installs what it finds (never while a phone is connected) and rolls back by itself if the new bridge won't start.
+WAVELENS_AUTO_UPDATE=0

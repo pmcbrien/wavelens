@@ -1,0 +1,5573 @@
+#!/usr/bin/env python3
+"""
+Wavelens companion bridge — Raspberry Pi / carputer / any Linux box with BlueZ.
+
+Turns the machine into the BLE peripheral the Wavelens app looks for, and relays
+whatever the radios attached to it produce. Feeds can be combined; add your own by
+writing Wavelens lines (see ../README.md) to stdin.
+
+  rtl_433 -F json | ./wavelens_bridge.py --rtl433        # RTL-SDR: 433/315/915 MHz decoders (TPMS, remotes, sensors)
+  ./wavelens_bridge.py --hackrf-sweep                    # HackRF: whole 1 MHz–6 GHz range, every carrier labelled by band
+  ./wavelens_bridge.py --rtl-power 300M:1000M:50k        # RTL-SDR: the same idea below 1.7 GHz
+  ./wavelens_bridge.py --rtl-power 150M:174M:12.5k --rtl-power 806M:815M:12.5k --rtl-power-device 00001090
+  ./wavelens_bridge.py --rtl-power 24M:895M:250k@00000978 --rtl-power 895M:1766M:250k@00001090
+                                                         # two dongles splitting the whole RTL-SDR range
+                                                         # several ranges take turns on one dongle; pin it by serial
+  ./wavelens_bridge.py --dump1090 localhost:30003        # ADS-B aircraft from dump1090 / readsb (SBS port)
+  ./wavelens_bridge.py --kismet-json /tmp/kismet.json    # Kismet export from a monitor-mode Wi-Fi adapter
+  ./wavelens_bridge.py --fcc-pack fcc-local.json ...     # label licensed carriers by name (see ../tools/fcc_local_pack.py)
+  ./wavelens_bridge.py                                   # raw: stdin already in Wavelens line format
+
+Several at once:  rtl_433 -F json | ./wavelens_bridge.py --rtl433 --hackrf-sweep --dump1090 localhost:30003
+
+  ./wavelens_bridge.py --rtl-power 144M:174M:12.5k@SERIAL --rtl-power 440M:470M:12.5k@SERIAL --listen-device SERIAL \
+      --rr-pack county.csv --rr-pack trunked_sites.csv --rr-pack talkgroups.csv --rr-county Pinellas
+                                                         # the scanner: Listen / Follow / trunk-tracking on one dongle,
+                                                         # control channels found from the sweep, calls named from
+                                                         # the RadioReference exports (see ../README.md, "Trunked systems")
+
+Needs: python3-bluezero (pip install bluezero), BlueZ 5.50+, the adapter powered, and whichever of
+rtl_433 / hackrf_sweep / rtl_power / rtl_fm / rtl_tcp / dump1090 you use on PATH; dsd-fme (install-dsd.sh)
+for digital voice and P25 / DMR / EDACS trunking; smartnet.py beside this file for Motorola Type II.
+Receive only: nothing here ever transmits. Runs on a Pi 4 in a car daily (Oct 2026); the HackRF sweep
+is a forked worker process, a hung RTL-SDR is USB-reset, and a missing sensor dongle is tolerated.
+Tunables that matter for the scanner: --trunk-idle (5 s), --trunk-min-db (18), --listen-squelch,
+--moto-band, --hackrf-keep-sweeping.
+"""
+from __future__ import annotations   # Pi OS Bullseye ships Python 3.9: keeps `dict | None` hints lazy
+
+import argparse
+import base64
+from collections import deque
+import bisect
+import glob
+import json
+import math
+import multiprocessing
+import os
+import re
+import shlex
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+from queue import Queue, Empty
+
+import spotters                       # ESP32 Spotters plugged into this Pi over USB
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import regions as region_packs   # noqa: E402  (companion/pi/regions.py)
+except ImportError:                  # an install that predates region packs: US tables only
+    class region_packs:              # noqa: N801
+        DIRS = []
+        @staticmethod
+        def find(code): return None
+        @staticmethod
+        def table(pack, base): return base
+        @staticmethod
+        def rtl433_args(pack, default): return default
+        @staticmethod
+        def radio_plan(pack): return {}
+try:
+    import audioop                   # C-speed mixing/resampling; gone in Python 3.13 (the Pi images have it)
+except ImportError:
+    audioop = None
+
+SVC = "57617665-6c65-6e73-0100-000000000001"
+TX = "57617665-6c65-6e73-0100-000000000002"
+RX = "57617665-6c65-6e73-0100-000000000003"
+AU = "57617665-6c65-6e73-0100-000000000004"      # device → phone, notify: audio frames while listening
+def _version() -> str:
+    # companion/VERSION, installed beside this file by install-service.sh / wavelens-update; the
+    # checkout's copy when run from the repo.
+    for cand in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "VERSION")):
+        try:
+            return open(cand).read().strip() or "dev"
+        except OSError:
+            continue
+    return "dev"
+
+
+VERSION = _version()
+FW = f"wavelens-bridge {VERSION}"
+UPDATE_STATE = "/var/lib/wavelens/update.json"     # written by wavelens-update
+RUN_STATUS = "/run/wavelens/status.json"           # written here for the admin page and the update timer
+
+
+def update_info() -> dict:
+    """{"installed", "available", "checked_at"} from the updater's record; available is None when current."""
+    info = {"installed": VERSION, "available": None, "checked_at": None}
+    try:
+        rec = json.load(open(UPDATE_STATE))
+        avail = rec.get("available")
+        info["available"] = avail if avail and avail != VERSION else None
+        info["checked_at"] = rec.get("checked_at")
+        info["last"] = rec.get("last_result")   # e.g. "update to X did not start, so Y was put back"
+    except (OSError, ValueError):
+        pass
+    return info
+
+
+# Data files the settings name that would not load (missing, unreadable, not what they claim to be). The
+# scanner runs without them; the admin page and the phone say which, so the fix is a settings edit or a
+# file copy and not a guess.
+PACK_PROBLEMS: "list[str]" = []
+
+
+def load_local_packs(fcc_arg, rr_args, rr_county_args, found):
+    """(FccPack or None, RrPack or None, [problem, ...]) from --fcc-pack / --rr-pack and the area folder.
+
+    A local pack names what the radio hears; it is never needed to hear it. So a file that will not load,
+    whether named by hand in WAVELENS_ARGS or found in the area folder, is logged and left out, and the
+    bridge starts. It used to stop: one settings line pointing at a file not yet copied over put the whole
+    scanner into a restart loop, and the admin page blamed an interrupted update."""
+    problems, fcc, rr = [], None, None
+    for path, named in ((fcc_arg, True), (found.get("fcc") or "", False)):
+        if not path or fcc is not None:
+            continue
+        try:
+            fcc = FccPack(path)
+            print(f"bridge: FCC pack loaded, {len(fcc.entries)} licensed frequencies from {path}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            why = "is not on this Pi" if isinstance(e, FileNotFoundError) else f"could not be read ({type(e).__name__}: {e})"
+            problems.append(f"licence pack {path} {why}" + (" (named by --fcc-pack in the settings)" if named else ""))
+    rr_paths = []
+    for path, named in [(p, True) for p in rr_args] + [(p, False) for p in found.get("rr") or []]:
+        if os.path.realpath(path) in {os.path.realpath(p) for p in rr_paths}:
+            continue
+        try:
+            RrPack([path])               # each file on its own first, so one bad export costs only itself
+            rr_paths.append(path)
+        except Exception as e:  # noqa: BLE001
+            why = "is not on this Pi" if isinstance(e, FileNotFoundError) else f"could not be read ({type(e).__name__}: {e})"
+            problems.append(f"RadioReference export {path} {why}" + (" (named by --rr-pack in the settings)" if named else ""))
+    if rr_paths:
+        counties = list(rr_county_args) + [c for c in found.get("counties") or [] if c not in rr_county_args]
+        try:
+            rr = RrPack(rr_paths, counties)
+            print(f"bridge: RadioReference overlay loaded, {len(rr.rows)} frequencies, {len(rr.sites)} trunked sites, "
+                  f"{len(rr.controls)} control channels, {len(rr.talkgroups)} talkgroups from {len(rr_paths)} file(s)", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            problems.append(f"RadioReference exports could not be combined ({type(e).__name__}: {e})")
+    for msg in problems:
+        print(f"bridge: left out: {msg}", file=sys.stderr)
+    return fcc, rr, problems
+
+
+# ---------------------------------------------------------------- area: where this companion is used
+# The app's set-up step ("Where will you use it?") and the Companion screen's Area row. The phone sends a
+# country and a postcode, or a position; the Pi does the downloading (area.py, the same tool as
+# `wavelens-area` and the admin page), because the app has no network permission. See area.py.
+AREA = {"dir": "/var/lib/wavelens/area", "busy": False, "last": "", "lock": threading.Lock()}
+AREA_COUNTRY_RE = re.compile(r"^[A-Za-z]{2}$")
+AREA_POSTCODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 -]{0,11}$")
+
+
+def area_info() -> dict:
+    """What the phone is told about the area in every hello: set or not, a label, and the last attempt."""
+    info = {"set": False, "busy": AREA["busy"]}
+    if AREA["last"]:
+        info["last"] = AREA["last"]
+    try:
+        import area as area_mod
+        a = area_mod.read_area()
+    except Exception:  # noqa: BLE001 - an unreadable area is "not set", never a bridge that will not start
+        a = {}
+    if a.get("country"):
+        place = ", ".join(x for x in (a.get("district", ""), a.get("region", "")) if x)
+        info.update(set=True, country=a.get("country", ""), postcode=a.get("postcode", ""), place=place,
+                    radius_km=a.get("radius_km"), licences=int(a.get("licences") or 0), built=a.get("data_built") or "")
+    return info
+
+
+def area_emit(st: str, msg: str) -> None:
+    """Progress of an area change, as its own line type (the set-up step shows it) and in the journal."""
+    AREA["last"] = msg
+    print("bridge: area: " + msg, file=sys.stderr)
+    emit({"t": "area", "state": st, "msg": msg})
+
+
+def area_argv(cmd: dict):
+    """The area.py arguments for a phone's {"c":"area",...} command, or a string saying what is wrong with it.
+    Every value is checked here and passed as its own argument; nothing reaches a shell."""
+    what = str(cmd.get("v") or "set")
+    if what in ("refresh", "clear"):
+        return [what] + (["--force"] if what == "refresh" and cmd.get("force") else [])
+    if what != "set":
+        return f"unknown action {what}"
+    country = str(cmd.get("country") or "").strip().upper()
+    if not AREA_COUNTRY_RE.match(country):
+        return "the country is a two-letter code, e.g. US, CA, AU, GB, DE"
+    try:
+        radius = float(cmd.get("radius_km") or 50)
+    except (TypeError, ValueError):
+        return "the radius is a number of kilometres"
+    if not 5 <= radius <= 300:
+        return "the radius is 5 to 300 km"
+    argv = ["set", "--country", country, "--radius-km", f"{radius:g}"]
+    postcode = " ".join(str(cmd.get("postcode") or "").upper().split())
+    if postcode:
+        if not AREA_POSTCODE_RE.match(postcode):
+            return "the postcode is letters and digits"
+        return argv + ["--postcode", postcode]
+    lat, lon = cmd.get("lat"), cmd.get("lon")
+    if lat is None and cmd.get("here") and state.get("lat") is not None and time.time() - state.get("pos_at", 0) < 120:
+        lat, lon = state["lat"], state["lon"]       # the position the phone is already sharing
+    try:
+        lat, lon = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return "give a postcode, or a position"
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return "that position is not on the map"
+    # two decimals is about a kilometre: all an area of tens of kilometres needs, and all that is kept
+    return argv + [f"--lat={lat:.2f}", f"--lon={lon:.2f}"]
+
+
+def run_area(cmd: dict) -> None:
+    """Phone asked to set, refresh or clear the area: run area.py, pass its progress on, then restart to load it."""
+    argv = area_argv(cmd)
+    if isinstance(argv, str):
+        area_emit("failed", argv)
+        return
+    with AREA["lock"]:
+        if AREA["busy"]:
+            emit({"t": "area", "state": "working", "msg": AREA["last"] or "already working on it"})
+            return
+        AREA["busy"] = True
+    tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "area.py")
+    ok, last = False, ""
+    try:
+        area_emit("working", "contacting the download server (the Pi needs to be online) …")
+        env = dict(os.environ, WAVELENS_AREA_DIR=AREA["dir"], PYTHONUNBUFFERED="1")
+        p = subprocess.Popen([sys.executable or "python3", tool] + argv + ["--no-restart"], stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, env=env)
+        deadline = time.time() + 900
+        for line in p.stdout:
+            line = line.strip()
+            if line:
+                last = line
+                if len(line) < 200:
+                    area_emit("working", line)
+            if time.time() > deadline:
+                p.kill()
+                last = "timed out"
+                break
+        ok = p.wait(timeout=30) == 0 and last != "timed out"
+    except (OSError, subprocess.SubprocessError) as e:
+        last = f"could not run the area tool ({e})"
+    finally:
+        AREA["busy"] = False
+    if not ok:
+        area_emit("failed", last.replace("error: ", "") or "failed")
+        hello()
+        return
+    area_emit("done", last or "done")
+    hello()
+    # The new licence pack is read at start. Give the lines above a moment to reach the phone, then restart;
+    # the app reconnects by itself, as it does after an update.
+    time.sleep(2.5)
+    try:
+        subprocess.Popen(["systemctl", "restart", "--no-block", "wavelens-bridge"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        area_emit("done", (last or "done") + " — restart the bridge to load it")
+
+
+def write_run_status(hw: dict | None = None) -> None:
+    """A small JSON the admin page shows and wavelens-update reads (no update while a phone is linked)."""
+    try:
+        os.makedirs(os.path.dirname(RUN_STATUS), exist_ok=True)
+        doc = {"linked": bool(state.get("linked")), "name": state.get("name"), "code": state.get("code"),
+               "hw_line": (hw or {}).get("line") or state.get("hw_line"), "hw_missing": (hw or {}).get("missing", []),
+               "fw": FW, "at": int(time.time()), "update": update_info(),
+               "problems": list(PACK_PROBLEMS),
+               "spotters": HUB.info() if HUB else []}
+        tmp = RUN_STATUS + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(doc, f)
+        os.replace(tmp, RUN_STATUS)
+    except OSError:
+        pass
+
+
+def run_update(what: str) -> None:
+    """Phone asked for an update (c=update, v=check|apply|rollback): run wavelens-update, report as status lines."""
+    if what not in ("check", "apply", "rollback"):
+        emit({"t": "status", "msg": f"update: unknown action {what}", "band": state["band"], "mode": state["mode"]})
+        return
+    emit({"t": "status", "msg": f"update: {what} started" + (" (the bridge restarts when it is done)" if what != "check" else ""),
+          "band": state["band"], "mode": state["mode"]})
+    try:
+        r = subprocess.run(["/usr/local/bin/wavelens-update", what], capture_output=True, text=True, timeout=900)
+        last = (r.stdout.strip().splitlines() or r.stderr.strip().splitlines() or ["(no output)"])[-1]
+        msg = last.replace("update: ", "")
+        if r.returncode == 10:
+            msg = "update available: " + msg
+        elif r.returncode != 0:
+            msg = f"update {what} failed: " + msg
+    except FileNotFoundError:
+        msg = "wavelens-update is not installed on this Pi (run companion/pi/install-service.sh once)"
+    except subprocess.TimeoutExpired:
+        msg = f"update {what}: timed out"
+    print("bridge: " + msg, file=sys.stderr)
+    emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
+    # apply/rollback restart the service; if we are still here (check, or a failure) refresh what the phone sees
+    write_run_status()
+    hello()
+
+
+class Outbox:
+    """Everything bound for the phone, in three classes, so a busy link never costs a word of audio and never
+    loses a hit or a journal line either:
+      control  — hello, status, page: small and wanted now; always next after the audio frame in flight.
+      bulk     — rf / wifi / ble hits, journal lines, pager data: queued without limit (BULK_MAX lines, a few
+                 MB) and delivered when the link has room — one chunk per audio frame while a call plays,
+                 flat out between calls. Nothing here is dropped short of the cap, and the cap is logged.
+      spec     — spectrum frames: only the newest matters; a stale one is replaced, never queued.
+    The pump sends the line at the head of a class in ≤180-byte chunks, and after every chunk looks at the
+    audio clock again, so a long journal line can never hold an audio frame past its 40 ms slot."""
+    BULK_MAX = 20000
+    CONTROL_T = ("hello", "status", "page", "net", "area")
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.control: "deque[bytes]" = deque()
+        self.bulk: "deque[bytes]" = deque()
+        self.spec: "bytes | None" = None
+        self.dropped = 0
+        self.high_water_said = False
+
+    def put(self, line: str, kind: str = "") -> None:
+        data = line.encode("utf-8")
+        with self.lock:
+            if kind == "spec":
+                self.spec = data
+            elif kind in self.CONTROL_T:
+                self.control.append(data)
+            else:
+                self.bulk.append(data)
+                if len(self.bulk) > self.BULK_MAX:
+                    self.bulk.popleft(); self.dropped += 1
+                    if self.dropped in (1, 1000, 10000):
+                        print(f"bridge: outbox: backlog over {self.BULK_MAX} lines; oldest dropped ({self.dropped} so far)", file=sys.stderr)
+                elif len(self.bulk) == 500 and not self.high_water_said:
+                    self.high_water_said = True
+                    print("bridge: outbox: 500 lines waiting for the link (audio comes first; they will follow)", file=sys.stderr)
+
+    def next(self, bulk_ok: bool) -> "bytes | None":
+        """The next line to send: control first, then the newest spectrum frame, then bulk when allowed."""
+        with self.lock:
+            if self.control:
+                return self.control.popleft()
+            if self.spec is not None:
+                sp, self.spec = self.spec, None
+                return sp
+            if bulk_ok and self.bulk:
+                if self.high_water_said and len(self.bulk) < 50:
+                    self.high_water_said = False
+                    print("bridge: outbox: backlog delivered", file=sys.stderr)
+                return self.bulk.popleft()
+        return None
+
+    def waiting(self) -> int:
+        with self.lock:
+            return len(self.control) + len(self.bulk) + (1 if self.spec is not None else 0)
+
+
+out = Outbox()
+aout: "Queue[bytes]" = Queue(maxsize=200)       # eight seconds of audio; the pump drops the oldest past AUDIO_DROP_S of lag
+state = {"linked": False, "band": "all", "mode": "rf", "ch": "hop", "park": "off", "lat": None, "lon": None, "pos_at": 0.0}
+
+
+ECHO = False      # --echo: also print every line sent to the phone (watch with journalctl -f)
+
+
+def emit(obj: dict) -> None:
+    line = json.dumps(obj, separators=(",", ":")) + "\n"
+    if ECHO:
+        print("sent " + line.rstrip(), file=sys.stderr)
+    out.put(line, str(obj.get("t") or ""))
+    if obj.get("t") == "rf" and obj.get("src") in ("hackrf", "rtlpower"):
+        trunk_note(obj)
+        if LISTEN.get("req") is not None:
+            try:
+                r = float(str((obj.get("x") or {}).get("exact_mhz", "")).split()[0])
+                if abs(r - LISTEN["mhz"]) < 0.06:
+                    LISTEN["carrier_at"] = time.time()
+                    hone(r)
+            except (ValueError, IndexError):
+                pass
+        if LISTEN.get("follow"):
+            follow_hit(obj)
+
+
+CAPS = ["rf"]
+HUB: "spotters.Hub | None" = None     # started in main(); None under --plan / tests
+START_AT = time.time()
+
+# The bridge's own journal, for the phone. Everything the bridge prints on stderr (its "bridge: …" lines
+# and what rtl_tcp / dsd-fme / hackrf_sweep say) is kept, last LOG_KEEP lines, and streamed as
+# {"t":"log"} frames while the app's Alerts screen asks for it ({"c":"log","on":true}, renewed every
+# 30 s). The "sent …" echo lines are left out: the app already has its own packet view, and a log
+# frame echoing itself would loop. The Pi's journal (journalctl -u wavelens-bridge) is the full record.
+LOG_KEEP = 100
+LOG_TTL_S = 90.0
+LOG = {"on": False, "until": 0.0, "lines": deque(maxlen=LOG_KEEP), "pending": deque(), "lock": threading.Lock()}
+
+
+def log_line(text: str) -> None:
+    text = text.rstrip()
+    if not text or text.startswith("sent ") or '"t":"log"' in text:
+        return
+    if "total sweeps completed" in text or "Stop with Ctrl-C" in text:
+        return                               # hackrf_sweep's once-a-second progress line
+    item = (time.time(), text[:300])
+    with LOG["lock"]:
+        LOG["lines"].append(item)
+        if LOG["on"]:
+            LOG["pending"].append(item)
+
+
+class _StderrTee:
+    """Replaces sys.stderr: passes everything through to the journal and keeps whole lines for the phone."""
+    def __init__(self, real):
+        self.real, self.buf = real, ""
+    def write(self, s):
+        self.real.write(s)
+        self.buf += s
+        while "\n" in self.buf:
+            ln, self.buf = self.buf.split("\n", 1)
+            log_line(ln)
+        return len(s)
+    def flush(self):
+        self.real.flush()
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+def log_pump() -> None:
+    while True:
+        time.sleep(0.5)
+        if not LOG["on"]:
+            continue
+        if time.time() > LOG["until"]:
+            LOG["on"] = False
+            with LOG["lock"]:
+                LOG["pending"].clear()
+            continue
+        with LOG["lock"]:
+            batch = [LOG["pending"].popleft() for _ in range(min(10, len(LOG["pending"])))]
+        for ts, text in batch:
+            emit({"t": "log", "ts": int(ts), "l": text})
+
+
+USB_IDS = {("0bda", "2838"): "rtl", ("0bda", "2832"): "rtl", ("1d50", "6089"): "hackrf",
+           ("10c4", "ea60"): "esp32", ("1a86", "7523"): "esp32", ("1a86", "55d4"): "esp32",   # CP210x / CH340 / CH9102 USB-serial
+           ("303a", "1001"): "esp32", ("303a", "4001"): "esp32"}                               # ESP32-S3 / -C3 native USB
+
+
+def hw_inventory() -> dict:
+    """What radios are on the Pi's USB bus right now, and what each is doing — read from sysfs (no device is
+    opened, so nothing running is disturbed). Sent in every hello and said in the journal, so a dongle that
+    fell off the bus or a HackRF left in the PortaPack menu is seen at the next connect, not after an hour
+    of silence. "esp32" here is a dev board plugged into the Pi over USB-serial (it is not driven by the
+    bridge; an ESP32 companion talks to the phone on its own)."""
+    rtls, hackrf, esp = [], "none", []
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        try:
+            with open(d + "/idVendor") as a, open(d + "/idProduct") as b:
+                kind = USB_IDS.get((a.read().strip(), b.read().strip()))
+        except OSError:
+            continue
+        if not kind:
+            continue
+        try:
+            with open(d + "/serial") as f:
+                sn = f.read().strip()
+        except OSError:
+            sn = ""
+        if kind == "rtl":
+            rtls.append(sn)
+        elif kind == "hackrf":
+            hackrf = "ok"
+        elif kind == "esp32":
+            esp.append(sn or os.path.basename(d))      # counted for the line below; HUB drives them
+    if hackrf == "none" and portapack_tty():
+        hackrf = "portapack"                 # on the bus as a PortaPack console: ensure_hackrf_mode() flips it
+    try:
+        out = subprocess.run(["pgrep", "-a", "-f", "rtl_433|rtl_power|rtl_fm|rtl_tcp|dump1090|dump978|readsb"],
+                             capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        out = ""
+    def role(sn: str) -> str:
+        if sn and sn == LISTEN.get("dev"):
+            return "listen"
+        for ln in out.splitlines():
+            if sn and (f"-d {sn}" in ln or f"-d :{sn}" in ln or f"@{sn}" in ln or f"serial={sn}" in ln):
+                tool = ln.split()[1] if len(ln.split()) > 1 else ""
+                return {"rtl_433": "sensors", "rtl_power": "sweep", "rtl_fm": "listen", "rtl_tcp": "listen"}.get(
+                    os.path.basename(tool), os.path.basename(tool) or "busy")
+        return "free"
+    hw = {"rtl": [{"serial": sn, "role": role(sn)} for sn in rtls], "hackrf": hackrf, "esp32": esp}
+    want = [d for d in [LISTEN.get("dev", "")] if d and d not in rtls]
+    missing = []
+    if want:
+        missing.append(f"RTL-SDR {want[0]} (configured to listen) is not on the USB bus")
+    if HACKRF.get("ctl") is not None and hackrf == "portapack":
+        missing.append("HackRF is in the PortaPack menu")   # a configured HackRF that is simply absent is adapted to, not an error
+    if not rtls:
+        missing.append("no RTL-SDR: nothing to listen or sweep with")
+    hw["missing"] = missing
+    parts = []
+    if rtls:
+        parts.append(f"{len(rtls)} RTL-SDR (" + ", ".join(f"{r['serial'] or '?'}: {r['role']}" for r in hw["rtl"]) + ")")
+    parts.append({"ok": "HackRF", "portapack": "HackRF (PortaPack menu)", "none": "no HackRF"}[hackrf])
+    units = HUB.info() if HUB else []
+    if units:
+        parts.append(f"{len(units)} Spotter{'s' if len(units) != 1 else ''} on USB (" +
+                     ", ".join(f"{u['u']}: {u['role_label'] if u['hosted'] else u['msg']}" for u in units) + ")")
+    elif esp:
+        parts.append(f"ESP32 on USB ({len(esp)})")
+    ip = admin_address()
+    if ip:
+        parts.append(f"admin http://{ip}:8080")     # the Pi's admin page, for people whose phone can't resolve .local
+    hw["line"] = " · ".join(parts) + (" — " + "; ".join(missing) if missing else "")
+    return hw
+
+
+_ADMIN = {"at": 0.0, "ip": ""}
+
+
+def admin_address() -> str:
+    """The Pi's first LAN address, if the admin service is enabled (checked once a minute)."""
+    if time.time() - _ADMIN["at"] > 60:
+        _ADMIN["at"] = time.time()
+        _ADMIN["ip"] = ""
+        try:
+            if os.path.exists("/etc/systemd/system/wavelens-admin.service"):
+                out = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=3).stdout.split()
+                _ADMIN["ip"] = next((a for a in out if "." in a and not a.startswith("127.")), "")
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return _ADMIN["ip"]
+
+
+# ---------------------------------------------------------------- Wi-Fi setup from the phone
+#
+# A Scanner fresh out of the box is on no network, and its admin page can only be reached over one. So the
+# phone, which already holds the Bluetooth link, can ask the Pi which networks it sees and tell it to join
+# one: {"c":"net","v":"status"|"scan"|"join"}. The Pi answers with {"t":"net"} lines. NetworkManager (nmcli)
+# does the work, the same way the admin page's Wi-Fi tab does.
+#
+# What this does not do: forget networks or rename the Pi (admin page), and it never logs, stores or sends
+# back the password. Anyone holding the Bluetooth link can use it, as with every other command here, so
+# WAVELENS_WIFI_SETUP=0 in /etc/default/wavelens-bridge turns it off for a Pi that is already set up.
+NET_ON = os.environ.get("WAVELENS_WIFI_SETUP", "1").strip().lower() not in ("0", "no", "off", "false")
+NET_MAX = 12            # networks listed to the phone, strongest first
+NET_JOIN_GAP_S = 8.0    # between join attempts: a wrong password is not a reason to hammer the access point
+NET = {"lock": threading.Lock(), "busy": "", "last_join": 0.0}
+
+
+def net_available() -> bool:
+    return NET_ON and shutil.which("nmcli") is not None
+
+
+def _nm(args: "list[str]", timeout: float = 20.0) -> "tuple[int, str]":
+    """Run nmcli (list argv, no shell). (returncode, combined output); never raises."""
+    try:
+        p = subprocess.run(["nmcli"] + args, capture_output=True, text=True, timeout=timeout, errors="replace")
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except FileNotFoundError:
+        return 127, "NetworkManager (nmcli) is not installed on this computer"
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+    except OSError as e:
+        return 1, str(e)
+
+
+def _nm_fields(line: str) -> "list[str]":
+    """One line of `nmcli -t` output split into fields: ':' separates, '\\:' and '\\\\' are literal."""
+    fields, cur, i = [], [], 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and i + 1 < len(line):
+            cur.append(line[i + 1]); i += 2
+            continue
+        if ch == ":":
+            fields.append("".join(cur)); cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    fields.append("".join(cur))
+    return fields
+
+
+def net_parse_scan(text: str) -> "list[dict]":
+    """`nmcli -t -f IN-USE,SSID,SIGNAL,SECURITY dev wifi list` → [{"s","sig","sec","on"}], one row per network
+    name (its strongest access point), strongest first, hidden networks left out, at most NET_MAX."""
+    best: "dict[str, dict]" = {}
+    for line in text.splitlines():
+        f = _nm_fields(line)
+        if len(f) < 4 or not f[1]:
+            continue
+        try:
+            sig = max(0, min(100, int(f[2])))
+        except ValueError:
+            sig = 0
+        sec = " ".join(f[3:]).strip()
+        row = {"s": f[1], "sig": sig, "sec": "" if sec in ("", "--") else sec, "on": f[0].strip() == "*"}
+        old = best.get(f[1])
+        if old is None or sig > old["sig"]:
+            row["on"] = row["on"] or bool(old and old["on"])
+            best[f[1]] = row
+        elif row["on"]:
+            old["on"] = True
+    rows = sorted(best.values(), key=lambda r: (not r["on"], -r["sig"], r["s"].lower()))
+    return rows[:NET_MAX]
+
+
+def net_current() -> dict:
+    """{"ssid", "ip"}: the Wi-Fi network this computer is on and its first LAN address ("" when none)."""
+    ssid = ""
+    rc, text = _nm(["-t", "-f", "ACTIVE,SSID", "dev", "wifi"], timeout=10)
+    if rc == 0:
+        for line in text.splitlines():
+            f = _nm_fields(line)
+            if len(f) >= 2 and f[0] == "yes":
+                ssid = f[1]
+                break
+    ip = ""
+    try:
+        addrs = subprocess.run(["hostname", "-I"], capture_output=True, text=True, timeout=3).stdout.split()
+        ip = next((a for a in addrs if "." in a and not a.startswith("127.")), "")
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return {"ssid": ssid, "ip": ip}
+
+
+def net_check(ssid, psk) -> str:
+    """Why this network name / password can't be used, or "" when they can. Checked before nmcli sees them."""
+    if not isinstance(ssid, str) or not isinstance(psk, str):
+        return "the network name and password must be text"
+    raw = ssid.encode("utf-8")
+    if not raw or len(raw) > 32:
+        return "enter the network name (up to 32 characters)"
+    if any(ord(ch) < 32 for ch in ssid + psk):
+        return "the network name or password has a character Wi-Fi doesn't allow"
+    if ssid.startswith("-"):
+        return "that network name can't be joined from here; use the admin page"   # would read as an nmcli option
+    if psk and not 8 <= len(psk.encode("utf-8")) <= 64:
+        return "a Wi-Fi password is 8 to 63 characters"
+    return ""
+
+
+def net_explain(rc: int, text: str, ssid: str, psk: str) -> str:
+    """nmcli's failure in plain words, with the password never repeated."""
+    if psk:
+        text = text.replace(psk, "(password)")
+    low = text.lower()
+    if rc == 124:
+        return f"{ssid} didn't answer in time. Move the Scanner closer to the router and try again."
+    if rc == 127:
+        return text
+    if "not authorized" in low or "insufficient privileges" in low:
+        return "This computer doesn't let the scanner software change Wi-Fi (it isn't running as root)."
+    if "no network with ssid" in low:
+        return f"The Scanner can't see {ssid} from where it is. Check the name, or move it closer to the router."
+    if "secrets were required" in low or "psk" in low or "password" in low or "authentication" in low:
+        return f"Couldn't join {ssid}: check the password."
+    last = (text.splitlines() or ["no reason given"])[-1].strip()
+    return f"Couldn't join {ssid}: {last[:160]}"
+
+
+def net_report(scan: bool = False, msg: str = "", ok: "bool | None" = None) -> None:
+    """Send the phone a {"t":"net"} line: what the Pi is on now, and (scan) the networks it can see."""
+    doc = dict(net_current())
+    if scan:
+        _nm(["radio", "wifi", "on"], timeout=10)          # a fresh image can come up with the radio soft-blocked
+        rc, text = _nm(["-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "dev", "wifi", "list", "--rescan", "yes"], timeout=30)
+        doc["nets"] = net_parse_scan(text) if rc == 0 else []
+        if rc != 0 and not msg:
+            msg, ok = "Couldn't look for networks: " + ((text.splitlines() or ["no reason given"])[-1][:160]), False
+    if msg:
+        doc["msg"] = msg
+    if ok is not None:
+        doc["ok"] = ok
+    if os.path.exists("/etc/systemd/system/wavelens-admin.service"):
+        port = os.environ.get("WAVELENS_ADMIN_PORT", "8080")
+        doc["admin"] = int(port) if port.isdigit() else 8080
+    emit({"t": "net", **doc})
+
+
+def net_join(ssid: str, psk: str, hidden: bool = False) -> None:
+    why = net_check(ssid, psk)
+    if why:
+        net_report(msg=why[0].upper() + why[1:] + ".", ok=False)
+        return
+    wait = NET_JOIN_GAP_S - (time.time() - NET["last_join"])
+    if wait > 0:
+        time.sleep(wait)
+    NET["last_join"] = time.time()
+    print(f"bridge: wifi: the phone asked to join {ssid!r}", file=sys.stderr)        # never the password
+    args = ["--wait", "45", "dev", "wifi", "connect", ssid]
+    if psk:
+        args += ["password", psk]
+    if hidden:
+        args += ["hidden", "yes"]
+    rc, text = _nm(args, timeout=60)
+    _ADMIN["at"] = 0.0                                   # the hardware line's admin address is stale now
+    if rc == 0:
+        cur = {}
+        for _ in range(10):                              # the address can arrive a moment after the join
+            cur = net_current()
+            if cur["ip"]:
+                break
+            time.sleep(1)
+        print(f"bridge: wifi: joined {ssid!r}" + (f", address {cur.get('ip')}" if cur.get("ip") else ""), file=sys.stderr)
+        net_report(msg=f"Joined {ssid}.", ok=True)
+        hello()
+    else:
+        msg = net_explain(rc, text, ssid, psk)
+        print(f"bridge: wifi: join {ssid!r} failed (nmcli {rc})", file=sys.stderr)
+        net_report(msg=msg, ok=False)
+
+
+def net_command(cmd: dict) -> None:
+    """{"c":"net"} from the phone. Scans and joins take seconds, so they run on their own thread, one at a time."""
+    v = str(cmd.get("v") or "status")
+    if not NET_ON:
+        emit({"t": "net", "ssid": "", "ip": "", "ok": False,
+              "msg": "Wi-Fi setup from the app is turned off on this Scanner (WAVELENS_WIFI_SETUP=0)."})
+        return
+    if shutil.which("nmcli") is None:
+        emit({"t": "net", "ssid": "", "ip": "", "ok": False,
+              "msg": "This computer doesn't use NetworkManager, so its Wi-Fi can't be set from the app."})
+        return
+    if v not in ("status", "scan", "join"):
+        emit({"t": "net", "ok": False, "msg": f"Unknown Wi-Fi request: {v[:20]}"})
+        return
+    with NET["lock"]:
+        if NET["busy"]:
+            emit({"t": "net", "busy": NET["busy"], "msg": "Still working on the last request…"})
+            return
+        NET["busy"] = v
+
+    def work():
+        try:
+            if v == "join":
+                emit({"t": "net", "busy": "join", "msg": f"Joining {str(cmd.get('ssid') or '')[:32]}… this takes up to a minute."})
+                net_join(cmd.get("ssid") or "", cmd.get("psk") or "", bool(cmd.get("hidden")))
+            else:
+                net_report(scan=(v == "scan"))
+        except Exception as e:                           # noqa: BLE001  a Wi-Fi helper must never take the bridge down
+            print(f"bridge: wifi: {type(e).__name__}: {e}", file=sys.stderr)
+            emit({"t": "net", "ok": False, "msg": "Something went wrong on the Scanner; try again."})
+        finally:
+            with NET["lock"]:
+                NET["busy"] = ""
+    threading.Thread(target=work, daemon=True).start()
+
+
+class RxLines:
+    """Commands from the phone. One per write is the rule, and every command but one fits a write. A Wi-Fi
+    join with a long name and password can be split by the phone (it sends MTU-sized pieces, newline at the
+    end), so a piece that isn't a whole command is kept until the rest arrives; a stale half is dropped."""
+    STALE_S = 5.0
+    MAX = 2048
+
+    def __init__(self):
+        self.data, self.at = b"", 0.0
+
+    def feed(self, data: bytes, now: "float | None" = None) -> "dict | None":
+        now = time.monotonic() if now is None else now
+        if self.data and now - self.at > self.STALE_S:
+            self.data = b""
+        whole = self.data + data
+        self.data = b""
+        if len(whole) > self.MAX:
+            return None
+        try:
+            cmd = json.loads(whole.decode("utf-8", "replace").strip() or "{}")
+        except json.JSONDecodeError:
+            if not whole.endswith(b"\n"):               # a whole line that doesn't parse is just dropped
+                self.data, self.at = whole, now
+            return None
+        return cmd if isinstance(cmd, dict) else None
+
+
+def hello() -> None:
+    hw = hw_inventory()
+    # the spectrum reach the phone may ask for: the whole HackRF range while one is on the bus, else what
+    # the RTL-SDR sweeps cover (24–1766 MHz is the dongle's limit; the configured ranges are what is drawn)
+    if hw["hackrf"] == "ok" and HACKRF_ON:
+        spec = [1, 6000]
+    elif SWEEP_RANGES:
+        spec = [round(min(lo for lo, _ in SWEEP_RANGES)), round(max(hi for _, hi in SWEEP_RANGES))]
+    else:
+        spec = None
+    msg = {"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""),
+           "caps": sorted(set(CAPS)), "hw": hw, "region": REGION["code"], "ver": VERSION, "update": update_info()}
+    if "area" in CAPS:
+        msg["area"] = area_info()
+    if HUB:
+        msg["spotters"] = HUB.info()
+        msg["peer"] = HUB.phone_spotter          # what the Pi believes; the phone corrects it if wrong
+        pr = HUB.phone_role()
+        if pr:
+            msg["phone_spotter"] = pr        # the job for the Spotter the phone holds over Bluetooth
+    if spec:
+        msg["spec"] = spec
+    emit(msg)
+    write_run_status(hw)
+    if PACK_PROBLEMS and not state.get("problems_said"):     # once per start, when a phone is there to read it
+        state["problems_said"] = True
+        emit({"t": "status", "msg": "left out at start: " + "; ".join(PACK_PROBLEMS), "band": state["band"], "mode": state["mode"]})
+    if hw["line"] != state.get("hw_line"):          # hello repeats every 15 s (the app's ping): say it when it changes
+        state["hw_line"] = hw["line"]
+        print(f"bridge: hardware: {hw['line']}", file=sys.stderr)
+        if hw["missing"]:
+            emit({"t": "status", "msg": "hardware: " + "; ".join(hw["missing"]), "band": state["band"], "mode": state["mode"]})
+
+
+
+# ---------------------------------------------------------------- RadioReference overlay (Lab)
+
+# Agency names as the people who use them say them: "Hillsborough County Sheriff's Office" → HCSO,
+# "Largo Police Department" → LPD, "Clearwater Fire Rescue" → CFR. Initials of the place words
+# plus the office's usual suffix; applied to headline names only, the full text stays in the extras.
+_PLACE = r"\b([A-Za-z][\w.&'-]*(?: [A-Za-z][\w.&'-]*){0,3}?)"
+_ABBR = [   # FCC licensee names are often ALL CAPS, so these ignore case
+    (re.compile(_PLACE + r" County Sheriff'?s? (?:Office|Department)\b", re.I), "CSO"),
+    (re.compile(_PLACE + r" Sheriff'?s? (?:Office|Department)\b", re.I), "SO"),
+    (re.compile(_PLACE + r" Police Department\b", re.I), "PD"),
+    (re.compile(_PLACE + r" Fire Rescue\b", re.I), "FR"),
+    (re.compile(_PLACE + r" Fire Department\b", re.I), "FD"),
+    (re.compile(_PLACE + r" Emergency Medical Services\b", re.I), "EMS"),
+    (re.compile(_PLACE + r" County Public Schools\b", re.I), "CPS"),
+    (re.compile(_PLACE + r" Public Schools\b", re.I), "PS"),
+]
+_SKIP_WORDS = {"of", "the", "and", "de", "la", "at", "city", "town", "village"}
+
+
+def abbrev(text: str) -> str:
+    def initials(place: str) -> str:
+        return "".join(w[0] for w in place.split() if w.lower() not in _SKIP_WORDS).upper()
+    out = text
+    for rx, suffix in _ABBR:
+        out = rx.sub(lambda m: initials(m.group(1)) + suffix, out)
+    return out
+
+
+# Tag column of a RadioReference export → the agency-type labels the FCC pack uses (so the
+# "keys up nearby" agency chips and the law-enforcement switch work from this table too).
+RR_TAG_AGENCY = [
+    (("law",), "Law enforcement"), (("corrections",), "Law enforcement"), (("fire",), "Fire / rescue"),
+    (("ems",), "EMS / ambulance"), (("hospital",), "Hospital / medical"), (("schools", "school"), "School / campus"),
+    (("aircraft", "airport"), "Airport"), (("public works",), "Local government"), (("security",), "Security company"),
+    (("transportation", "transit"), "Transit / roads"), (("utilities", "utility"), "Utility"),
+    (("federal", "military"), "Federal"), (("emergency ops", "emergency"), "911 / emergency management"),
+    (("interop", "multi-"), "Public safety"), (("railroad",), "Transit / roads"),
+    (("ham",), "Amateur radio"), (("media",), "Business"), (("business",), "Business"),
+]
+# Mode column → how to listen (the app's Listen uses it instead of guessing from the band).
+RR_LISTEN = {"fm": "fm", "fmn": "fm", "am": "am", "dmr": "dmr", "dmre": "dmr", "p25": "p25", "p25e": "p25",
+             "nxdn48": "nxdn", "nxdn96": "nxdn", "nxdn": "nxdn", "project 25": "p25", "telm": "fm",   # telemetry/paging: FM, the pager decoder reads it
+             "edacs": "trunked", "ltr": "trunked"}
+RR_PUBLIC = ("county", "city", "sheriff", "police", "law", "state", "fire", "ems", "town", "village", "government",
+             "public safety")     # "Michigan's Public Safety Communications System (MPSCS)" names no state or county
+RR_NEAR_KM = 80.0      # a trunked site this close to the phone counts as local when several systems share a frequency
+
+
+class RrPack:
+    """Frequency → what RadioReference says is there, from one or more of its CSV exports
+    (columns: Frequency Output, Frequency Input, FCC Callsign, Agency/Category, Description, Alpha Tag,
+    PL Output Tone, PL Input Tone, Mode, Class Station Code, Tag). Both the output and the input
+    frequency of a pair are indexed: a hit on the input side is a mobile or handheld keying up nearby.
+    The data is the user's own export, loaded from the Pi; nothing from it is shipped or stored.
+    Wavelens Lab only, by use: the Play app never asks for Listen and shows a name like any other."""
+
+    def __init__(self, paths, counties=()):
+        """paths in order of preference: the county exports first, then a statewide one, then nationwide.
+        A statewide export carries a County column: rows for the given counties (or "Statewide") rank
+        ahead of other counties' rows, which stay usable for a drive out of the area."""
+        import csv
+        self.rows = []          # (mhz, side, row); row["_rank"] orders competing matches
+        # Trunked-site control channels: RadioReference marks them "851.0125c" (primary) / "851.0125a"
+        # (alternate), or a column / description says "control". [(mhz, primary, row)]
+        self.controls = []
+        self.sites = []         # site-export rows: dicts with "_freqs" [(mhz, flag)] in RadioReference's order
+        self.talkgroups = {}    # decimal talkgroup → [(system, alpha, description, mode, tag)]
+        want = {c.strip().lower() for c in counties if c.strip()}
+        for rank, path in enumerate(paths):
+            with open(path, encoding="utf-8-sig", newline="") as f:
+                head = [h.strip() for h in next(csv.reader([f.readline()]), [])]
+                f.seek(0)
+                if "Frequencies" in head and ("Site Dec" in head or "Site Hex" in head):
+                    self._load_sites(csv.reader(f), rank, want)
+                    continue
+                if "Decimal" in head and "Alpha Tag" in head:
+                    self._load_talkgroups(csv.DictReader(f))
+                    continue
+                for r in csv.DictReader(f):
+                    row = {k.strip(): (v or "").strip() for k, v in r.items() if k}
+                    # A nationwide export names the agency in its own first column and leaves Agency/Category empty.
+                    if not row.get("Agency/Category") and row.get("Nationwide Agency"):
+                        row["Agency/Category"] = row["Nationwide Agency"]
+                    county = row.get("County", "")
+                    row["_rank"] = rank * 2 + (0 if not county or county.lower() == "statewide" or county.lower() in want else 1)
+                    out, flag = rr_freq(row.get("Frequency Output"))
+                    inp, _ = rr_freq(row.get("Frequency Input"))
+                    if flag or rr_says_control(row):
+                        if 24.0 <= out <= 6000.0:
+                            self.controls.append((out, flag != "a", row))
+                    if not row.get("Frequency Output"):
+                        # A site export: one row per site, its frequencies in several cells ("851.0125c, 852.5375 …").
+                        for k, v in row.items():
+                            if k.startswith("_"):
+                                continue
+                            for tok in re.split(r"[\s,;]+", v or ""):
+                                f, fl = rr_freq(tok)
+                                if fl and 24.0 <= f <= 6000.0:
+                                    self.controls.append((f, fl != "a", row))
+                    if 24.0 <= out <= 6000.0:
+                        self.rows.append((out, "output", row))
+                    if 24.0 <= inp <= 6000.0:      # a mangled input (one export had 46053250.0) is skipped
+                        self.rows.append((inp, "input", row))
+        self.rows.sort(key=lambda t: t[0])
+        self.keys = [t[0] for t in self.rows]
+        seen, uniq = set(), []
+        for f, primary, row in sorted(self.controls, key=lambda c: (not c[1], c[2].get("_rank", 9), c[0])):
+            if round(f, 4) not in seen:
+                seen.add(round(f, 4)); uniq.append((f, primary, row))
+        self.controls = uniq
+
+    def _load_sites(self, reader, rank: int, want: set) -> None:
+        """A trunked-sites export: System, SID, Counties, [RFSS, Site Dec, Site Hex, NAC …], Description,
+        County Name, Lat, Lon, Range, then the site's frequencies, one per cell, "c" on control channels.
+        The middle columns vary by system type, so a row is read from its end: the frequencies are the
+        trailing run of cells, and Range, Lon, Lat, County, Description sit just before them."""
+        next(reader, None)
+        F = re.compile(r"^\s*\d{2,4}\.\d{3,}[ca]?\s*$", re.I)
+        for cells in reader:
+            cells = [c.strip() for c in cells]
+            i = len(cells)
+            while i > 3 and F.match(cells[i - 1]):
+                i -= 1
+            freqs = [rr_freq(c) for c in cells[i:]]
+            freqs = [(fq, fl) for fq, fl in freqs if 24.0 <= fq <= 6000.0]
+            if not freqs or len(cells) < 4:
+                continue
+            j = i
+            rng = ""
+            if j > 0 and re.match(r"^\d+$", cells[j - 1]):
+                rng, j = cells[j - 1], j - 1
+            lon, lat = (cells[j - 1], cells[j - 2]) if j >= 2 else ("", "")
+            county, desc = (cells[j - 3] if j >= 3 else ""), (cells[j - 4] if j >= 4 else "")
+            system = cells[0]
+            row = {"Agency/Category": system, "System Name": system, "Description": desc or "?", "County": county,
+                   "Lat": lat, "Lon": lon, "Range": rng, "Mode": rr_system_kind(system), "Tag": "TRS", "_sid": cells[1],
+                   "_rank": rank * 2 + (0 if county.lower() in want or not want else 1), "_freqs": freqs, "_site": True}
+            self.sites.append(row)
+            if row["Mode"] == "ltr":
+                continue                     # LTR / Type II: no control channel dsd-fme can follow
+            for fq, fl in freqs:
+                if fl:
+                    self.controls.append((fq, fl != "a", row))
+                # labels read the frequency from the row: give each channel its own view of the site row
+                self.rows.append((fq, "output", {**row, "Frequency Output": f"{fq:.5f}"}))
+
+    def _load_talkgroups(self, reader) -> None:
+        for r in reader:
+            try:
+                dec = int((r.get("Decimal") or "").strip())
+            except ValueError:
+                continue
+            self.talkgroups.setdefault(dec, []).append(((r.get("System") or "").strip(), (r.get("Alpha Tag") or "").strip(),
+                                                        (r.get("Description") or "").strip(), (r.get("Mode") or "").strip(),
+                                                        (r.get("Tag") or "").strip()))
+
+    def talkgroup(self, dec: int, system: str = ""):
+        """(alpha, description, mode, tag) for a talkgroup, preferring the system being followed."""
+        hits = self.talkgroups.get(dec) or []
+        if not hits:
+            return None
+        sysl = system.lower()
+        own = [h for h in hits if sysl and h[0].lower() == sysl]
+        if own:
+            return own[0][1:]
+        return hits[0][1:] if len({h[0] for h in hits}) == 1 else None
+
+    def _near(self, row: dict) -> float:
+        """Distance (km) from the phone's last position to a site row with Lat/Lon, else a large number.
+        Sites within RR_NEAR_KM rank as local; a 'West Palm' or 'Fortville' site sharing a frequency does not."""
+        try:
+            if state.get("lat") is None or not row.get("Lat"):
+                return 9e9
+            return haversine_km(float(state["lat"]), float(state["lon"]), float(row["Lat"]), float(row["Lon"]))
+        except (TypeError, ValueError):
+            return 9e9
+
+    def _order(self, row: dict, d_mhz: float) -> tuple:
+        """Sort key for competing matches: a nearby site first (when the phone shares its position), then
+        the --rr-county / county-file rank, then the closest frequency."""
+        km = self._near(row)
+        return (0 if km <= RR_NEAR_KM else 1 if km < 9e9 else 2, row.get("_rank", 9), d_mhz)
+
+    def site_at(self, mhz: float, tol_mhz: float = 0.0065):
+        """The site-export row that lists this frequency (any channel, control or not): the local one when
+        several systems share it, else None."""
+        best = None
+        for row in self.sites:
+            d = min((abs(fq - mhz) for fq, _ in row["_freqs"]), default=9.0)
+            if d <= tol_mhz:
+                k = self._order(row, d)
+                if best is None or k < best[0]:
+                    best = (k, row)
+        return best[1] if best else None
+
+    def control_at(self, mhz: float, tol_mhz: float = 0.0065):
+        """The control-channel entry at this frequency (the local system's when several share it), or None."""
+        best = None
+        for f, primary, row in self.controls:
+            d = abs(f - mhz)
+            if d <= tol_mhz:
+                k = self._order(row, d) + (not primary,)
+                if best is None or k < best[0]:
+                    best = (k, (f, primary, row))
+        return best[1] if best else None
+
+    @staticmethod
+    def _freq(hit) -> float:
+        _, side, r = hit
+        return rr_freq(r.get("Frequency Input") if side == "input" else r.get("Frequency Output"))[0]
+
+    def lookup(self, mhz: float, tol_khz: float):
+        half = max(tol_khz, 12.5) / 1000.0 / 2 + 0.004   # + the dongle's own error (10 ppm at 400 MHz)
+        lo = bisect.bisect_left(self.keys, mhz - half)
+        hi = bisect.bisect_right(self.keys, mhz + half)
+        hits = [(abs(f - mhz), side, row) for f, side, row in self.rows[lo:hi]]
+        # local first: sites near the phone's position, then the preferred counties, then by distance in MHz
+        hits.sort(key=lambda h: self._order(h[2], h[0]))
+        return hits
+
+    @staticmethod
+    def agency(row: dict) -> str:
+        tag = (row.get("Tag") or "").lower()
+        if tag == "trs":                     # a trunked site: judge by whose system it is
+            who = (row.get("Agency/Category") or "").lower()
+            return "Public safety" if any(k in who for k in RR_PUBLIC) else "Business"
+        if tag == "data":
+            return "Data / telemetry"
+        for keys, label in RR_TAG_AGENCY:
+            if any(k in tag for k in keys):
+                return label
+        who = (row.get("Agency/Category") or "").lower()       # "Other", blank: judge by the agency's name
+        if any(k in who for k in ("sheriff", "police", "law enforcement", "highway patrol")):
+            return "Law enforcement"
+        if "fire" in who:
+            return "Fire / rescue"
+        return "Business" if tag else "Licensed"
+
+    def label(self, mhz: float, tol_khz: float = 12.5):
+        """(name, cat, conf, extras) like FccPack.label, or None. Nearest entry wins; several in a wide
+        bin are listed instead of named, as the FCC pack does."""
+        hits = self.lookup(mhz, tol_khz)
+        if not hits:
+            return None
+        best = min(r["_rank"] for _, _, r in hits)
+        hits = [h for h in hits if h[2]["_rank"] == best]        # the most local source that knows the frequency
+        hits.sort(key=lambda t: t[0])
+        distinct = {(r.get("Alpha Tag") or r.get("Description")) for _, _, r in hits}
+        if len(distinct) > 1 and tol_khz > 25:
+            tags = ", ".join(sorted(distinct)[:4]) + (" …" if len(distinct) > 4 else "")
+            return (f"{len(distinct)} known channels in this {tol_khz:.0f} kHz: {tags}", "UNKNOWN", "POSSIBLE",
+                    {"rr_channels": "; ".join(sorted(distinct)[:8]),
+                     "ambiguous": f"a {tol_khz:.0f} kHz sweep bin spans several channels; an RTL-SDR sweep at 12.5 kHz names the one"})
+        _, side, r = hits[0]
+        agency, desc, alpha = r.get("Agency/Category", ""), r.get("Description", ""), r.get("Alpha Tag", "")
+        mode, tag, call = r.get("Mode", ""), r.get("Tag", ""), r.get("FCC Callsign", "")
+        ag = self.agency(r)
+        trs = tag.upper() == "TRS"
+        if ag == "Amateur radio":
+            agency = f"Amateur {agency}"
+        agency, desc = abbrev(agency), abbrev(desc)
+        # RadioReference splits "Pinellas County" / "Sheriff - MDT": fold that into PCSO · MDT, and a city's
+        # "Police …" into <initials>PD …
+        m = re.match(r"(?i)^sheriff'?s?(?: office)?\s*[-–:·]?\s*(.*)$", desc)
+        if m and agency.lower().endswith(" county"):
+            agency, desc = abbrev(agency + " Sheriff's Office"), m.group(1).strip()
+        m = re.match(r"(?i)^police(?: department)?\s*[-–:·]?\s*(.*)$", desc)
+        if m and not trs and " " not in agency.strip() or (m and agency.lower().startswith(("city of", "town of"))):
+            agency, desc = abbrev(agency + " Police Department"), m.group(1).strip()
+        who = agency if trs or not desc else f"{agency} · {desc}"
+        if alpha and alpha.strip().lower() not in who.lower() and who.lower().replace(" · ", " ") not in alpha.lower():
+            who += f" ({alpha.strip()})"     # the alpha tag is the channel's everyday name: in the headline
+        # The name is who: agency and channel description (alpha tag, mode, tone go in the extras, which the
+        # app shows on the card's second line). The input side of a pair says so: a radio keying up nearby.
+        if trs:
+            name, conf = f"{agency} · {desc} (trunked site)", "POSSIBLE"
+        elif side == "input":
+            name, conf = f"{who} · keying up nearby", "LIKELY"
+        else:
+            name, conf = who, "POSSIBLE"
+        x = {"rr_agency": agency, "rr_description": desc, "rr_tag": tag, "rr_mode": mode, "agency": ag,
+             "listen": RR_LISTEN.get(mode.lower(), "auto"), "lic_mhz": f"{self._freq(hits[0]):.5f}"}
+        if alpha: x["rr_alpha"] = alpha
+        if r.get("County"): x["rr_county"] = r["County"]
+        if call: x["call_sign"] = call
+        tone = r.get("PL Output Tone") if side == "output" else r.get("PL Input Tone")
+        if tone: x["rr_tone"] = tone
+        if mode.lower().endswith("e") and mode.lower() in ("dmre", "p25e"):
+            x["encrypted"] = "RadioReference marks this channel encrypted: nothing to hear"
+        if side == "input":
+            x["repeater_input"] = "the mobile/handheld side of a repeater pair — heard only from close by"
+        elif trs:
+            x["trunked_site"] = "a trunked system's site channel; Follow system from the Companion screen with its control channel"
+        else:
+            x["base_output"] = "the repeater or base output: heard for miles, not a sign of anything nearby"
+        return name, "UNKNOWN", conf, x
+
+
+RR: "RrPack | None" = None
+
+
+def rr_freq(v):
+    """'851.01250c' → (851.0125, 'c'); '453.2' → (453.2, ''); anything else → (0.0, '')."""
+    m = re.match(r"^\s*(\d{2,4}\.\d+)\s*([ca])?\*?\s*$", str(v or ""), re.I)
+    if not m:
+        return 0.0, ""
+    return float(m.group(1)), (m.group(2) or "").lower()
+
+
+def rr_system_kind(system: str) -> str:
+    """The system type RadioReference puts in a trunked system's name: "(EDACS)", "(P25)", "Duke Energy P25",
+    "(Capacity Plus)", "(470 Connect Plus)", "(DMR)", "(NXDN)", "(LTR)". Unknown → "" (tried as P25/DMR)."""
+    s = system.lower()
+    if "edacs" in s:
+        return "edacs"
+    if "p25" in s or "project 25" in s:
+        return "p25"
+    if "dmr" in s or "capacity plus" in s or "connect plus" in s or "trbo" in s:
+        return "dmr"
+    if "nxdn" in s:
+        return "nxdn"
+    if "type ii" in s or "smartnet" in s or "smartzone" in s or "motorola" in s:
+        return "moto"
+    if "ltr" in s:
+        return "ltr"
+    return ""
+
+
+def rr_says_control(row: dict) -> bool:
+    """A column or the description naming the channel a control channel ("Control", "CC", "Use: c")."""
+    for k, v in row.items():
+        if k.startswith("_") or not isinstance(v, str):
+            continue
+        kl, vl = k.lower(), v.strip().lower()
+        if kl in ("control", "control channel", "cc") and vl in ("1", "y", "yes", "true", "x", "c", "primary", "alternate", "a"):
+            return True
+        if kl in ("use", "type", "channel type", "usage") and (vl in ("c", "a", "cc") or "control" in vl):
+            return True
+    d = f"{row.get('Description', '')} {row.get('Alpha Tag', '')}".lower()
+    return bool(re.search(r"\bcontrol( channel)?\b|\bcntl\b|\bctrl\b", d))
+
+
+NOT_PUBLIC_WORDS = ("utility", "energy", "power", "electric", "gas", "water", "business", "security", "transit",
+                    "railroad", "airport", "aviation")
+
+
+def system_public(row) -> bool:
+    """Is this RadioReference row a public-safety system (one that can carry police / fire / EMS talkgroups)?
+    Unknown (no row) counts as public: an unlisted system is not excluded on a guess."""
+    if row is None:
+        return True
+    who = row.get("Agency/Category") or row.get("System Name") or ""
+    return is_public_system(who) and not is_federal(who) and not any(w in who.lower() for w in NOT_PUBLIC_WORDS)
+
+
+def rr_doubtful_site(row: dict) -> bool:
+    """The list's site for a frequency is a guess when it is far from the phone, or — with no position
+    shared — not in the configured county: several sites of a statewide system reuse a frequency, and
+    naming the wrong one ("Holmes (North)" for a carrier heard in Pinellas) is worse than naming none."""
+    if not RR:
+        return False
+    km = RR._near(row)
+    if km < 9e9:
+        return km > RR_NEAR_KM
+    rank = row.get("_rank", 9)
+    return rank >= 9 or rank % 2 == 1          # odd: the row's county is not one of --rr-county
+
+
+def rr_site(row: dict):
+    """(agency, site, kind) for a control-channel row, named the way the rest of the bridge names it."""
+    agency = abbrev(row.get("Agency/Category") or row.get("System Name") or row.get("System") or "?")
+    site = abbrev(row.get("Description") or row.get("Site Name") or row.get("Site") or "?")
+    return agency, site, trunk_kind(row.get("Mode") or row.get("System Type") or "p25") or "p25"
+
+
+FEDERAL_WORDS = ("united states", "air force", "army", "navy", "marine corps", "coast guard",
+                 "federal", "u.s.", "usaf", "national guard", "department of defense")
+
+
+def is_federal(who: str) -> bool:
+    return any(k in who.lower() for k in FEDERAL_WORDS)
+
+
+def is_public_system(who: str) -> bool:
+    w = who.lower()
+    return any(k in w for k in RR_PUBLIC) or any(k in w for k in ("county", "city of", "local government", "sheriff", "police"))
+
+
+def trunk_auto_ok(x: dict) -> bool:
+    """Follow takes a trunked system by itself only when it is public safety — never military / federal, and
+    never a business system (FleetTalk, BCI, a hotel, a utility), even one your talkgroups export covers.
+    Lock onto the nearest system is unaffected: it ranks, it doesn't exclude."""
+    raw = ""
+    if RR:
+        try:
+            lic = float(x.get("lic_mhz") or 0)
+        except ValueError:
+            lic = 0.0
+        row = (RR.control_at(lic) or (None, None, None))[2] if lic else None
+        row = row or (RR.site_at(lic) if lic else None)
+        raw = (row.get("Agency/Category") or "") if row else ""
+    who = raw or x.get("rr_agency") or ""
+    if is_federal(who):
+        return False
+    if x.get("agency") == "Business" or not is_public_system(who) and x.get("agency") != "Public safety":
+        return False
+    # "Duke Energy P25" passes the name test ("state"? no — but is_public_system is loose); the utility tag
+    # and a far-away site both say no.
+    if row is not None and RR._near(row) < 9e9 and RR._near(row) > RR_NEAR_KM:
+        return False
+    tag = (x.get("rr_tag") or "").lower()
+    if any(w in (x.get("agency") or "").lower() for w in ("utility", "business", "security", "transit", "railroad")):
+        return False
+    return True
+
+
+def rr_controls_ranked(limit: int = 6):
+    """RadioReference control channels, best first: ones the sweep has heard lately, then the nearest site
+    (when the phone shares its position and the export has coordinates), then the most local export."""
+    if not RR or not RR.controls:
+        return []
+    now = time.time()
+    heard = {round(m, 4): v for m, v in TRUNK["seen"].items() if now - v[1] <= TRUNK_SEEN_S}
+    lat, lon = state.get("lat"), state.get("lon")
+    tg_systems = {h[0].lower() for hs in RR.talkgroups.values() for h in hs}
+
+    def key(c):
+        f, primary, row = c
+        h = any(abs(f - m) <= 0.0065 for m in heard)
+        d = 1e9
+        if lat is not None and lon is not None:
+            try:
+                la = float(row.get("Lat") or row.get("Latitude") or "x")
+                lo = float(row.get("Lon") or row.get("Long") or row.get("Longitude") or "x")
+                d = haversine_km(lat, lon, la, lo)
+            except ValueError:
+                pass
+        who = (row.get("Agency/Category") or "").lower()
+        federal = is_federal(who)
+        public = not federal and is_public_system(who)
+        # Inside a site's own coverage (RadioReference's Range, miles; 25 if blank) every site counts as
+        # local, and among local sites the public-safety system goes before a utility or a hotel. Many
+        # exports place every site at its county's centre, so distance alone is a poor tiebreak.
+        try:
+            reach = float(row.get("Range") or 25) * 1.609
+        except ValueError:
+            reach = 40.0
+        local = d <= reach
+        kind = {"p25": 0, "": 0, "dmr": 1, "nxdn": 2, "edacs": 3}.get(row.get("Mode", "") if row.get("_site") else trunk_kind(row.get("Mode") or ""), 2)
+        listed = (row.get("Agency/Category") or "").lower() in tg_systems   # a system your talkgroups export covers
+        return (federal, not h, not local, not public, not listed, kind, round(d / 10.0), not primary, row.get("_rank", 9), d)
+    out, per = [], {}
+    for c in sorted(RR.controls, key=key):
+        k = (c[2].get("Agency/Category"), c[2].get("Description"))
+        if per.get(k, 0) >= 2:
+            continue                         # two per site, so the next site gets a turn
+        per[k] = per.get(k, 0) + 1
+        out.append(c)
+        if len(out) >= limit:
+            break
+    return out
+
+# ---------------------------------------------------------------- local FCC license pack
+
+class FccPack:
+    """Frequency → licensee lookup built by ../tools/fcc_local_pack.py.
+
+    A hit at 453.21 MHz becomes "Licensed: Example County Sheriff's Office · WQZZ001 · public
+    safety" with a category hint from the licensee's name and radio service. When the phone
+    has shared its position (opt-in), the nearest licensed site's distance is included and
+    the nearest licensee wins when several share a frequency.
+    """
+
+    def __init__(self, path: str):
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        self.entries = d.get("entries", [])
+        self.keys = [e["mhz"] for e in self.entries]           # sorted by the builder
+        self.area = d.get("area", {})
+
+    def lookup(self, mhz: float, tol_khz: float = 12.5):
+        """Entries whose assigned frequency (or band) covers mhz ± tol. Nearest-first when a position is known."""
+        lo = bisect.bisect_left(self.keys, mhz - 5.0)
+        hits = []
+        for e in self.entries[lo:]:
+            if e["mhz"] > mhz + 5.0:
+                break
+            half = max(e.get("bw_khz") or 12.5, tol_khz) / 2000.0
+            if e.get("mhz_hi"):
+                ok = e["mhz"] - half <= mhz <= e["mhz_hi"] + half
+            else:
+                ok = abs(e["mhz"] - mhz) <= half
+            if ok:
+                hits.append(e)
+        lat, lon = state.get("lat"), state.get("lon")
+        if lat is not None and lon is not None and time.time() - state.get("pos_at", 0) < 120:
+            def dist(e):
+                ds = [haversine_km(lat, lon, la, lo_) for la, lo_ in e.get("sites", [])]
+                return min(ds) if ds else 1e9
+            hits.sort(key=dist)
+            return [(e, dist(e)) for e in hits]
+        return [(e, None) for e in hits]
+
+    def label(self, mhz: float, tol_khz: float = 12.5):
+        """(name, cat, conf, extras) for a carrier, or None when nothing is licensed there.
+
+        What a licence record can and can't say, so that nothing here raises a false alarm:
+        - The category is never a device type the app alerts on. A licence says whose radio is on
+          that frequency, not that it is a body cam, a camera or a traffic sensor; those categories
+          are mapped away even when an older pack carries them. Low-threat hints (vehicle, IoT)
+          are kept for the list colouring.
+        - A repeater input (station class MO: mobiles and handhelds transmit there) is LIKELY to be
+          a radio nearby. A base or repeater output is heard from miles away: POSSIBLE, and said so.
+        - A wide sweep bin (the HackRF's 500 kHz) can hold dozens of 12.5 kHz land-mobile channels.
+          With several licensees in the bin no single one is named: the hit says how many, and which
+          agency types, at POSSIBLE. Only a narrow bin (rtl_power at 12.5 kHz) or a lone match names
+          the licensee.
+        """
+        hits = self.lookup(mhz, tol_khz)
+        if not hits:
+            return None
+        agencies = sorted({agency_of(h) for h, _ in hits})
+        if len(hits) > 1 and tol_khz > 25:
+            kinds = ", ".join(agencies[:4]) + (" …" if len(agencies) > 4 else "")
+            name = f"Licensed radio nearby · {len(hits)} licensees in this {tol_khz:.0f} kHz ({kinds})"
+            x = {"agency": kinds, "licensees": "; ".join(f"{h['name'] or h['call']} ({h['call']})" for h, _ in hits[:6]),
+                 "ambiguous": (f"a {tol_khz:.0f} kHz sweep bin spans many {12.5:g} kHz channels; an RTL-SDR sweep "
+                               "at 12.5 kHz names the licensee")}
+            return name, "UNKNOWN", "POSSIBLE", x
+        # A mobile/handheld (station class MO…) frequency is a repeater input: radios transmit there
+        # toward the tower, and a low-power handheld is only audible from close by. Prefer that reading.
+        inputs = [(h, dd) for h, dd in hits if is_input(h)]
+        e, d = (inputs or hits)[0]
+        who = abbrev(e['name']) if e['name'] else e['call']
+        agency = agency_of(e)
+        # The registrant leads the name: "Example County Sheriff · law enforcement radio nearby · WQZZ001".
+        if is_input(e):
+            name, conf = f"{who} · keying up nearby", "LIKELY"
+        else:
+            name, conf = f"{who} · base / repeater (regional)", "POSSIBLE"
+        x = {"agency": agency, "licensee": e["name"], "call_sign": e["call"], "service": e["service_label"],
+             "place": e.get("place", ""), "lic_mhz": f"{e['mhz']:.5f}"}   # the licensed centre: Listen tunes it exactly
+        if is_input(e):
+            x["repeater_input"] = "a mobile or handheld transmitting up to its repeater — heard only from close by"
+        else:
+            x["base_output"] = "a base station or repeater output: heard for miles, not a sign of anything nearby"
+        if d is not None and d < 1e8:
+            x["site_km"] = f"{d:.1f}"
+        if len(hits) > 1:
+            x["other_licensees"] = "; ".join(f"{h['name'] or h['call']} ({h['call']})" for h, _ in hits[1:4])
+        cat = e.get("cat") or "UNKNOWN"
+        if cat in FCC_NO_DEVICE_CATS:
+            cat = "UNKNOWN"
+        return name, cat, conf, x
+
+
+# Categories a licence record must never assert: the app alerts on them and names a device
+# ("Body cam", "Traffic sensor", "Camera") that a licence says nothing about.
+FCC_NO_DEVICE_CATS = {"LE_GEAR", "ALPR", "CAMERA", "TRAFFIC_SENSOR", "DRONE", "TOOL", "ACOUSTIC", "TRACKER"}
+
+
+def agency_of(e: dict) -> str:
+    """Agency type stored by fcc_local_pack.py, or the radio-service label on an older pack."""
+    return e.get("agency") or e.get("service_label") or "Licensed"
+
+
+def is_input(e: dict) -> bool:
+    """FCC station class MO, MO3 … = mobile / portable units; on a repeater pair that is the input side."""
+    return str(e.get("class", "")).upper().startswith("MO")
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    r = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+FCC: "FccPack | None" = None
+
+
+def licensed_label(mhz: float, tol_khz: float):
+    """What is known to be on a frequency: the RadioReference overlay first (curated, with mode and
+    tone), then the FCC pack. Either returns (name, cat, conf, extras) or None.
+    Not in the bands the sweep skips (2.4 / 5 GHz Wi-Fi and Bluetooth): a 2.4 GHz licence does exist
+    for many agencies, but what the sweep hears there is Wi-Fi, and a morning of "11 law-enforcement
+    licensees in this bin" for the neighbour's router is worse than no label."""
+    b = band_of(mhz)
+    if b is not None and b.get("name") is None:
+        return None
+    if RR:
+        lic = RR.label(mhz, tol_khz=tol_khz)
+        if lic:
+            return lic
+    return FCC.label(mhz, tol_khz=tol_khz) if FCC else None
+HACKRF_ON = False
+
+
+# ---------------------------------------------------------------- spectrum sweeps (HackRF, rtl_power)
+
+# What a carrier in each part of 1 MHz–6 GHz most likely is, from the US frequency allocation
+# table. Energy only: a sweep sees that something is on the air, never what it says, so every
+# label is a hint (POSSIBLE) and nothing is demodulated. The phone treats these as hints only.
+#
+# First match wins, so narrow entries come before the wide bands they sit in.
+#   kind ""         report it (1 MHz buckets, at most every 2 s each)
+#   kind "persist"  report only once it is over the floor on two passes in a row (video links are
+#                   continuous; a rotating radar or a glitch shows once)
+#   kind "bg"       background: broadcast, tower and satellite downlinks, fixed navigation beacons and
+#                   radars. Everywhere, so one entry per band at most once a minute
+#   steady=(...)    the same band means two different things: a carrier still there after STEADY_N passes
+#                   in a row gets the steady label, one that comes and goes gets the burst label
+#   name None       skipped (2.4 / 5 GHz Wi-Fi and Bluetooth: everything is there)
+def B(lo, hi, name, cat="UNKNOWN", conf="POSSIBLE", kind="", steady=None):
+    return {"lo": lo, "hi": hi, "name": name, "cat": cat, "conf": conf, "kind": kind, "steady": steady,
+            "key": f"{lo:g}-{hi:g}"}
+
+
+# The website and README list these; after changing BANDS run: python3 companion/tools/band_table.py
+BANDS = [
+    # ---- skipped outright
+    B(2400, 2500, None),                              # 2.4 GHz Wi-Fi / BLE / microwave ovens
+    B(5150, 5644, None),                              # 5 GHz Wi-Fi (also airport weather radar 5600–5650)
+    B(5926, 6000, None),                              # Wi-Fi 6E
+    B(1215, 1240, None),                              # GPS L2 + long-range air-traffic radar bursts
+    B(1300, 1390, None),                              # long-range air-traffic and military radar
+    B(1400, 1427, None),                              # radio astronomy: protected, nothing should transmit
+    B(1, 26.96, None),                                # AM broadcast and HF: worldwide propagation, nothing nearby
+    B(27.41, 30, None),                               # HF (CB at 26.96–27.41 stays: a transmitter nearby)
+
+    # ---- narrow, specific
+    B(121.4, 121.6, "Aviation emergency frequency 121.5 MHz (ELT beacon or guard call)"),
+    B(242.9, 243.1, "Military aviation emergency frequency 243.0 MHz (beacon or guard call)"),
+    B(406.0, 406.1, "406 MHz distress beacon (EPIRB / PLB / ELT)"),
+    B(161.95, 162.05, "AIS: ship or boat position transponder nearby"),
+    B(144.37, 144.41, "APRS 144.39 MHz: amateur position beacon"),
+    B(462.54, 462.74, "Walkie-talkie nearby (FRS / GMRS)"),
+    B(467.54, 467.74, "Walkie-talkie nearby (FRS / GMRS)"),
+    B(978, 978.5, "Aircraft ADS-B (978 MHz UAT): small plane nearby"),
+    B(1029.5, 1030.5, "Secondary radar interrogation (1030 MHz): airport or military radar nearby"),
+    B(1089.5, 1090.5, "Aircraft transponder (1090 MHz, Mode S / ADS-B) nearby"),
+    B(26.96, 27.41, "CB radio transmitting nearby (trucks, CB users)", "VEHICLE"),
+
+    # ---- unlicensed Part 15 / ISM devices
+    B(314, 316, "315 MHz burst (TPMS, key fob)", "VEHICLE"),
+    B(299, 319, "Key fob or garage remote (300–318 MHz)", "VEHICLE"),
+    B(389.5, 390.5, "Garage remote (390 MHz)", "VEHICLE"),
+    B(433.05, 434.79, "433 MHz ISM burst (remotes, sensors, TPMS)", "IOT"),
+    B(902, 928, "900 MHz ISM burst (LoRa, telemetry, meters)", "IOT",
+      steady=("Steady 900 MHz carrier: meter collector, LoRa gateway, cordless phone — or a toll / RFID reader on the road", "IOT", "POSSIBLE")),
+    B(863, 870, "868 MHz ISM burst (EU LoRa, sensors)", "IOT"),
+    B(49.8, 49.9, "49 MHz baby monitor, toy or old cordless phone", "IOT"),
+    B(72, 76, "72 MHz steady carrier: radio-control model (RC aircraft), or hearing-assist / paging", "DRONE", kind="persist"),
+
+    # ---- video and drone links
+    # 5645–5849 is shared with 5 GHz Wi-Fi (ch 132–165). Analog FPV video transmits continuously; Wi-Fi
+    # comes and goes with traffic. kind "video": reported only after VIDEO_N passes in a row.
+    B(5645, 5849, "5.8 GHz steady carrier: FPV video, or a busy Wi-Fi access point", "DRONE", kind="video"),
+    B(5850, 5925, "5.9 GHz burst: connected-vehicle radio (C-V2X roadside unit or vehicle)", "VEHICLE",
+      steady=("5.9 GHz steady carrier: FPV video on a high channel, or Wi-Fi ch 169–177", "DRONE", "POSSIBLE")),
+    B(5030, 5091, "Drone command-link band (5030–5091 MHz, aviation UAS control)", "DRONE", kind="persist"),
+    B(5091, 5150, "Airport surface network (AeroMACS)", "NETWORK"),
+    B(1240, 1300, "1.2 GHz carrier: video or telemetry link (also ham 23 cm)", "DRONE", kind="persist"),
+    B(2025, 2110, "News / broadcast video link (2 GHz: ENG trucks, news helicopters)", "CAMERA", kind="video"),
+    B(4940, 4990, "4.9 GHz public-safety link (camera / video backhaul, mesh)", "NETWORK", kind="persist"),
+
+    # ---- aircraft
+    B(4200, 4400, "Radio altimeter: aircraft flying low overhead (helicopter, plane on approach, large drone)"),
+    B(118, 137, "Aircraft or airport radio (VHF air band)"),
+    B(108, 118, "Aviation navigation beacon (VOR / ILS)", kind="bg"),
+    B(960, 1215, "Aviation navigation (DME / TACAN beacons)", kind="bg"),
+    B(225, 400, "Military / government UHF: military aviation, tactical radio, SATCOM"),
+    B(1435, 1525, "Flight-test / aeronautical telemetry (L-band)"),
+    B(2360, 2395, "Flight-test / aeronautical telemetry (S-band)"),
+    B(2200, 2290, "Federal telemetry: space operations, flight test, military UAV links"),
+
+    # ---- phones and satellite terminals transmitting (uplinks: a strong burst is a transmitter nearby,
+    #      very often your own phone)
+    B(663, 698, "Phone transmitting nearby (600 MHz LTE uplink)", "PHONE"),
+    B(699, 716, "Phone transmitting nearby (700 MHz LTE uplink)", "PHONE"),
+    B(777, 787, "Phone transmitting nearby (700 MHz LTE uplink)", "PHONE"),
+    B(788, 798, "Phone or public-safety LTE (FirstNet) transmitting nearby", "PHONE"),
+    B(799, 805, "Radio keying up nearby (700 MHz public-safety mobile)"),
+    B(806, 815, "Radio keying up nearby (800 MHz repeater input)"),
+    B(815, 824, "Phone transmitting nearby (LTE band 26 uplink)", "PHONE"),
+    B(824, 849, "Phone transmitting nearby (850 MHz cellular uplink)", "PHONE"),
+    B(1710, 1780, "Phone transmitting nearby (AWS LTE uplink)", "PHONE"),
+    B(1850, 1920, "Phone transmitting nearby (PCS uplink)", "PHONE"),
+    B(2000, 2020, "Phone transmitting nearby (AWS-4 uplink)", "PHONE"),
+    B(2305, 2315, "Phone transmitting nearby (WCS uplink)", "PHONE"),
+    B(1610, 1626.5, "Satellite phone or tracker transmitting nearby (Globalstar / Iridium)", "PHONE"),
+    B(1626.5, 1660.5, "Satellite terminal transmitting nearby (Inmarsat: maritime, aviation)", "PHONE"),
+
+    # ---- two-way radio, by band
+    B(156, 162.05, "Marine VHF radio (boats, harbors)"),
+    B(160.2, 161.6, "Railroad radio"),
+    B(162.4, 162.55, "NOAA Weather Radio", kind="bg"),
+    B(162.05, 174, "Federal government VHF"),
+    B(138, 144, "Federal / military VHF"),
+    B(148, 150.8, "Federal / military VHF"),
+    B(150.8, 174, "VHF two-way radio (public safety, business)"),
+    B(144, 148, "Amateur radio (2 m)"),
+    B(219, 225, "Amateur radio (1.25 m) / telemetry"),
+    B(30, 50, "VHF low-band two-way radio"),
+    B(50, 54, "Amateur radio (6 m)"),
+    B(400, 406, "Weather balloon (radiosonde) or federal telemetry"),
+    B(406.1, 420, "Federal government UHF"),
+    B(420, 450, "Amateur radio (70 cm) / military radar"),
+    B(450, 470, "UHF two-way radio (public safety, business)"),
+    B(608, 614, "Hospital medical telemetry (WMTS)", "IOT"),
+    B(769, 775, "700 MHz public-safety radio (base / repeater)", kind="bg"),
+    B(896, 902, "900 MHz business radio / private LTE"),
+    B(935, 941, "900 MHz business radio / private LTE", kind="bg"),
+    B(1390, 1400, "Hospital medical telemetry (WMTS)", "IOT"),
+    B(1427, 1435, "Hospital medical telemetry (WMTS)", "IOT"),
+    B(1780, 1850, "Federal / military (1780–1850 MHz: tactical links, satellite control)"),
+    B(4400, 4940, "Federal / military microwave (4.4–4.94 GHz)"),
+
+    # ---- radars
+    B(2700, 2900, "Airport or weather radar (S-band)", kind="bg"),
+    B(2900, 3100, "Ship radar (S-band)"),
+    B(3100, 3450, "Military radar (S-band)"),
+
+    # ---- background: broadcast, towers, satellites — everywhere, reported once a minute per band
+    B(54, 88, "TV broadcast (VHF low)", kind="bg"),
+    B(88, 108, "FM broadcast", kind="bg"),
+    B(137, 138, "Weather / low-orbit satellite downlink", kind="bg"),
+    B(174, 216, "TV broadcast (VHF high)", kind="bg"),
+    B(470, 608, "TV broadcast (UHF)", kind="bg"),
+    B(614, 652, "Cell tower (600 MHz downlink)", "CELL_SITE", kind="bg"),
+    B(716, 768, "Cell tower (700 MHz downlink)", "CELL_SITE", kind="bg"),
+    B(851, 869, "800 MHz tower output (regional, not nearby)", kind="bg"),
+    B(869, 894, "Cell tower (850 MHz downlink)", "CELL_SITE", kind="bg"),
+    B(929, 932, "Paging transmitter", kind="bg"),
+    B(941, 960, "Fixed point-to-point links / paging", kind="bg"),
+    B(1525, 1559, "Mobile satellite downlink (Inmarsat, Ligado)", kind="bg"),
+    B(1660.5, 1710, "Weather satellite / radiosonde downlink", kind="bg"),
+    B(1920, 2000, "Cell tower (PCS downlink)", "CELL_SITE", kind="bg"),
+    B(2110, 2200, "Cell tower (AWS downlink)", "CELL_SITE", kind="bg"),
+    B(2315, 2345, "Satellite radio (SiriusXM) and its street repeaters", kind="bg"),
+    B(2345, 2360, "Cell tower (WCS downlink)", "CELL_SITE", kind="bg"),
+    B(2496, 2690, "5G (2.5 GHz band 41): tower or phone", "CELL_SITE", kind="bg"),
+    B(3450, 3550, "Cell tower (3.45 GHz 5G)", "CELL_SITE", kind="bg"),
+    B(3550, 3700, "CBRS: private LTE / 5G, fixed wireless", "NETWORK", kind="bg"),
+    B(3700, 3980, "Cell tower (C-band 5G)", "CELL_SITE", kind="bg"),
+    B(3980, 4200, "Satellite C-band downlink", kind="bg"),
+]
+
+
+# GNSS: satellite signals arrive far below the noise floor, so a wide signal that rises clearly above
+# it is local — most often a GPS jammer, sometimes a GPS repeater (hangars, garages) or interference.
+# (band lo, band hi, judged lo, judged hi, label). The whole band is swept for the floor; only the part
+# around the centre frequency (± 12 MHz, which every common jammer covers) is judged, which also keeps
+# clear of the sweep's edges. GLONASS (1598–1606) and the Galileo/BeiDou edges are floor only.
+GNSS = [
+    (1559e6, 1610e6, 1563e6, 1587e6, "GPS band (L1)"),
+    (1164e6, 1189e6, 1166e6, 1187e6, "GPS band (L5)"),
+]
+SETTLE_S = 2.0       # ignore rtl_power's first rows after it opens the dongle: gain and PLL still settling
+
+PERSIST = {"DRONE"}  # these categories must be over the floor on two passes in a row before they're reported
+STEADY_N = 3         # passes in a row over the floor before a carrier counts as steady
+VIDEO_N = 6          # kind "video": passes in a row before a carrier shared with Wi-Fi is reported
+CHAIN_S = 30.0       # a bin's run of hot passes breaks if it isn't revisited within this long
+ALWAYS_S = 180.0     # a 1 MHz bucket hot for this long without a break counts as always on: background
+STORM_FRESH_S = 10.0 # a bucket hot for less than this is "fresh": only fresh hits make, or fall to, an overload burst
+BG_RATE_S = 60.0     # background bands: at most one report per band per minute
+FLOOR_S = 40.0       # rolling floor time constant (a carrier that stays this long becomes the floor)
+FLOOR_UP_GNSS_S = 1200.0   # ... rising in the GNSS bands, so a jammer riding with you stays visible
+FLOOR_HOT_S = 600.0        # ... rising under a bin that is already reported, so a held carrier keeps reporting
+FLOOR_WARM_S = 60.0        # a bin's floor follows at the normal rate for this long after first sight, whatever the level
+
+# Parked: the HackRF stops sweeping 1 MHz–6 GHz and stays on one 20 MHz slice, so a short transmission
+# there is caught on the pass it happens instead of within a second. "le" is the body-cam-and-radio
+# preset the phone sends: 796–816 MHz, where public-safety handhelds and car radios transmit (700 MHz
+# public-safety mobile 799–805, 800 MHz repeater inputs 806–815). Energy only: "a radio keyed up
+# nearby", never who or what was said. Set another slice with --hackrf-park-range.
+PARK_RANGES = {"le": "796:816"}
+HACKRF_STALL_S = 10.0   # a full 1 MHz–6 GHz pass takes about a second; this long with no rows means it hung
+HACKRF_PAUSE_ON_LISTEN = True   # stop the HackRF sweep while dsd-fme decodes (--hackrf-keep-sweeping to leave it running)
+RTL_STALL_S = 20.0      # rtl_power reports every second or two; this long with no rows means the dongle is hung → USB reset
+
+
+_band_cache = {}
+# The table band_of reads: BANDS, or the active region pack's bands ahead of it (regions.py).
+REGION = {"code": "US", "pack": None, "home": ""}    # home: the country this companion's area is set to, when a pack exists for it
+ACTIVE_BANDS = BANDS
+
+
+def set_region(code: str, announce: bool = True) -> None:
+    """Switch the band names and rtl_433 frequencies to a region pack. A code with no pack on this
+    bridge keeps the US tables and says so."""
+    global ACTIVE_BANDS
+    code = (code or "US").upper()[:2]
+    if code == REGION["code"] and (REGION["pack"] is not None or code == "US"):
+        return
+    pack = region_packs.find(code)
+    old_args = region_packs.rtl433_args(REGION["pack"], RTL433_DEFAULT_ARGS)
+    if pack is None and code != "US":
+        if announce:
+            emit({"t": "status", "msg": f"no {code} local pack on this bridge: keeping US band names "
+                                        f"(copy {code.lower()}.json to /etc/wavelens/packs/)",
+                  "band": state["band"], "mode": state["mode"]})
+        print(f"bridge: region {code}: no pack found in {', '.join(region_packs.DIRS)}", file=sys.stderr)
+        code = "US"
+    REGION["code"], REGION["pack"] = code, pack
+    ACTIVE_BANDS = region_packs.table(pack, BANDS)
+    apply_radio_plan(pack)
+    _band_cache.clear()
+    print(f"bridge: region {code}" + (f" from {pack['_path']}" if pack else " (built-in US tables)"), file=sys.stderr)
+    if region_packs.rtl433_args(pack, RTL433_DEFAULT_ARGS) != old_args:
+        p = RTL433_CHILD.get("p")
+        if p is not None and p.poll() is None:
+            p.terminate()              # feed_rtl433_child restarts it with the region's frequencies
+    if announce and pack is not None:
+        emit({"t": "status", "msg": f"local pack: {pack.get('name', code)} band names"
+                                    + (" (in testing)" if pack.get("status") == "testing" else ""),
+              "band": state["band"], "mode": state["mode"]})
+
+
+def band_of(mhz: float):
+    """The BANDS entry for a frequency, or a generic one for anything not in the table."""
+    k = round(mhz * 1000)
+    b = _band_cache.get(k)
+    if b is None:
+        for e in ACTIVE_BANDS:
+            if e["lo"] <= mhz <= e["hi"]:
+                b = e
+                break
+        else:
+            b = {"lo": mhz, "hi": mhz, "name": f"{mhz:.1f} MHz carrier", "cat": "UNKNOWN", "conf": "POSSIBLE",
+                 "kind": "", "steady": None, "key": "other"}
+        _band_cache[k] = b
+    return b
+
+
+def gnss_window(hz: float):
+    for w in GNSS:
+        if w[0] <= hz <= w[1]:
+            return w
+    return None
+
+
+# Spectrum for the phone. The Scanner and Spectrum screens ask for a window ({"c":"spec","on":true,
+# "lo":851,"hi":869}); about once a second the bridge sends the latest sweep readings inside it,
+# reduced to at most SPEC_BINS bins (the strongest reading in each), as one byte per bin:
+# 0.5 dB steps from SPEC_DB0. Nothing is sent unless a screen is looking, and it stops by itself
+# SPEC_TTL_S after the phone's last request (the app renews while the screen is open).
+SWEEPS = []                   # every Sweep in this process (hackrf_sweep, rtl_power)
+SPEC = {"on": False, "lo": 1.0, "hi": 6000.0, "until": 0.0, "src": ""}
+SPEC_BINS = 200
+SPEC_DB0 = -120.0             # byte 0; byte 255 = +7.5 dB
+SPEC_RATE_S = 1.0
+SPEC_TTL_S = 90.0
+
+
+SPEC_LOCK = threading.Lock()   # the sweep threads write Sweep.latest; spec_pump reads it
+
+
+def spec_pick(lo_mhz: float, hi_mhz: float):
+    """The sweep covering most of the window: HackRF (whole range) over an RTL-SDR range, unless
+    only the RTL-SDR sweep covers it. Returns (sweep, its readings in the window) from one snapshot."""
+    best, best_pts = None, []
+    with SPEC_LOCK:
+        snaps = [(sw, list(sw.latest.items())) for sw in SWEEPS]
+    for sw, items in snaps:
+        pts = [(hz, db) for hz, db in items if lo_mhz * 1e6 <= hz < hi_mhz * 1e6]
+        if len(pts) > len(best_pts):
+            best, best_pts = sw, pts
+    return best, sorted(best_pts)
+
+
+def spec_frame():
+    lo, hi = SPEC["lo"], SPEC["hi"]
+    sw, pts = spec_pick(lo, hi)
+    if sw is None or not sw.step_hz or not pts:
+        return None
+    n = min(SPEC_BINS, len(pts))
+    width = (hi - lo) * 1e6 / n
+    out = [None] * n
+    for hz, db in pts:
+        i = min(n - 1, int((hz - lo * 1e6) / width))
+        if out[i] is None or db > out[i]:
+            out[i] = db
+    fill = min(db for _, db in pts)
+    raw = bytes(max(0, min(255, int(round(((db if db is not None else fill) - SPEC_DB0) * 2)))) for db in out)
+    return {"t": "spec", "src": sw.src, "lo": round(lo, 4), "hi": round(hi, 4), "n": n,
+            "bin_hz": int(sw.step_hz), "db0": SPEC_DB0, "step_db": 0.5, "b": base64.b64encode(raw).decode()}
+
+
+def spec_pump() -> None:
+    while True:
+        time.sleep(SPEC_RATE_S)
+        if not SPEC["on"]:
+            continue
+        if time.time() > SPEC["until"]:
+            SPEC["on"] = False
+            with SPEC_LOCK:
+                for sw in SWEEPS:
+                    sw.latest.clear()
+            continue
+        try:
+            fr = spec_frame()
+        except Exception as e:                # never let the spectrum feed take the bridge down
+            print(f"bridge: spectrum: {e}", file=sys.stderr)
+            continue
+        if fr is not None and fr["b"] != SPEC.get("last_b"):
+            SPEC["last_b"] = fr["b"]
+            emit(fr)
+
+
+class Sweep:
+    """Parses hackrf_sweep / rtl_power CSV rows and reports bins that rise above a rolling floor.
+
+    Row format (both tools): date, time, hz_low, hz_high, hz_bin_width, samples, dB, dB, dB, ...
+    """
+
+    def __init__(self, src: str, threshold_db: float = 18.0, rate_s: float = 2.0, bucket_mhz: float = 1.0,
+                 mask: "list[tuple[float, float]] | None" = None, ppm: float = 0.0):
+        self.src, self.th, self.rate, self.bucket = src, threshold_db, rate_s, bucket_mhz
+        self.ppm = ppm            # reported MHz are scaled by (1 + ppm/1e6): the radio's crystal error, measured
+        self.peak_ok, self.tol_hz = True, 0.0
+        self.mask = [(lo * 1e6, hi * 1e6) for lo, hi in (mask or [])]   # Hz ranges never reported (the unit's spurs)
+        self.floor = {}       # bin start Hz → EMA of dB
+        self.last = {}        # bucket → last report time
+        self.gps_prev = {}    # GNSS row start (MHz) → last time that row looked jammed
+        self.settle_until = 0.0
+        self.quiet_until = 0.0    # floors learn but nothing is reported until then (a sweep's first FLOOR_WARM_S)
+        self.since = {}       # bin Hz → when it was first seen (the floor is "warm" after FLOOR_WARM_S)
+        self.seen = {}        # bin Hz → time of the previous visit
+        self.runs = {}        # bin Hz → [passes in a row over the floor, last dB, bin width]
+        self.bhot = {}        # 1 MHz bucket → [first hot, last hot]: a spur drifts across bins, the bucket holds
+        self.latest = {}      # bin Hz → last dB read: the spectrum the phone's Scanner / Spectrum screens draw
+        self.step_hz = 0.0
+        self.hist = {}        # rtl_power only: bin Hz → deque of (time, dB), the last few passes, for the control-channel hunt
+        SWEEPS.append(self)
+
+    def row(self, line: str) -> None:
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 7:
+            return
+        try:
+            lo, hi, step = float(parts[2]), float(parts[3]), float(parts[4])
+            vals = [float(v) for v in parts[6:] if v]
+        except ValueError:
+            return
+        now = time.time()
+        if now < self.settle_until:
+            return
+        if SPEC["on"]:
+            self.step_hz = step
+            with SPEC_LOCK:
+                for i, db in enumerate(vals):
+                    if db == db and db not in (float("inf"), float("-inf")):
+                        self.latest[lo + i * step] = db
+        if self.src == "rtlpower" and any(b_lo * 1e6 <= lo < b_hi * 1e6 for _, b_lo, b_hi, _ in CC_BANDS):
+            with SPEC_LOCK:
+                for i, db in enumerate(vals):
+                    if db == db and db not in (float("inf"), float("-inf")):
+                        self.hist.setdefault(lo + i * step, deque(maxlen=8)).append((now, db))
+        gnss_rows = {}      # GNSS window → [bins judged, hot bins]
+        for i, db in enumerate(vals):
+            if db != db or db in (float("inf"), float("-inf")):
+                continue                     # rtl_power prints nan for bins it cropped; never a hit
+            hz = lo + i * step
+            prev_visit = self.seen.get(hz)
+            self.seen[hz] = now
+            f = self.floor.get(hz)
+            if f is None:
+                self.floor[hz] = db
+                self.since[hz] = now
+                continue
+            # slow floor: a carrier that stays for minutes becomes the floor, which is what we want for a drive.
+            # Not in the GNSS bands: there the true floor is the empty band, and a jammer riding with you must
+            # not fade into it, so the floor rises ~30x more slowly there (and falls at the normal rate).
+            # Time-based, so the floor moves at the same speed whether a pass takes a second (full sweep)
+            # or a few milliseconds (parked): about 40 s to follow a change, ~20 min upward in GNSS.
+            w = gnss_window(hz)
+            dt = min(max((now - prev_visit) if prev_visit is not None else 1.2, 0.001), 30.0)
+            # The floor follows the band with a 40 s time constant, so a tower fades into the background
+            # on a drive. But a bin that is already well over the floor must not be absorbed at that
+            # rate: a radio held keyed (Find it) or a video link would stop being reported after 40 s.
+            # Hot bins rise with FLOOR_HOT_S instead; the floor still falls at the normal rate.
+            # ... but only once the floor has had FLOOR_WARM_S to settle: a sweep tool's first pass can
+            # come before its gain is applied, 30-40 dB low, and a floor that started there must be
+            # allowed to catch up fast, or the whole spectrum looks hot for ten minutes.
+            warm = now - self.since.get(hz, now) >= FLOOR_WARM_S
+            hot = db - f >= self.th and warm
+            tau = FLOOR_UP_GNSS_S if (w and db > f and warm) else FLOOR_HOT_S if (hot and db > f) else FLOOR_S
+            k = min(1.0, dt / tau)
+            self.floor[hz] = f * (1 - k) + db * k
+            if any(lo <= hz < hi for lo, hi in self.mask):
+                continue                     # one of this unit's own spurs (--hackrf-mask): floor only, never reported
+            if now < self.quiet_until:
+                continue                     # the floor isn't trusted yet (see FLOOR_WARM_S): learn it, report nothing
+            if w:
+                if not w[2] <= hz <= w[3]:
+                    continue                 # GNSS but outside the judged window: floor only, never reported
+                # Judged per row below: a jammer is wide and steady, so one hot bin is not enough.
+                g = gnss_rows.setdefault(w, [0, []])
+                g[0] += 1
+                if db - f >= self.th:
+                    g[1].append((hz, db, db - f))
+                continue
+            # Where in the bin is the carrier? A carrier spreads over two or three bins (FFT leakage), so
+            # only the local peak reports, placed by a parabola through the peak and its neighbours
+            # (dB). That puts a narrow carrier within about a quarter bin: 446.075 reads 446.07, not 446.1.
+            left = vals[i - 1] if i > 0 else None
+            right = vals[i + 1] if i + 1 < len(vals) else None
+            self.peak_ok = (left is None or db >= left) and (right is None or db > right)
+            off, self.tol_hz = 0.0, step / 2
+            if left is not None and right is not None:
+                den = left - 2 * db + right
+                if den < 0:
+                    off = max(-0.5, min(0.5, 0.5 * (left - right) / den))
+                    self.tol_hz = step / 4
+            mhz = (hz + step / 2 + off * step) / 1e6 * (1 + self.ppm / 1e6)   # hz is the bin's lower edge
+            if db - f < self.th:
+                run = self.runs.pop(hz, None)       # quiet on this pass: the run of hot passes is over
+                if run and run[0] < STEADY_N:
+                    b = band_of(mhz)
+                    if b["steady"] and not licensed_label(mhz, max(step / 1000.0, 12.5)):
+                        # it came and went: report it now with the burst label
+                        self.fresh = self.peak_ok = True
+                        self.report(mhz, run[1], step, run[1] - f, b["name"], b["cat"], b["conf"], b, None, now, {})
+                continue
+            # How long this 1 MHz bucket has been hot without a break of CHAIN_S. Judged per bucket, not
+            # per bin: a spur wanders across neighbouring bins, and a per-bin count would keep restarting.
+            bucket = round(mhz / self.bucket)
+            bh = self.bhot.get(bucket)
+            if bh is None or now - bh[1] > CHAIN_S:
+                bh = self.bhot[bucket] = [now, now]
+            bh[1] = now
+            hot_for = now - bh[0]
+            run = self.runs.get(hz)
+            if run and prev_visit is not None and 0.2 < now - prev_visit <= CHAIN_S:
+                run[0] += 1
+                run[1] = db
+            elif not run or prev_visit is None or now - prev_visit > CHAIN_S:
+                run = self.runs[hz] = [1, db, step]
+            n = run[0]
+            # Hot for ALWAYS_S without a break: a fixed transmitter, or one of the receiver's own spurs
+            # (a HackRF shows a few, some near full scale). Background from here on: once a minute,
+            # and never part of the overload judgement, where a strong spur would otherwise be "the cause".
+            self.always = hot_for >= ALWAYS_S
+            # Fresh: this bucket rose just now. Only fresh hits can be an overload burst, and only fresh
+            # hits are dropped as one. A bucket that has been hot for a while is established: it goes
+            # through, and it is not "a band that rose together" with anything.
+            self.fresh = hot_for < STORM_FRESH_S
+            x = {"over_floor_db": f"{db - f:.0f}", "bin_hz": f"{step:.0f}"}
+            lic = licensed_label(mhz, max(step / 1000.0, 12.5))
+            if lic:
+                name, cat, conf, lx = lic
+                x.update(lx)
+                if cat in PERSIST and n < 2:
+                    continue
+                # a named licensee keeps its own id; an ambiguous wide-bin hit falls back to the 1 MHz bucket id
+                ident = f"fcc/{lx['call_sign']}/{mhz:.3f}" if lx.get("call_sign") else None
+                self.report(mhz, db, step, db - f, name, cat, conf, None, ident, now, x)
+                continue
+            b = band_of(mhz)
+            if b["name"] is None:
+                continue
+            if b["steady"]:
+                if n < STEADY_N:
+                    continue                 # wait: steady label at STEADY_N passes, burst label when it drops
+                name, cat, conf = b["steady"]
+                x["steady"] = f"over the floor on {n} passes in a row"
+            else:
+                name, cat, conf = b["name"], b["cat"], b["conf"]
+                if (b["kind"] == "persist" or cat in PERSIST) and n < 2:
+                    continue                 # a video link transmits continuously; a radar sweep or a glitch shows once
+                if b["kind"] == "video":
+                    if n < VIDEO_N:
+                        continue             # Wi-Fi bursts; analog video is on every pass
+                    x["steady"] = f"over the floor on {n} passes in a row"
+            self.report(mhz, db, step, db - f, name, cat, conf, b, None, now, x)
+        for w, (n, hot) in gnss_rows.items():
+            self.gps_row(lo, step, n, hot, now, w[4])
+
+    def report(self, mhz, db, step, over, name, cat, conf, b, ident, now, x) -> None:
+        if not self.peak_ok:
+            return                           # a shoulder of a carrier whose peak bin reports instead
+        if not x:
+            x = {"over_floor_db": f"{over:.0f}", "bin_hz": f"{step:.0f}"}
+        # f goes out rounded to whole MHz (and sweep ids are 1 MHz buckets); exact_mhz is the best the
+        # sweep knows: the interpolated peak, to a quarter bin, plus the radio's ppm error unless --ppm is set.
+        x.setdefault("exact_mhz", f"{mhz:.4f}".rstrip("0").rstrip(".") + f" ± {self.tol_hz / 1e6:g}")
+        fresh = getattr(self, "fresh", True)
+        if b is not None and b["kind"] == "bg":
+            key, rate = "bg/" + b["key"], BG_RATE_S
+            ident = ident or f"{self.src}/bg/{b['key']}"
+            x["background"] = "broadcast, tower or beacon: everywhere, shown for completeness"
+        elif getattr(self, "always", False):
+            bucket = round(mhz / self.bucket)
+            key, rate = ("always", bucket), BG_RATE_S
+            ident = ident or f"{self.src}/{bucket * self.bucket:.0f}"
+            x["always_on"] = ("on the air continuously for minutes: a fixed transmitter, or a spur the receiver "
+                              "makes itself (a HackRF shows a few, some very strong). Shown once a minute.")
+        else:
+            bucket = round(mhz / self.bucket)
+            key, rate = (bucket, cat if b is not None and b["steady"] and cat == b["steady"][1] else ""), self.rate
+            if b is not None and b["key"] in RADAR_BANDS:
+                # a radar's pulses drift across several MHz: one entry per radar band, not one per MHz
+                key = ("band", b["key"])
+                ident = ident or f"{self.src}/band/{b['key']}"
+            ident = ident or f"{self.src}/{bucket * self.bucket:.0f}"
+        if now - self.last.get(key, 0) < rate:
+            return
+        self.last[key] = now
+        if b is not None:
+            x.setdefault("band", f"{b['lo']:g}–{b['hi']:g} MHz")
+        line = {"t": "rf", "id": ident, "n": name, "f": int(round(mhz)), "r": int(round(db)),
+                "cat": cat, "conf": conf, "src": self.src, "x": x}
+        if (b is not None and b["kind"] == "bg") or getattr(self, "always", False):
+            emit(line)                       # background and always-on bins bypass the overload gate
+        else:
+            storm_gate(self.src).push(now, b["key"] if b is not None else str(ident), line, fresh)
+
+    def gps_row(self, lo: float, step: float, n: int, hot: list, now: float, label: str = "GPS band (L1)") -> None:
+        """Possible GPS jammer only when a wide part of this row is raised (at least a quarter of its
+        bins, and 3+) and the same row looked that way on the previous pass too. A single narrow
+        spike — interference, a retune glitch — is ignored."""
+        key = round(lo / 1e6)
+        wide = len(hot) >= max(3, n // 4)
+        if not wide:
+            self.gps_prev.pop(key, None)
+            return
+        prev = self.gps_prev.get(key, 0.0)
+        self.gps_prev[key] = now
+        if not prev or now - prev > 90:
+            return                                  # first pass that looks jammed: wait for a second
+        if now - self.last.get("gps/" + label, 0) < self.rate:
+            return
+        self.last["gps/" + label] = now
+        overs = sorted(o for _, _, o in hot)
+        mid = sum(h for h, _, _ in hot) / len(hot) / 1e6
+        emit({"t": "rf", "id": f"{self.src}/gps" + ("" if "L1" in label else "-l5"), "n": f"{label}: strong local signal — possible GPS jammer nearby",
+              "f": int(round(mid)), "r": int(round(max(d for _, d, _ in hot))), "cat": "TOOL", "conf": "POSSIBLE",
+              "src": self.src, "x": {
+                  "over_floor_db": f"{overs[len(overs) // 2]:.0f}",
+                  "width_mhz": f"{len(hot) * step / 1e6:.1f}",
+                  "raised_bins": f"{len(hot)} of {n}, on two passes in a row",
+                  "gps": ("satellites are far below the noise floor, so a wide signal this strong is local — "
+                          "usually a jammer, sometimes a GPS repeater. Check whether the phone's location "
+                          "is drifting or dropping out.")}})
+
+
+# ---------------------------------------------------------------- broadband bursts
+#
+# An SDR with no front-end filter (the HackRF especially) overloads when a strong transmitter is
+# right beside it, usually the phone or the Pi's own Wi-Fi. For that moment, false carriers appear
+# across the whole spectrum at once, at about the same level: "military radar", "satellite C-band",
+# "flight-test telemetry" in a living room. Real signals rise one or two bands at a time. So sweep
+# reports are held for STORM_HOLD_S, and when STORM_BANDS or more unrelated bands rose within that
+# window, the fresh part of the batch is thinned to its strongest and the phone gets one status line.
+# "Rose together" means rose: a bucket that has been hot for a while (a spur, a steady carrier) is not
+# part of the burst and is never dropped by it. Without that, a receiver with a few permanent spurs
+# would be "overloaded" in every window, and a radio keyed up beside it would be dropped every time.
+# Bands that are only radar: a radar's pulses drift across several MHz, so these report as one entry
+# per band. Not 420–450 (70 cm amateur shares it) or 1030 MHz: there each carrier is its own transmitter.
+RADAR_BANDS = {"2700-2900", "2900-3100", "3100-3450"}
+STORM_HOLD_S = 2.5
+STORM_BANDS = 4
+STORM_NOTE_S = 60.0
+STORM_KEEP_DB = 5.0
+STORM_KEEP_OVER_DB = 30.0   # a hit this far over its floor is a real strong signal nearby: never dropped as overload
+
+
+class StormGate:
+    def __init__(self, src: str):
+        self.src, self.q, self.lock, self.noted = src, deque(), threading.Lock(), 0.0
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def push(self, now: float, band: str, line: dict, fresh: bool = True) -> None:
+        with self.lock:
+            self.q.append((now, band, line, fresh))
+
+    def _loop(self) -> None:
+        while True:
+            time.sleep(0.25)
+            self.flush(time.time())
+
+    def flush(self, now: float) -> None:
+        """Release every window that has been held for STORM_HOLD_S (call again until nothing is due)."""
+        while True:
+            with self.lock:
+                if not self.q or now - self.q[0][0] < STORM_HOLD_S:
+                    return
+                t0 = self.q[0][0]
+                batch = []
+                while self.q and self.q[0][0] <= t0 + STORM_HOLD_S:
+                    batch.append(self.q.popleft())
+            self._judge(batch)
+
+    def _judge(self, batch: list) -> None:
+            now = time.time()
+            rose = [(band, line) for _, band, line, fresh in batch if fresh]
+            # Smear: a strong carrier beside an unfiltered receiver spreads over several MHz of its own
+            # band (a comb of 435-441 from one handheld). Several fresh buckets in one band in one window
+            # are one signal: keep the strongest, say so on it.
+            by_band = {}
+            for band, line in rose:
+                by_band.setdefault(band, []).append(line)
+            smeared = []
+            for band, lines in by_band.items():
+                if len(lines) >= SMEAR_N:
+                    lines.sort(key=lambda l: l["r"], reverse=True)
+                    lines[0].setdefault("x", {})["smear"] = (f"{len(lines)} carriers in this band at once: one strong "
+                                                            "signal spread by the receiver; the strongest is shown")
+                    smeared += lines[1:]
+            rose = [(band, line) for band, line in rose if line not in smeared]
+            bands = {band for band, _ in rose}
+            if len(bands) >= STORM_BANDS:
+                # Overload has a cause: the strongest thing in the burst, and preferably something that can
+                # actually be beside the receiver (a radio, a phone, a key fob), not a "4.7 GHz microwave link"
+                # that is really the receiver's own product of it. Keep the cause and what's within
+                # STORM_KEEP_DB of it; drop the rest. When nothing in the burst looks like a nearby
+                # transmitter, keep the strongest and anything STORM_KEEP_OVER_DB over its floor (radar).
+                # Established hits (not fresh) were there before the burst and go through untouched.
+                cause = [line for _, line in rose if near_cause(line)]
+                if cause:
+                    top = max(line["r"] for line in cause)
+                    keep = [line for line in cause
+                            if line["r"] >= top - STORM_KEEP_DB
+                            or float(line.get("x", {}).get("over_floor_db", 0)) >= STORM_KEEP_OVER_DB]
+                    keep = drop_harmonics(keep)
+                    why = "the transmitter that caused it"
+                else:
+                    top = max(line["r"] for _, line in rose)
+                    keep = [line for _, line in rose
+                            if line["r"] >= top - STORM_KEEP_DB
+                            or float(line.get("x", {}).get("over_floor_db", 0)) >= STORM_KEEP_OVER_DB]
+                    why = "the strongest"
+                for line in keep:
+                    line.setdefault("x", {})["burst"] = f"{why} of {len(bands)} bands that rose together"
+                for _, _, line, fresh in batch:
+                    if not fresh or line in keep:
+                        emit(line)
+                if now - self.noted > STORM_NOTE_S:
+                    self.noted = now
+                    names = ", ".join(sorted({l["n"] for l in keep}))[:120]
+                    msg = (f"{self.src}: {len(bands)} bands rose together; kept {why} ({names}) and "
+                           "ignored the rest as receiver overload. A strong transmitter close by, or a radar beam "
+                           "sweeping past, does this; lower the gain if it happens often.")
+                    print("bridge: " + msg, file=sys.stderr)
+                    emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
+                return
+            for _, _, line, _ in batch:
+                if line not in smeared:
+                    emit(line)
+
+
+SMEAR_N = 3
+
+
+def near_cause(line: dict) -> bool:
+    """A hit in a band where a transmitter beside the receiver is the normal explanation: two-way
+    radios, phones, key fobs, ISM devices. Not radar, not microwave links, not altimeters."""
+    n = (line.get("n") or "").lower()
+    if "altimeter" in n or "radar (" in n and "radio" not in n:
+        return False
+    return (line.get("cat") in ("PHONE", "VEHICLE", "IOT")
+            or "radio" in n or "nearby" in n or "walkie" in n or "keying" in n or "two-way" in n)
+
+
+def drop_harmonics(keep: list) -> list:
+    """A kept hit at 2x, 3x or 4x a stronger kept hit (to 0.3 %) is the receiver's harmonic of it."""
+    keep = sorted(keep, key=lambda l: l["r"], reverse=True)
+    out = []
+    for line in keep:
+        f = float(str(line.get("x", {}).get("exact_mhz", line["f"])).split()[0])
+        for strong in out:
+            fs = float(str(strong.get("x", {}).get("exact_mhz", strong["f"])).split()[0])
+            if any(abs(f - k * fs) <= 0.003 * f for k in (2, 3, 4)):
+                break
+        else:
+            out.append(line)
+    return out
+
+
+_storm_gates: "dict[str, StormGate]" = {}
+
+
+def storm_gate(src: str) -> StormGate:
+    g = _storm_gates.get(src)
+    if g is None:
+        g = _storm_gates[src] = StormGate(src)
+    return g
+
+
+def spawn(cmd: str):
+    """Start a radio tool with stdout piped. Its stderr is drained on a thread (hackrf_sweep and
+    rtl_power write progress there constantly) and the last few lines kept, so that when the tool
+    exits early the journal says why. Returns the process, or None if the tool isn't installed."""
+    try:
+        p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except FileNotFoundError:
+        print(f"bridge: {cmd.split()[0]} not found on PATH", file=sys.stderr)
+        return None
+    tail = deque(maxlen=4)
+
+    tool = cmd.split()[0]
+    usage = False
+
+    def drain():
+        nonlocal usage
+        for ln in p.stderr:
+            ln = ln.strip()
+            if not ln:
+                continue
+            if ln.startswith("Usage:"):
+                usage = True                 # a tool printing its help after an error: the error line is enough
+            if usage:
+                continue
+            tail.append(ln)
+            log_line(f"{tool}: {ln}")
+    threading.Thread(target=drain, daemon=True).start()
+    p.started_at, p.err_tail = time.time(), tail
+    return p
+
+
+def reap(p, cmd: str, planned: bool = False) -> None:
+    """Wait for a tool; if it lasted under 10 s, log what it said, since that is a failure, not a sweep.
+    planned: the tool was told when to stop (rtl_power -e taking turns), so a clean exit is not logged."""
+    p.wait()
+    if planned and p.returncode == 0:
+        return
+    if p.returncode == -15:
+        return                                  # we stopped it (a listen took the dongle): not a failure
+    if time.time() - p.started_at < 10:
+        time.sleep(0.2)                         # let the drain thread catch the last lines
+        why = " | ".join(p.err_tail) or "no message"
+        print(f"bridge: {cmd.split()[0]} exited after {time.time() - p.started_at:.1f} s (code {p.returncode}): {why}",
+              file=sys.stderr)
+
+
+def run_once(cmd: str, handler, planned: bool = False, stop_when=None, stall_s: float = 0.0, on_stall=None) -> bool:
+    """Run a tool until it exits, handing it each stdout line. False if it isn't installed.
+    stop_when: polled five times a second; when it turns true the tool is stopped (the dongle is wanted).
+    stall_s: no stdout for this long after start means the radio is hung; the tool is killed and on_stall() runs."""
+    p = spawn(cmd)
+    if p is None:
+        return False
+    p.last_line = time.time()
+    state = {"stalled": False}
+    if stop_when is not None or stall_s:
+        def watch():
+            while p.poll() is None:
+                if stop_when is not None and stop_when():
+                    p.terminate()
+                    return
+                if stall_s and time.time() - p.last_line > stall_s:
+                    state["stalled"] = True
+                    p.kill()
+                    return
+                time.sleep(0.2)
+        threading.Thread(target=watch, daemon=True).start()
+    for line in p.stdout:
+        p.last_line = time.time()
+        handler(line)
+    reap(p, cmd, planned or (stop_when is not None and stop_when()) or state["stalled"])
+    if state["stalled"]:
+        print(f"bridge: {cmd.split()[0]} produced nothing for {stall_s:.0f} s: the dongle is hung", file=sys.stderr)
+        if on_stall is not None:
+            on_stall()
+    return True
+
+
+def usb_reset(serial_or_index: str) -> bool:
+    """Power-cycle a USB device from software: /sys/bus/usb/devices/<dev>/authorized 0 then 1 re-enumerates
+    it, which is what unplugging does. Finds the RTL-SDR by its serial (or, for an index, the Nth RTL-SDR).
+    Needs root (the service has it). A hung RTL2832U — a process killed mid-stream leaves it that way — gives
+    every later open a device that answers but never streams; this is the only fix short of a replug."""
+    rtls = []
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        try:
+            with open(d + "/idVendor") as f:
+                vid = f.read().strip()
+            with open(d + "/idProduct") as f:
+                pid = f.read().strip()
+        except OSError:
+            continue
+        if (vid, pid) not in (("0bda", "2838"), ("0bda", "2832")):
+            continue
+        try:
+            with open(d + "/serial") as f:
+                sn = f.read().strip()
+        except OSError:
+            sn = ""
+        rtls.append((d, sn))
+    target = None
+    for d, sn in rtls:
+        if sn == serial_or_index:
+            target = d
+    if target is None and serial_or_index.isdigit() and int(serial_or_index) < len(rtls):
+        target = rtls[int(serial_or_index)][0]
+    if target is None:
+        print(f"bridge: usb reset: no RTL-SDR {serial_or_index!r} under /sys/bus/usb", file=sys.stderr)
+        return False
+    try:
+        with open(target + "/authorized", "w") as f:
+            f.write("0")
+        time.sleep(1.5)
+        with open(target + "/authorized", "w") as f:
+            f.write("1")
+        time.sleep(2.5)                          # re-enumeration
+        print(f"bridge: usb reset of RTL-SDR {serial_or_index} ({os.path.basename(target)}) done", file=sys.stderr)
+        return True
+    except OSError as e:
+        print(f"bridge: usb reset of RTL-SDR {serial_or_index} failed: {e} (not root?) — replug it", file=sys.stderr)
+        return False
+
+
+def feed_process(cmd: str, handler) -> None:
+    """Run a sweep tool and hand it each stdout line; restart it if it exits."""
+    while run_once(cmd, handler):
+        time.sleep(2)
+
+
+def parse_mask(spec: str) -> "list[tuple[float, float]]":
+    """'4770:4805,3215:3240' (MHz) → [(4770.0, 4805.0), (3215.0, 3240.0)]"""
+    out = []
+    for part in (spec or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        lo, hi = part.split(":")
+        out.append((float(lo), float(hi)))
+    return out
+
+
+
+# ---------------------------------------------------------------- PortaPack: switch to HackRF mode
+
+# A HackRF One with a PortaPack running Mayhem boots into its own menu, where it is a USB serial
+# console, not a HackRF: hackrf_sweep finds nothing until someone taps "HackRF" on the screen.
+# Mayhem's console has a `hackrf` command that does the same, so the bridge sends it.
+HACKRF_USB = ("1d50", "6089")
+PORTAPACK_TTY = ""           # --portapack-port; empty = look for one
+_pp_last = 0.0
+
+
+def hackrf_on_usb() -> bool:
+    """True when a HackRF in HackRF mode is on the bus (1d50:6089), without opening it."""
+    for d in glob.glob("/sys/bus/usb/devices/*"):
+        try:
+            with open(d + "/idVendor") as a, open(d + "/idProduct") as b:
+                if (a.read().strip(), b.read().strip()) == HACKRF_USB:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def portapack_tty() -> str:
+    """The PortaPack's serial console, if one is plugged in and in its own (Mayhem) mode."""
+    if PORTAPACK_TTY:
+        return PORTAPACK_TTY if os.path.exists(PORTAPACK_TTY) else ""
+    for path in sorted(glob.glob("/dev/serial/by-id/*")):
+        if re.search(r"portapack|mayhem|great_scott|hackrf", os.path.basename(path), re.I):
+            return path
+    # No by-id link (older udev): any ttyACM whose USB parent is a Great Scott Gadgets device.
+    for tty in sorted(glob.glob("/sys/class/tty/ttyACM*")):
+        try:
+            dev = os.path.realpath(tty + "/device/..")
+            with open(dev + "/idVendor") as a:
+                if a.read().strip() == "1d50":
+                    return "/dev/" + os.path.basename(tty)
+        except OSError:
+            continue
+    return ""
+
+
+def ensure_hackrf_mode(wait_s: float = 10.0) -> bool:
+    """If the HackRF is sitting in the PortaPack menu, send Mayhem's `hackrf` command and wait for it to
+    come back as a HackRF. True when a HackRF is (now) on the bus. At most one try every 30 s."""
+    global _pp_last
+    if hackrf_on_usb():
+        return True
+    tty = portapack_tty()
+    if not tty or time.time() - _pp_last < 30:
+        return False
+    _pp_last = time.time()
+    try:
+        fd = os.open(tty, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+        try:
+            try:
+                import termios, tty as ttymod
+                ttymod.setraw(fd)                    # no \n → \r\n translation: send exactly what's written
+                termios.tcflush(fd, termios.TCIOFLUSH)
+            except (ImportError, OSError):
+                pass
+            os.write(fd, b"\r\n")
+            time.sleep(0.3)
+            os.write(fd, b"hackrf\r\n")
+        finally:
+            os.close(fd)
+    except OSError as e:
+        print(f"bridge: PortaPack on {tty}: {e}", file=sys.stderr)
+        return False
+    print(f"bridge: PortaPack on {tty}: asked it to switch to HackRF mode", file=sys.stderr)
+    end = time.time() + wait_s
+    while time.time() < end:
+        time.sleep(0.5)
+        if hackrf_on_usb():
+            time.sleep(1.0)              # let it finish enumerating before hackrf_sweep opens it
+            print("bridge: PortaPack is in HackRF mode", file=sys.stderr)
+            return True
+    print("bridge: PortaPack did not come back as a HackRF; will try again", file=sys.stderr)
+    return False
+
+
+# ---------------------------------------------------------------- the HackRF sweep in its own process
+#
+# Parsing hackrf_sweep's output is the bridge's biggest job: 60,000 bins a pass at 100 kHz, 0.6–0.8 passes
+# a second, every bin through the floor / hot / run bookkeeping in Python. On a Pi 4 that alone is ~90 %
+# of one core, and Python runs on one core, so the audio encoder behind it stalled and words went missing.
+# The sweep therefore runs in a forked child: it inherits the loaded packs, parses on a core of its own,
+# and sends what it would have emitted (hits, spectrum frames, journal lines) back over a queue. The parent
+# tells it about park changes, when to pause for a digital decode, and which spectrum window it owns.
+HACKRF = {"paused": False, "ctl": None, "out": None}
+
+
+def hackrf_child(range_mhz, bin_hz, lna, vga, mask, ppm, out_q, ctl_q) -> None:
+    """Entry point of the forked sweep process."""
+    def emit_child(obj: dict) -> None:
+        try:
+            out_q.put(obj)
+        except Exception:
+            pass
+    globals()["emit"] = emit_child
+    globals()["log_line"] = lambda text: emit_child({"t": "_log", "l": str(text).rstrip()}) if str(text).strip() and not str(text).startswith("sent ") else None
+    sys.stderr = _StderrTee(sys.__stderr__)   # a fresh tee in this process; its lines go up the queue as _log
+    SPEC["on"] = False
+    SWEEPS.clear()
+
+    def control():
+        while True:
+            m = ctl_q.get()
+            if m is None:
+                os._exit(0)
+            if "park" in m:
+                state["park"] = m["park"]
+            if "pause" in m:
+                HACKRF["paused"] = bool(m["pause"])
+            if "spec" in m:
+                sp = m["spec"]
+                if sp.get("on"):
+                    SPEC.update(on=True, lo=float(sp["lo"]), hi=float(sp["hi"]), until=time.time() + SPEC_TTL_S)
+                else:
+                    SPEC["on"] = False
+    threading.Thread(target=control, daemon=True).start()
+    threading.Thread(target=spec_pump, daemon=True).start()
+    feed_hackrf(range_mhz, bin_hz, lna, vga, mask, ppm)
+
+
+def hackrf_start(range_mhz, bin_hz, lna, vga, mask, ppm) -> None:
+    """Parent: fork the sweep process and relay its output into the real emit()."""
+    ctx = multiprocessing.get_context("fork")
+    out_q, ctl_q = ctx.Queue(maxsize=2000), ctx.Queue()
+    HACKRF["ctl"], HACKRF["out"] = ctl_q, out_q
+    proc = ctx.Process(target=hackrf_child, args=(range_mhz, bin_hz, lna, vga, mask, ppm, out_q, ctl_q), daemon=True)
+    proc.start()
+    print(f"bridge: hackrf sweep running in its own process (pid {proc.pid})", file=sys.stderr)
+
+    def relay():
+        while True:
+            try:
+                obj = out_q.get(timeout=1.0)
+            except Empty:
+                if not proc.is_alive():
+                    print("bridge: hackrf sweep process exited; restarting it", file=sys.stderr)
+                    time.sleep(2)
+                    hackrf_start(range_mhz, bin_hz, lna, vga, mask, ppm)
+                    return
+                continue
+            if obj.get("t") == "_log":
+                log_line(obj.get("l", ""))
+            else:
+                emit(obj)
+    threading.Thread(target=relay, daemon=True).start()
+
+    def pauser():
+        """Tell the child to stop sweeping while a digital decode runs, and to resume after."""
+        last = None
+        while True:
+            # paused while a digital decode runs, and for the whole of a Follow session that has used one
+            # (the hops between systems are seconds apart; restarting the sweep each time just resets its floor)
+            digital = LISTEN["proc"] is not None and LISTEN["mode"] in DIGITAL_MODES
+            if digital:
+                HACKRF["follow_digital_at"] = time.time()
+            want = HACKRF_PAUSE_ON_LISTEN and (digital or (LISTEN["follow"] and time.time() - HACKRF.get("follow_digital_at", 0.0) < 120.0))
+            if want != last:
+                last = want
+                hackrf_ctl({"pause": want})
+            time.sleep(0.5)
+    threading.Thread(target=pauser, daemon=True).start()
+
+
+def hackrf_ctl(msg: dict) -> None:
+    q = HACKRF.get("ctl")
+    if q is not None:
+        try:
+            q.put(msg)
+        except Exception:
+            pass
+
+
+def spec_route(on: bool, lo: float = 1.0, hi: float = 6000.0) -> None:
+    """Who draws this spectrum window: the parent's rtl_power sweep when one of its ranges covers the whole
+    window (finer bins), else the HackRF child. Never both."""
+    if not on:
+        SPEC["on"] = False
+        hackrf_ctl({"spec": {"on": False}})
+        return
+    if sweep_covers(lo, hi) and any(sw.src == "rtlpower" for sw in SWEEPS):
+        SPEC.update(on=True, lo=lo, hi=hi, until=time.time() + SPEC_TTL_S)
+        hackrf_ctl({"spec": {"on": False}})
+    else:
+        SPEC["on"] = False
+        hackrf_ctl({"spec": {"on": True, "lo": lo, "hi": hi}})
+
+
+def feed_hackrf(range_mhz: str, bin_hz: int, lna: int = 32, vga: int = 20, mask: str = "", ppm: float = 0.0) -> None:
+    """hackrf_sweep over range_mhz, or over the parked slice while the phone has asked to park.
+    A park change stops the running sweep and starts the other one."""
+    sw = Sweep("hackrf", mask=parse_mask(mask), ppm=ppm)
+    if sw.mask:
+        print("bridge: hackrf: masking " + ", ".join(f"{lo/1e6:g}-{hi/1e6:g} MHz" for lo, hi in sw.mask), file=sys.stderr)
+    def digital_listen() -> bool:
+        """A digital decode is running on an RTL-SDR: the HackRF stream shares its USB bandwidth with
+        rtl_tcp. The sweep waits it out. (Set by the parent process over the control queue.)"""
+        return HACKRF["paused"]
+
+    absent_said = False
+    while True:
+        if digital_listen():
+            time.sleep(0.5)
+            continue
+        ensure_hackrf_mode()
+        if not hackrf_on_usb():
+            # Unplugged, lost power, or sitting in the PortaPack menu: don't restart hackrf_sweep every 3 s
+            # (each failure printed its whole usage text into the journal). Wait for it on the bus.
+            if not absent_said:
+                print("bridge: hackrf_sweep: no HackRF on the USB bus — waiting for one (check its cable/power; "
+                      "a PortaPack must be in HackRF mode)", file=sys.stderr)
+                absent_said = True
+            time.sleep(5)
+            continue
+        if absent_said:
+            print("bridge: hackrf_sweep: HackRF is back on the bus", file=sys.stderr)
+            absent_said = False
+        park = state.get("park", "off")
+        rng = PARK_RANGES.get(park, range_mhz)
+        cmd = f"hackrf_sweep -f {rng} -w {bin_hz} -l {lna} -g {vga}"
+        p = spawn(cmd)
+        if p is None:
+            return
+        sw.settle_until = time.time() + SETTLE_S + 3.0   # first passes come before the gains are applied
+        # A full sweep's floor is untrustworthy for its first minute (the gains arrive late, the floor starts
+        # 30-40 dB low): learn it quietly. A parked slice sweeps thousands of times a minute and settles fast.
+        sw.quiet_until = time.time() + (FLOOR_WARM_S if rng == range_mhz else 8.0)
+        print(f"bridge: hackrf_sweep {rng} MHz" + (f" (parked: {park})" if park in PARK_RANGES else ""), file=sys.stderr)
+
+        p.last_line = time.time()
+
+        def watch(proc=p, was=park):
+            while proc.poll() is None:
+                if state.get("park", "off") != was:
+                    proc.terminate()
+                    return
+                if digital_listen():
+                    print("bridge: hackrf_sweep paused while digital voice is decoding (USB and CPU for dsd-fme)", file=sys.stderr)
+                    proc.terminate()
+                    return
+                # A HackRF behind a busy USB hub can stop streaming without hackrf_sweep exiting: the radio
+                # sits on one frequency and nothing is reported. Kill it and start over.
+                if time.time() - proc.last_line > HACKRF_STALL_S:
+                    print(f"bridge: hackrf_sweep stalled (no data for {HACKRF_STALL_S:.0f} s); restarting", file=sys.stderr)
+                    proc.kill()
+                    return
+                time.sleep(0.2)
+
+        threading.Thread(target=watch, daemon=True).start()
+        for line in p.stdout:
+            p.last_line = time.time()
+            sw.row(line)
+        reap(p, cmd, planned=digital_listen())
+        if state.get("park", "off") == park and not digital_listen():
+            time.sleep(2)                    # it exited by itself (unplugged, error): retry like feed_process
+
+
+def _mhz(v: str) -> float:
+    v = v.strip().upper()
+    mult = {"K": 1e-3, "M": 1.0, "G": 1e3}.get(v[-1:], 1e-6)
+    return float(v.rstrip("KMG")) * mult
+
+
+def sweep_interval_s(spec: str) -> int:
+    """rtl_power wants its integration interval to cover one full pass of the range
+    ("buggy if a full sweep takes longer than the interval"). A hop covers ~2 MHz and takes
+    roughly 30 ms, so a 50 MHz range gets 1 s and the full 24–1766 MHz about 26 s."""
+    try:
+        lo, hi = spec.split(":")[:2]
+        hops = abs(_mhz(hi) - _mhz(lo)) / 2.0
+    except (ValueError, IndexError):
+        return 1
+    return max(1, math.ceil(hops * 0.03))
+
+
+def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm: int = 0, gain: int = 30) -> None:
+    """One range: rtl_power runs continuously. Several: they take turns on the same dongle,
+    dwell_s seconds each (rtl_power -e), so VHF and 800 MHz can share one RTL-SDR.
+    device is an index or serial (rtl_power -d matches either). Each dongle gets its own thread."""
+    sw = Sweep("rtlpower")          # one floor map keyed by Hz, so the ranges don't disturb each other
+    dev = f" -d {shlex.quote(device)}" if device else ""
+    busy = lambda: listen_busy(device)      # the phone is listening on this dongle: stop, and wait
+
+    def wait_free():
+        while busy():
+            time.sleep(0.3)
+    if len(specs) == 1:
+        cmd = f"rtl_power -f {specs[0]}{dev} -i {sweep_interval_s(specs[0])} {(' -g ' + str(gain)) if gain else ''}{(' -p ' + str(ppm)) if ppm else ''} -"
+        while True:
+            wait_free()
+            sw.settle_until = time.time() + SETTLE_S + sweep_interval_s(specs[0])
+            if not run_once(cmd, sw.row, stop_when=busy, stall_s=RTL_STALL_S, on_stall=lambda: usb_reset(device)):
+                return
+            time.sleep(2)
+        return
+    def in_cc_band(spec: str) -> bool:
+        try:
+            lo, hi = _mhz(spec.split(":")[0]), _mhz(spec.split(":")[1].split("@")[0])
+        except (ValueError, IndexError):
+            return False
+        return any(lo <= b_hi and hi >= b_lo for _, b_lo, b_hi, _ in CC_BANDS)
+    while True:
+        for spec in specs:
+            wait_free()
+            hunting = HUNT.get("sweeping") and any(in_cc_band(sp) for sp in specs)
+            if hunting and not in_cc_band(spec):
+                continue                 # a control-channel hunt is waiting on the trunking bands: skip the rest for now
+            i = sweep_interval_s(spec)
+            sw.settle_until = time.time() + SETTLE_S + i      # first integration after a retune is discarded
+            # While a hunt counts passes: long enough for the settle window plus five integrations, so one
+            # pass already gives the three readings per bin that sweep_steady needs.
+            dwell = int(SETTLE_S + i * 5) if hunting else max(dwell_s, 2 * i)
+            if not run_once(f"rtl_power -f {spec}{dev} -i {i} {(' -g ' + str(gain)) if gain else ''}{(' -p ' + str(ppm)) if ppm else ''} -e {dwell}s -",
+                            sw.row, planned=True, stop_when=busy, stall_s=RTL_STALL_S, on_stall=lambda: usb_reset(device)):
+                return
+            time.sleep(0.5)         # let the dongle close before the next range opens it
+
+
+def usb_rtl_serials() -> "list[str]":
+    """Serials of the RTL-SDRs on the USB bus right now (sysfs; nothing is opened)."""
+    out = []
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        try:
+            with open(d + "/idVendor") as a, open(d + "/idProduct") as b:
+                if (a.read().strip(), b.read().strip()) not in (("0bda", "2838"), ("0bda", "2832")):
+                    continue
+            with open(d + "/serial") as f:
+                out.append(f.read().strip())
+        except OSError:
+            continue
+    return out
+
+
+def adapt_radios(groups: "dict[str, list[str]]", listen_dev: str, hackrf_wanted: bool) -> "tuple[dict, str]":
+    """Fit the configured plan to the radios actually present. The config names dongles by serial; when one
+    is missing (unplugged, swapped, a V4 that fell off the bus) its job moves to a dongle that is here —
+    a free one first, else the job shares a dongle that has one already (listening borrows the sweep
+    dongle; that is how a two-dongle setup works anyway). A HackRF that is configured but absent is just
+    not swept with (the hunt and Follow run on the RTL-SDR sweep); one plugged in later is picked up.
+    Only serial-addressed dongles are adapted; an index (-d 0) is left alone."""
+    present = usb_rtl_serials()
+    if not present:
+        return groups, listen_dev              # nothing to adapt to; the hardware status will say so
+    try:
+        held = subprocess.run(["pgrep", "-a", "-f", "rtl_433"], capture_output=True, text=True, timeout=3).stdout
+    except Exception:
+        held = ""
+    busy = {sn for sn in present if re.search(rf"-d :?{re.escape(sn)}\b", held)}   # rtl_433's dongle
+    used = set()
+    out: "dict[str, list[str]]" = {}
+    for dev, specs in groups.items():
+        if not dev or not dev.isdigit() and dev in present:
+            out.setdefault(dev, []).extend(specs); used.add(dev); continue
+        if dev.isdigit():
+            out.setdefault(dev, []).extend(specs); continue
+        free = [sn for sn in present if sn not in busy and sn not in used]
+        new = free[0] if free else next((sn for sn in present if sn not in busy), present[0])
+        print(f"bridge: adapting: RTL-SDR {dev} (sweep) is not on the bus; sweeping {', '.join(specs)} on {new}", file=sys.stderr)
+        out.setdefault(new, []).extend(specs); used.add(new)
+    if listen_dev and not listen_dev.isdigit() and listen_dev not in present:
+        free = [sn for sn in present if sn not in busy and sn not in used]
+        new = free[0] if free else next((sn for sn in present if sn not in busy), present[0])
+        print(f"bridge: adapting: RTL-SDR {listen_dev} (listen) is not on the bus; listening on {new}"
+              + (" (it also sweeps; the sweep pauses while listening)" if new in used else ""), file=sys.stderr)
+        listen_dev = new
+    if hackrf_wanted and not hackrf_on_usb() and not portapack_tty():
+        print("bridge: adapting: no HackRF on the bus; the RTL-SDR sweep does the hunting and Follow (above 1.7 GHz "
+              "nothing is seen); a HackRF plugged in later is picked up", file=sys.stderr)
+    return out, listen_dev
+
+
+def group_sweeps(specs: "list[str]", default_device: str) -> "dict[str, list[str]]":
+    """'24M:895M:250k@00000978' pins that range to a dongle; ranges without @ use --rtl-power-device."""
+    groups: "dict[str, list[str]]" = {}
+    for s in specs:
+        spec, _, dev = s.partition("@")
+        groups.setdefault(dev or default_device, []).append(spec)
+    return groups
+
+
+# ---------------------------------------------------------------- listen: demodulate one frequency and stream the audio
+
+# The phone asks to hear a hit. The bridge borrows an RTL-SDR (the one rtl_power sweeps with, by default;
+# that sweep pauses), runs rtl_fm on the frequency and sends 8 kHz mono audio over BLE as IMA ADPCM:
+# 4 bits a sample, 40 ms frames of 164 bytes, about 4 kB/s. rtl_fm's squelch keeps the link quiet
+# between transmissions. A listen ends by itself after LISTEN_MAX_S unless the phone renews it.
+# Receive only: rtl_fm demodulates, it never transmits.
+LISTEN_MAX_S = 300.0
+LISTEN_RATE = 8000
+LISTEN_FRAME = 320          # samples per frame: 40 ms
+LISTEN_MODES = {"fm": "-M fm -s 16k", "am": "-M am -s 16k", "wbfm": "-M wbfm"}
+# Digital voice: rtl_tcp serves the dongle, dsd-fme demodulates and decodes, and sends 8 kHz PCM to a UDP
+# port the bridge listens on. TDMA modes (DMR, P25 phase 2) come out stereo, one slot per channel: mixed.
+# Encrypted traffic decodes to nothing; that is the law and the maths, not a setting.
+DIGITAL_MODES = {"dmr": ("-fs", 2), "p25": ("-f1", 1), "nxdn": ("-fi", 1), "dstar": ("-fd", 1),
+                 "auto": ("-fa", 1),       # auto: dsd-fme's own detection (DMR, P25 phase 1 and 2); see AUTO_* below
+                 # Trunked systems: mhz is the control channel; dsd-fme follows the system's grants, retuning
+                 # the dongle to each voice channel and back (P25 phase 1/2, DMR Tier III / Cap+ / Con+). -ft is
+                 # its trunking preset (P25p1 + p2 + DMR, C4FM); "trunkq" adds -mq for QPSK/LSM simulcast sites.
+                 # Encrypted calls are never tuned (dsd-fme's default). Lab only; the app sends it from the
+                 # Companion screen's "Trunked systems" section.
+                 "trunk": ("-ft -T", 2), "trunkq": ("-ft -T -mq", 2),
+                 # EDACS (analog voice on a 9600-baud control channel) and DMR Cap+/Con+/Tier III need a channel map:
+                 # built from the RadioReference site's frequencies, LCN/LSN in ascending-frequency order (the usual
+                 # convention; dsd-fme shows in its log whether calls follow). Motorola Type II / SmartNet and LTR
+                 # are not decodable by dsd-fme at all.
+                 "trunke": ("-fE -T", 1), "trunkd": ("-fs -T", 2),
+                 # Motorola Type II (SmartNet / SmartZone): analog voice, digital control channel. Not dsd-fme:
+                 # the bridge's own decoder (smartnet.py) reads the control channel from rtl_fm and a second
+                 # rtl_fm plays the voice channel of each grant. See serve_smartnet().
+                 "trunkm": ("", 1)}
+TRUNK_MODES = ("trunk", "trunkq", "trunke", "trunkd", "trunkm")
+ENC_RE = re.compile(r"\b(ENC|Encrypted|ALG(?:ID)?\s*[:=]?\s*(?:0x)?[0-9A-Fa-f]+)\b", re.I)
+CALL_RE = re.compile(r"\bTG[:= ]\s*(\d+)")
+# Mode "auto": start in dsd-fme's auto-detect; it says on stderr what sync it finds ("Sync: +P25p1"), which
+# also tells us the audio layout (TDMA is stereo). If the carrier is on and no digital sync shows within
+# AUTO_WAIT_S, it's analog: restart as narrow FM. Decided once per tune; the app's renewals keep "auto".
+AUTO_WAIT_S = 5.0
+# ...counted from dsd-fme's first "Sync:" line (it is demodulating by then), not from the tune: rtl_tcp and
+# dsd-fme take a few seconds to come up, and a 3 s window from the tune used to run out before they had
+# heard anything, so every digital repeater came out as FM — a buzz.
+# Second line of defence, in FM: a digital carrier through the FM discriminator is broadband noise at a
+# steady level — zero-crossing rate near 0.5 and almost no level change, where voice sits near 0.1 and
+# swings. DIGI_FRAMES frames of that (2 s) and the tune goes back to dsd-fme once, for AUTO_REPROBE_S;
+# if that finds no sync either it is a data or voice mode dsd-fme can't do (NXDN, dPMR, P25 data, a
+# paging/telemetry carrier): nothing to hear, so the audio stays muted and Follow moves on.
+DIGI_ZCR = 0.33
+DIGI_FRAMES = 50
+AUTO_REPROBE_S = 10.0
+# Channel plans: a sweep places a carrier to within a quarter bin (±25 kHz on a HackRF, ±3 kHz on an
+# RTL-SDR), but radios sit on channel rasters. Snap to the likeliest channel within the tolerance:
+# (lo, hi, [(step_khz, offset_khz, preference)...]) — lower preference wins when several rasters fit.
+CHANNEL_PLANS = [
+    (26.96, 27.41, [(10, 5, 0)]),                              # CB: 26.965, 26.975, ... (x.xx5)
+    (29.6, 54.0, [(20, 0, 0), (5, 0, 1)]),                      # low band
+    (118.0, 137.0, [(25, 0, 0), (8.333, 0, 1)]),                # air band: 25 kHz (8.33 kHz in Europe)
+    (144.0, 148.0, [(15, 0, 0), (5, 0, 1)]),                    # 2 m: 15 kHz repeater raster, 5 kHz elsewhere
+    (156.0, 162.05, [(25, 0, 0), (12.5, 0, 1)]),                # marine: 25 kHz channels
+    (137.0, 174.0, [(12.5, 0, 0), (7.5, 0, 1), (2.5, 0, 2)]),   # VHF land mobile: 12.5 kHz, with 7.5 kHz offsets
+    (216.0, 225.0, [(12.5, 0, 0), (6.25, 0, 1)]),
+    (403.0, 420.0, [(12.5, 0, 0), (6.25, 0, 1)]),               # 400 MHz land mobile (government networks outside the US)
+    (420.0, 450.0, [(25, 0, 0), (12.5, 0, 1), (5, 0, 2)]),      # 70 cm: 25 kHz repeaters, 5 kHz raster
+    (462.5375, 462.7375, [(12.5, 0, 0)]),                       # FRS/GMRS: 462.5500 … 462.7250 on 12.5 kHz
+    (467.5375, 467.7375, [(12.5, 0, 0)]),
+    (450.0, 470.0, [(25, 0, 0), (12.5, 0, 1), (6.25, 0, 2), (2.5, 0, 3)]),  # UHF land mobile: 25 kHz primaries, then interstitials
+    (470.0, 520.0, [(12.5, 0, 0), (6.25, 0, 1)]),               # UHF land mobile above 470 (Australia: to 520, UHF CB at 476.4–477.4)
+    (806.0, 824.0, [(12.5, 0, 0), (6.25, 0, 1)]),
+    (851.0, 869.0, [(12.5, 0, 0), (6.25, 0, 1)]),
+    (896.0, 902.0, [(12.5, 0, 0)]), (935.0, 941.0, [(12.5, 0, 0)]),
+]
+HONE_MIN_READINGS = 3        # sweep readings of the tuned carrier before re-snapping from their average
+HONE_RATE_S = 10.0           # at most one re-tune this often
+# AFC on analog FM: rtl_fm's discriminator output has a DC level proportional to how far the carrier is
+# from the tuned frequency (full scale 16384 = half the demod rate). Half a second of open squelch
+# measures that to ~100 Hz, which is how the listen lands on the exact channel after a sweep's ±25 kHz.
+AFC_RATE_IN = 16000.0
+# Pager data (POCSAG, FLEX) on an analog FM channel: multimon-ng decodes it from rtl_fm's audio when
+# it is installed (apt install multimon-ng). It runs beside every analog listen; the first page
+# decoded marks the channel as pager data, mutes the audio (it's tone bursts and squeal) and the
+# pages go to the phone as lines instead. Wavelens Lab only; the store app never listens.
+PAGER_RATE = 22050           # multimon-ng wants 22050 Hz s16 mono
+PAGER_CMD = "multimon-ng -t raw -a POCSAG512 -a POCSAG1200 -a POCSAG2400 -a FLEX -e -u -"
+PAGE_RE = re.compile(r"^(POCSAG\d+|FLEX)[:|]\s*(.*)$")
+PAGE_ADDR_RE = re.compile(r"Address:\s*(\d+)|\[(\d+)\]")
+PAGE_MSG_RE = re.compile(r"(?:Alpha|Numeric|ALN|NUM|TON|BIN):\s*(.*)$|(?:ALN|NUM)\s+(.*)$")
+PAGE_KIND_RE = re.compile(r"\b(Alpha|Numeric|ALN|NUM|TON|BIN)\b")
+# Where one-way paging lives in the US (MHz). Outside these the decoder is not run at all: multimon-ng,
+# POCSAG at 512 baud above all, locks onto telemetry and mobile data and prints it as "numeric pages"
+# (seen on a 460.600 MHz public-safety channel: a dozen junk pages, and the channel's audio muted as
+# "pager data"). A country pack can give its own list: "companion": {"pager_bands": [[lo, hi], ...]}.
+# Other countries without one are not gated by band; the plausibility test below still applies.
+PAGER_BANDS_US = [(35.0, 36.0), (43.0, 44.0), (152.0, 153.0), (157.7, 158.75), (163.2, 163.3),
+                  (454.0, 455.0), (462.7375, 462.9375), (464.99, 465.01), (929.0, 932.0)]
+PAGER_ANY_BAND = False       # --pager-any-band: decode on any analog channel (for finding an unlisted pager)
+PAGER_CONFIRM = 2            # plausible POCSAG pages on one listen before the channel counts as pager data
+
+
+def pager_band_ok(mhz: float) -> bool:
+    """May the pager decoder run on this frequency?"""
+    if PAGER_ANY_BAND:
+        return True
+    bands = None
+    pack = REGION.get("pack")
+    if pack:
+        try:
+            bands = [(float(lo), float(hi)) for lo, hi in (pack.get("companion") or {}).get("pager_bands") or []]
+        except (TypeError, ValueError):
+            bands = None
+    if not bands:
+        if REGION.get("code", "US") != "US":
+            return True
+        bands = PAGER_BANDS_US
+    return any(lo <= mhz <= hi for lo, hi in bands)
+
+
+def page_kind(rest: str) -> str:
+    """alpha | numeric | other, from the label multimon-ng put before the message."""
+    m = PAGE_KIND_RE.search(rest)
+    k = (m.group(1) if m else "").upper()
+    return "alpha" if k in ("ALPHA", "ALN") else "numeric" if k in ("NUMERIC", "NUM") else "other"
+
+
+def page_plausible(proto: str, kind: str, msg: str) -> bool:
+    """Is this decode a page somebody sent, rather than noise or another signal read as one?
+    FLEX has a long sync word and its own checks: text is enough. POCSAG is easy to false-lock, so:
+      numeric  a call-back number: short, nearly all digits, at most a couple of separators. The junk is
+               long and full of the filler symbols of the numeric alphabet (U, [, ], -, .).
+      alpha    readable: mostly letters, digits, spaces and ordinary punctuation, with at least one word
+               or a run of digits in it."""
+    msg = msg.strip()
+    if not msg:
+        return False
+    if proto == "FLEX":
+        return bool(re.search(r"[A-Za-z0-9]{2}", msg))
+    if kind == "numeric":
+        digits = sum(ch.isdigit() for ch in msg)
+        odd = sum(ch in "U[]." for ch in msg)
+        return 3 <= len(msg) <= 24 and digits >= 3 and digits / len(msg) >= 0.75 and odd <= 1
+    if len(msg) < 3:
+        return False
+    plain = sum(ch.isalnum() or ch in " .,:;/#-()'&+@!?" for ch in msg)
+    if plain / len(msg) < 0.85:
+        return False
+    return bool(re.search(r"[A-Za-z]{3}|\d{3}", msg))
+# multimon-ng prints control characters as named tokens (<NUL>, <ETX>, <EOT>, <ESC> …) and leaves others
+# raw; neither belongs on a screen or in a voice. Removed before the page leaves the Pi.
+PAGE_CTRL_RE = re.compile(r"<(?:NUL|SOH|STX|ETX|EOT|ENQ|ACK|BEL|BS|HT|LF|VT|FF|CR|SO|SI|DLE|DC[1-4]|NAK|SYN|ETB|CAN|EM|SUB|ESC|FS|GS|RS|US|DEL|SP|0x[0-9A-Fa-f]{2})>|[\x00-\x1f\x7f-\x9f]")
+
+
+def page_clean(msg: str) -> str:
+    msg = PAGE_CTRL_RE.sub(" ", msg)
+    return re.sub(r"\s+", " ", msg).strip()
+AFC_FRAMES = 12              # 40 ms frames with signal before judging (about half a second)
+AFC_MIN_HZ = 1500            # smaller offsets are the dongle's crystal, not a wrong channel
+
+
+def snap_channel(mhz: float, tol_mhz: float) -> float:
+    """The likeliest channel for a carrier placed at mhz ± tol. Rasters of the band in preference order;
+    a raster point within the tolerance (plus a 20 % margin) wins, nearest first among equal preference.
+    Outside any plan, or nothing within tolerance, the reading itself at 2.5 kHz."""
+    best = None
+    for lo, hi, rasters in CHANNEL_PLANS:
+        if not lo <= mhz <= hi:
+            continue
+        for step_khz, off_khz, pref in rasters:
+            step = step_khz / 1000.0
+            g = round((mhz - off_khz / 1000.0) / step) * step + off_khz / 1000.0
+            d = abs(g - mhz)
+            if d <= tol_mhz * 1.2 + 0.004:   # + 10 ppm at 400 MHz: an uncorrected dongle's own error
+                cand = (pref, d, g)
+                if best is None or cand < best:
+                    best = cand
+        break
+    if best is not None:
+        return round(best[2], 4)
+    return round(round(mhz / 0.0025) * 0.0025, 4)
+AUTO_NO_CARRIER_WAIT_S = 8.0   # no sweep running to tell us the carrier is on: decide on time since tune alone
+TDMA_SYNCS = ("DMR", "P25p2", "X2")
+DSD_UDP_PORT = 23470
+RTL_TCP_PORT = 23471
+LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "mhz": 0.0, "mode": "", "asked": "", "sq": 0,
+          "raw_mhz": 0.0, "tol": 0.05, "readings": [], "honed_at": 0.0,   # the sweep's placing, and later readings
+          "until": 0.0, "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0,
+          "chan_at": 0.0,                   # when this channel was first asked for (tuned_at restarts on AUTO → FM)
+          "carrier_at": 0.0, "detected": "",   # auto: when the sweep last saw the tuned carrier; what dsd-fme found
+          "call": "", "call_at": 0.0,       # trunk: the talkgroup dsd-fme is following right now, and when it started
+          "starting": False,                # the worker is bringing the tools up (dongle spoken for, proc not yet set)
+          "pages": False,                   # decode POCSAG/FLEX on analog listens: only when the client asks (Lab)
+          "recent": {}, "played": {},      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
+          "lockout": []}                   # MHz the phone told us never to follow (a pager, a busy repeater)
+LOCKOUT_TOL = 0.02                         # a hit within this of a locked-out frequency is the same channel
+
+
+def locked_out(mhz: float) -> bool:
+    return any(abs(mhz - f) <= LOCKOUT_TOL for f in LISTEN["lockout"])
+LISTEN_CV = threading.Condition()
+# LISTEN["recent"] / LISTEN["played"] are touched by the sweep reader (follow hits), follow_watch and the phone's
+# commands (lockout), each on its own thread: iterating one while another adds or deletes raised "dictionary
+# changed size during iteration". Hold this around every read or write of the two. Never held while tuning.
+FOLLOW_LOCK = threading.RLock()
+
+# Follow: a scanner. Every fresh sweep hit in a band where voice is analog and legal to hear gets tuned
+# and played; the dongle stays while the squelch is open, hangs on FOLLOW_HANG_S after it closes, then
+# the next hit takes it. Not digital trunked bands (P25/DMR: rtl_fm would play buzzing), not broadcast.
+FOLLOW_BANDS = [(26.96, 27.41, "am"), (29.6, 54.0, "auto"), (118.0, 137.0, "am"), (137.0, 174.0, "auto"),
+                (216.0, 225.0, "auto"), (400.0, 470.0, "auto")]
+FOLLOW_NAMED_ONLY = [(29.6, 54.0)]   # low band: full of a HackRF's own products; only tune a hit the licence lists name
+FOLLOW_HANG_S = 3.0
+FOLLOW_MIN_S = 4.0          # once tuned, give the squelch this long to open before another hit can take over
+FOLLOW_MAX_S = 30.0         # a channel gets at most this long, then the next waiting signal takes the dongle
+FOLLOW_PROBE_S = AUTO_NO_CARRIER_WAIT_S + 3.0   # AUTO still deciding (no audio flows while dsd-fme probes): not "quiet"
+FOLLOW_COOLDOWN_S = 60.0    # a channel just played isn't returned to for this long (a busy repeater would hog it)
+FOLLOW_RECENT_S = 60.0      # a hit older than this is no longer a candidate
+FOLLOW_TTL_S = 15 * 60.0    # Follow stops by itself this long after the app's last renewal (it renews every minute)
+
+
+TRUNK_HOLD_S = 5.0          # a locked trunked system keeps the dongle until it has had no call for this long
+
+
+def follow_busy(now: float) -> bool:
+    """The current channel keeps the dongle: still tuning, still being probed for a digital sync, just
+    tuned, or audio in the last few seconds. A locked trunked system is busy until it has gone quiet for
+    TRUNK_HOLD_S: a conventional hit should not pull the dongle off the system between two calls."""
+    if LISTEN["proc"] is None or now - LISTEN["tuned_at"] < FOLLOW_MIN_S or now - LISTEN["last_audio"] < FOLLOW_HANG_S:
+        return True
+    if LISTEN["mode"] in TRUNK_MODES and LISTEN["detected"] and now - max(LISTEN.get("call_at", 0.0), LISTEN["tuned_at"]) < TRUNK_HOLD_S:
+        return True
+    return (LISTEN["mode"] == "auto" or LISTEN["mode"] in DIGITAL_MODES) and now - LISTEN["chan_at"] < FOLLOW_PROBE_S
+
+
+def follow_mode(mhz: float):
+    for lo, hi, mode in FOLLOW_BANDS:
+        if lo <= mhz <= hi:
+            return mode
+    return None
+
+
+IMA_INDEX = [-1, -1, -1, -1, 2, 4, 6, 8]
+IMA_STEP = [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88,
+            97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658,
+            724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660,
+            4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818,
+            18500, 20350, 22385, 24623, 27086, 29794, 32767]
+
+
+class Ima:
+    """IMA ADPCM encoder (the DVI/IMA tables every decoder knows). Each frame carries the predictor
+    and step index it starts from, so a lost frame costs 40 ms of audio and nothing after it."""
+
+    def __init__(self):
+        self.pred, self.idx = 0, 0
+
+    def frame(self, seq: int, pcm: bytes) -> bytes:
+        n = len(pcm) // 2
+        head = struct.pack("<BhB", seq & 0xFF, self.pred, self.idx)
+        out = bytearray(head)
+        pred, idx = self.pred, self.idx
+        byte, high = 0, True
+        for s in struct.unpack(f"<{n}h", pcm[:n * 2]):
+            step = IMA_STEP[idx]
+            diff = s - pred
+            code = 0
+            if diff < 0:
+                code, diff = 8, -diff
+            d = step >> 3
+            if diff >= step:
+                code |= 4
+                diff -= step
+                d += step
+            step >>= 1
+            if diff >= step:
+                code |= 2
+                diff -= step
+                d += step
+            step >>= 1
+            if diff >= step:
+                code |= 1
+                d += step
+            pred = pred - d if code & 8 else pred + d
+            pred = -32768 if pred < -32768 else 32767 if pred > 32767 else pred
+            idx += IMA_INDEX[code & 7]
+            idx = 0 if idx < 0 else 88 if idx > 88 else idx
+            if high:
+                byte = code << 4
+            else:
+                out.append(byte | code)
+            high = not high
+        if not high:
+            out.append(byte)
+        self.pred, self.idx = pred, idx
+        return bytes(out)
+
+
+def follow_key(mhz: float) -> int:
+    return int(round(mhz / 0.0125))         # one channel = one 12.5 kHz slot
+
+
+# Automatic trunk following (Lab). A trunked system's control channel is the site frequency that never
+# stops transmitting; the sweep sees it on every pass while voice channels come and go. Every hit on a
+# RadioReference "TRS" row is counted here per site; asked to follow a system, the bridge tries the
+# site's most constant frequency first and the next if dsd-fme finds no control-channel sync.
+TRUNK = {"auto": True, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc_at": 0.0, "map": "",
+         "hold": False,          # system lock: stay on this system, no rotation
+         "tg_lock": 0,           # talkgroup lock: only this TG is heard (others on the system are muted)
+         "tg_avoid": set(),      # talkgroups muted (the app's TG lockout; resent on connect)
+         "tg_seen": [],          # recent (ts, tg, name, encrypted) on this system, for the app's call list
+         "cats": {"police"},     # category filter: only these kinds of talkgroup are heard (empty = all); police by default
+         "system": ""}
+# Category of a talkgroup from the RadioReference Tag column ("Law Dispatch", "Fire-Tac", "EMS Dispatch",
+# "Multi-Dispatch", "Public Works", "Schools", "Interop", "Hospital"…). The phone's POLICE / FIRE / EMS / OTHER
+# buttons map onto these.
+TG_CATS = [(("law", "corrections", "police", "sheriff"), "police"), (("fire",), "fire"), (("ems", "medical", "hospital"), "ems"),
+           (("multi", "interop", "emergency ops", "public safety"), "police"), ]
+
+
+def tg_category(tg: int) -> str:
+    """police | fire | ems | other for a talkgroup, from its Tag (then its description) in the talkgroups export."""
+    if not RR or not tg:
+        return ""                            # unknown: the filter lets it through (an unlisted system would otherwise be silent)
+    hit = RR.talkgroup(tg, TRUNK.get("system", ""))
+    if not hit:
+        return ""
+    alpha, desc, mode, tag = hit
+    text = f"{tag} {desc} {alpha}".lower()
+    for words, cat in TG_CATS:
+        if any(w in text for w in words):
+            return cat
+    return "other"
+HUNT = {"on": False, "cancel": False, "sweeping": False, "gen": 0}
+TRUNK_KINDS = ("p25", "dmr", "nxdn", "edacs", "moto")
+# Where control channels live: the base-station (output) side of the trunking bands, 800 MHz first
+# (most US public-safety P25 systems), then 700 MHz, 900 MHz, UHF and VHF.
+CC_BANDS = [("851M:869M:12.5k", 851.0, 869.0, "800 MHz"), ("769M:775M:12.5k", 769.0, 775.0, "700 MHz"),
+            ("935M:940M:12.5k", 935.0, 940.0, "900 MHz"), ("450M:470M:12.5k", 450.0, 470.0, "UHF"),
+            ("150.8M:174M:12.5k", 150.8, 174.0, "VHF")]
+CC_STEADY_DB = 12.0         # a control channel never stops: its quietest reading is still this far over the band
+CC_MAX_TRIES = 8            # control-channel candidates tried per hunt (each with C4FM, then simulcast QPSK)
+CC_CACHE = "/var/lib/wavelens/control-channel.json"
+
+
+def trunk_kind(mode: str) -> str:
+    """RadioReference writes P25 as 'P25', 'P25e', 'Project 25', 'APCO-25' or 'TDMA' (phase II)."""
+    m = (mode or "").lower().replace("-", " ").strip()
+    if m.startswith("p25") or "project 25" in m or "apco" in m or m in ("tdma", "p25 phase ii", "phase ii"):
+        return "p25"
+    if "type ii" in m or "smartnet" in m or "smartzone" in m or m == "moto":
+        return "moto"
+    if m.startswith("dmr") or "trbo" in m:
+        return "dmr"
+    if m.startswith("nxdn"):
+        return "nxdn"
+    if m.startswith("edacs"):
+        return "edacs"
+    return m
+
+
+SIMULCAST_RE = re.compile(r"(?i)simulcast|\bLSM\b|phase\s*(?:2|II)\b|P25p2|\bTDMA\b|CQPSK")
+
+
+def trunk_modes(kind: str, row=None) -> list:
+    """dsd-fme modes to try on one control-channel candidate. -ft covers P25 phase 1/2 and DMR trunking.
+    P25 simulcast (LSM) sites need the CQPSK demodulator: C4FM still syncs their control channel, but voice
+    comes out chopped. So QPSK goes first when the phone asked for it, or when the RadioReference row for the
+    site says simulcast / Phase II; otherwise C4FM first, QPSK second."""
+    if kind == "edacs":
+        return ["trunke"]
+    if kind == "dmr":
+        return ["trunkd"]
+    if kind == "moto":
+        return ["trunkm"]
+    qpsk_first = TRUNK["qpsk"]
+    if row is not None and not qpsk_first:
+        text = " ".join(str(v) for v in row.values() if v)
+        qpsk_first = bool(SIMULCAST_RE.search(text))
+    return ["trunkq", "trunk"] if qpsk_first else ["trunk", "trunkq"]
+
+
+def cc_load():
+    try:
+        with open(CC_CACHE) as f:
+            d = json.load(f)
+        return float(d["mhz"]), str(d["mode"]), str(d.get("system", ""))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def cc_save(mhz: float, mode: str, system: str) -> None:
+    try:
+        os.makedirs(os.path.dirname(CC_CACHE), exist_ok=True)
+        with open(CC_CACHE, "w") as f:
+            json.dump({"mhz": round(mhz, 5), "mode": mode, "system": system, "at": int(time.time())}, f)
+    except OSError:
+        pass
+def cc_sync_ok(sync: str, mode: str) -> bool:
+    """Is this dsd-fme sync the kind a control channel carries? P25 control channels are phase 1 (FDMA);
+    a P25p2 sync is a TDMA voice channel of the system. DMR Tier III / Cap+ control channels show as DMR,
+    EDACS as EDACS. Anything else (NXDN, D-STAR, ProVoice…) is not something -ft follows."""
+    u = sync.upper()
+    if mode == "trunkm":
+        return u.startswith("MOTO")
+    if mode == "trunke":
+        return u.startswith("EDACS")
+    if mode == "trunkd":
+        return u.startswith("DMR")
+    return u.startswith("P25P1") or u == "P25" or u.startswith("DMR")
+
+
+def cc_forget(mhz: float) -> None:
+    """A candidate that failed is not the control channel; if it is the one the cache remembers, drop it,
+    or every later Follow would start on it again. The hunt's ranking remembers the failure too."""
+    for r in TRUNK.get("ranked") or []:
+        if abs(r["mhz"] - mhz) <= 0.001:
+            r["failed_at"] = time.time()
+    last = cc_load()
+    if last and abs(last[0] - mhz) < 0.001:
+        try:
+            os.remove(CC_CACHE)
+        except OSError:
+            pass
+
+
+TRUNK_SEEN_S = 180.0        # a site frequency counts as a candidate for this long after its last hit
+TRUNK_CC_WAIT_S = 18.0      # dsd-fme must show a sync on a candidate within this, else the next is tried (rtl_tcp start + sync)
+TRUNK_IDLE_S = 5.0          # a locked system with no call for this long: on to the next strongest system (scanner-style)
+TRUNK_MIN_DB = 18.0         # a system is only rotated to when its control channel was this far over the band's floor
+TRUNK_RANK_TTL_S = 15 * 60.0  # the hunt's ranking of nearby systems is re-done after this
+TRUNK_FAIL_SKIP_S = 10 * 60.0 # a carrier that gave no sync is not retried for this long
+
+
+def trunk_next_system(now: float, force: bool = False) -> bool:
+    """Scanner behaviour on a quiet system: the next strongest steady carrier from the last hunt that
+    isn't the one we're on and hasn't just failed to sync. Round-robin back to the strongest when the
+    list is exhausted; a fresh hunt when the ranking is stale. False if there is nothing else to try.
+    force: the phone's Skip — go even if the system is held or busy."""
+    if TRUNK.get("hold") and not force:
+        return True                              # held: stay; "True" so the caller doesn't drop the listen
+    ranked = TRUNK.get("ranked") or []
+    if HUNT["on"]:
+        return True                              # a hunt is running: wait for it (don't drop to conventional hits)
+    if not ranked or now - TRUNK.get("ranked_at", 0.0) > TRUNK_RANK_TTL_S:
+        if LISTEN["follow"] and not HUNT["on"]:
+            listen_status("trunked: system quiet; looking again for the strongest systems nearby")
+            threading.Thread(target=cc_hunt, args=([],), daemon=True).start()
+            return True
+        return False
+    cur = LISTEN["mhz"]
+    for r in ranked:
+        if r["mhz"] == cur:
+            r["ok"] = True
+    others = [r for r in ranked if abs(r["mhz"] - cur) > 0.001 and now - r["failed_at"] > TRUNK_FAIL_SKIP_S
+              and r["lvl"] >= TRUNK_MIN_DB]              # weak carriers are not worth leaving a system for
+    if TRUNK.get("cats") and any(r.get("public", True) for r in others):
+        # POLICE / FIRE / EMS asked for: a utility, airport or business system has no such talkgroups —
+        # don't spend 5 s on each of them every rotation
+        others = [r for r in others if r.get("public", True)]
+    if not others:
+        return False
+    # the next one down the power ranking after the current; wrap to the top
+    idx = next((i for i, r in enumerate(ranked) if abs(r["mhz"] - cur) <= 0.001), -1)
+    order = [r for r in ranked[idx + 1:] + ranked[:idx + 1] if r in others]
+    nxt = order[0]
+    TRUNK["tries"] = [(nxt["mhz"], md) for md in nxt["modes"][1:]]
+    TRUNK["cc_at"] = time.time()
+    trunk_prep(nxt["mhz"], nxt["modes"][0])
+    listen_status(f"trunked: {cur:.4f} MHz quiet for {TRUNK_IDLE_S:.0f} s; next system {nxt['mhz']:.4f} MHz (+{nxt['lvl']:.0f} dB)"
+                  + (f" {nxt['name']}" if nxt.get("name") else ""))
+    listen_start(nxt["mhz"], nxt["modes"][0], LISTEN["sq"], 0.0)
+    return True
+
+
+def tg_named(call: str) -> str:
+    """'TG 1234 …' → 'TG 1234 · PCSO Disp (Law Dispatch) …' from the RadioReference talkgroup export, and
+    'encrypted' when the export says so (Mode DE / TE). Talkgroups only: there are no radio IDs to name."""
+    m = re.match(r"TG (\d+)(.*)$", call)
+    if not m or not RR or not RR.talkgroups:
+        return call
+    tg = RR.talkgroup(int(m.group(1)), TRUNK.get("system", ""))
+    if not tg:
+        return call
+    alpha, desc, mode, tag = tg
+    name = alpha or desc
+    extra = f" ({tag})" if tag and tag.lower() not in name.lower() else ""
+    enc = " · encrypted" if "e" in mode.lower() and "encrypted" not in m.group(2) else ""
+    return f"TG {m.group(1)} · {name}{extra}{enc}{m.group(2)}"
+
+
+def trunk_note(obj: dict) -> None:
+    x = obj.get("x") or {}
+    if "trunked_site" not in x:
+        return
+    try:
+        mhz = round(float(str(x.get("exact_mhz", "")).split()[0]), 4)
+    except (ValueError, IndexError):
+        return
+    try:
+        lic = float(x.get("lic_mhz") or 0)
+    except ValueError:
+        lic = 0.0
+    if lic:
+        mhz = round(lic, 5)
+    site = (x.get("rr_agency") or "?", x.get("rr_description") or "?", trunk_kind(x.get("rr_mode") or ""))
+    if RR and lic:
+        row = RR.site_at(lic)
+        if row is not None and RR._near(row) < 9e9 and RR._near(row) > RR_NEAR_KM:
+            return                           # the list's site for this frequency is far away: not this carrier's system
+    n, _, _, _ = TRUNK["seen"].get(mhz, (0, 0.0, -200, site))
+    try:
+        lvl = int(obj.get("r") or -200)
+    except (TypeError, ValueError):
+        lvl = -200
+    # An always-on carrier (the sweep reports those once a minute) is the control channel's signature:
+    # it outweighs the once-per-pass reports of voice channels that come and go.
+    TRUNK["seen"][mhz] = (n + (12 if "always_on" in x else 1), time.time(), lvl, site)
+
+
+def trunk_candidates(site=None):
+    """Site frequencies seen lately, most constant (then strongest) first; site=None → the busiest site."""
+    now = time.time()
+    seen = {m: v for m, v in TRUNK["seen"].items() if now - v[1] <= TRUNK_SEEN_S and v[3][2] in TRUNK_KINDS}
+    if not seen:
+        return None, []
+    if site is None:
+        by_site = {}
+        for m, (n, _, _, st) in seen.items():
+            by_site[st] = by_site.get(st, 0) + n
+        site = max(by_site, key=by_site.get)
+    cands = sorted((m for m, v in seen.items() if v[3] == site), key=lambda m: (-seen[m][0], -seen[m][2]))
+    return site, cands
+
+
+def trunk_start(site=None, qpsk=None) -> bool:
+    """Follow a trunked system: lock onto its control channel without being told it. Candidates, in order:
+    the control channel that worked last time, the site frequencies the sweep has matched to a RadioReference
+    trunked site, then — always available — a hunt on the listening dongle for carriers that never stop.
+    Each candidate is tried with C4FM and with simulcast QPSK. Returns True (the search runs in the background)."""
+    if qpsk is not None:
+        TRUNK["qpsk"] = bool(qpsk)
+    TRUNK["hunted"] = False
+    site, cands = trunk_candidates(site)
+    tries = []
+    last = cc_load()
+    if last and site is None:
+        tries.append((last[0], last[1]))
+    if site is not None and RR:
+        # The system the sweep heard: its own control channels from the export go first.
+        own = [c for c in rr_controls_ranked(50) if rr_site(c[2])[:2] == site[:2]]
+        for f, _, row in own[:4]:
+            tries += [(f, md) for md in trunk_modes(rr_site(row)[2], row)]
+    if site is None and RR and RR.controls:
+        # Nearest system, and the sweep hasn't matched a site: hunt first. A 30-60 s rtl_power pass over the
+        # trunking bands finds the carriers that never stop and that this dongle can actually hear, with the
+        # list's own control channels ranked ahead of the rest. Trying the list blind, 8 s a channel, spent
+        # minutes on sites that were never receivable here. The list is the fallback when nothing is steady.
+        TRUNK["site"], TRUNK["map"] = ("?", "nearest system", "p25"), ""
+        threading.Thread(target=cc_hunt, args=(tries,), daemon=True).start()
+        return True
+    if cands:
+        for m in cands[:5]:
+            tries += [(m, md) for md in trunk_modes(site[2])]
+        TRUNK["map"] = write_trunk_map(site) if site[2] in ("edacs", "dmr") else ""
+        TRUNK["site"] = site
+        trunk_try(tries, f"{site[0]} ({site[1]})")
+        return True
+    TRUNK["site"], TRUNK["map"] = ("?", "nearest system", "p25"), ""
+    threading.Thread(target=cc_hunt, args=(tries,), daemon=True).start()
+    return True
+
+
+def trunk_try(tries: list, what: str) -> None:
+    """Start on the first (mhz, mode) candidate; trunk_next moves down the list when it shows no sync."""
+    seen, uniq = set(), []
+    for m, md in tries:
+        k = (round(m, 4), md)
+        if k not in seen:
+            seen.add(k); uniq.append((m, md))
+    if not uniq and not TRUNK.get("hunted"):
+        threading.Thread(target=cc_hunt, args=([],), daemon=True).start()
+        return
+    if not uniq:
+        listen_stop("no control channel found")
+        listen_status("trunked: no control channel found nearby — no steady carrier in the trunking bands synced as P25 or DMR")
+        return
+    (m, md), TRUNK["tries"] = uniq[0], uniq[1:]
+    TRUNK["cc_at"] = time.time()
+    trunk_prep(m, md)
+    listen_status(f"trunked: trying {m:.4f} MHz ({'QPSK' if md == 'trunkq' else 'C4FM' if md == 'trunk' else 'Type II' if md == 'trunkm' else md}) as the control channel of {what}")
+    listen_start(m, md, LISTEN["sq"], 0.0)
+
+
+def cc_hunt(first: list) -> None:
+    """Scan the trunking bands on the listening dongle for carriers that are on in every reading (a control
+    channel transmits continuously; voice channels and conventional repeaters come and go), strongest first."""
+    HUNT["gen"] += 1
+    my_gen = HUNT["gen"]                  # a hunt started after this one supersedes it: the old thread bows out
+    HUNT["on"], HUNT["cancel"] = True, False
+    TRUNK["hunted"] = True
+    found = []
+
+    def cancelled() -> bool:
+        return HUNT["cancel"] or HUNT["gen"] != my_gen
+
+    try:
+        # First: the bands the running rtl_power sweep already covers. Its passes are the measurement —
+        # no second rtl_power, no fight over the dongle (two processes on one RTL-SDR left it wedged).
+        # Wait for three passes of each covered band, up to HUNT_FROM_SWEEP_S.
+        covered = [(spec, lo, hi, label) for spec, lo, hi, label in CC_BANDS if sweep_covers(lo, hi)]
+        probe_extra = []
+        if covered:
+            # the sweep must keep running for this: "sweeping" tells listen_busy not to hold the dongle, and
+            # tells the sweep to concentrate on the trunking bands with short dwells until the hunt is done
+            HUNT["sweeping"] = True
+            t0 = time.time()
+            listen_status("trunked: looking for a control channel in the sweep ("
+                          + ", ".join(label for _, _, _, label in covered) + ")…")
+            while time.time() - t0 < HUNT_FROM_SWEEP_S and not cancelled():
+                counts = [sweep_steady(lo, hi, time.time())[1] for _, lo, hi, _ in covered]
+                if all(n >= 3 for n in counts):
+                    break
+                # the 800 MHz band is first in CC_BANDS and is where the answer almost always is: once it has
+                # its readings and shows something steady, don't wait on the rest
+                if counts and counts[0] >= 3 and sweep_steady(covered[0][1], covered[0][2], time.time())[0] and time.time() - t0 > 20:
+                    break
+                time.sleep(2.0)
+            stale_bands = []
+            for _, lo, hi, label in covered:
+                here, n = sweep_steady(lo, hi, time.time())
+                if n < 3:
+                    # No fresh passes of this band: the sweep was off the dongle (listening borrows it) or
+                    # has not got round to it. Not evidence of silence — carry over what the last hunt
+                    # heard here (within the ranking's lifetime) and the system being listened to now,
+                    # rather than yanking a working lock for a band that merely wasn't measured.
+                    old = [(r["mhz"], r["lvl"]) for r in (TRUNK.get("ranked") or [])
+                           if lo <= r["mhz"] < hi and time.time() - TRUNK.get("ranked_at", 0.0) < 3 * TRUNK_RANK_TTL_S]
+                    if LISTEN["proc"] is not None and LISTEN["mode"] in TRUNK_MODES and lo <= LISTEN["mhz"] < hi \
+                            and all(abs(LISTEN["mhz"] - m) > 0.02 for m, _ in old):
+                        old.append((LISTEN["mhz"], 99.0))          # the one we're on outranks a remembered one
+                    here = old
+                    stale_bands.append(label)
+                here = [(m, lvl) for m, lvl in here if all(abs(m - f) > 0.02 for f, _ in found)]
+                print(f"bridge: control-channel hunt: {label} (sweep, {n} passes{', kept from last hunt' if n < 3 else ''}): {len(here)} steady"
+                      + (" — " + ", ".join(f"{m:.4f} (+{l:.0f} dB)" for m, l in sorted(here, key=lambda c: -c[1])[:4]) if here else ""),
+                      file=sys.stderr)
+                found += here
+            HUNT["sweeping"] = False
+            if stale_bands and not found and not cancelled():
+                # Nothing remembered either: measure the unmeasured bands directly (takes the dongle).
+                probe_extra = [(spec, lo, hi, label) for spec, lo, hi, label in CC_BANDS if label in stale_bands]
+            else:
+                probe_extra = []
+        probe = [(spec, lo, hi, label) for spec, lo, hi, label in CC_BANDS if not sweep_covers(lo, hi)]
+        if covered:
+            probe = probe_extra + probe
+        if probe and not found and not cancelled():
+            # Bands no sweep covers, and nothing steady yet: probe them with rtl_power. This is the path
+            # that has to take the dongle from the sweep, so it is the last resort.
+            free_dongle(LISTEN["dev"])
+        else:
+            probe = []
+        dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
+        ppm = f" -p {LISTEN['ppm']}" if LISTEN["ppm"] else ""
+        for spec, lo, hi, label in probe:
+            if cancelled() or len(found) >= CC_MAX_TRIES:
+                break
+            listen_status(f"trunked: looking for a control channel, {label} ({lo:g}–{hi:g} MHz)…")
+            rows, err = [], ""
+            # The sweep's rtl_power on this dongle was just told to stop; it can take several seconds to
+            # release the USB device, and an open attempt before that fails at once (usb_claim_interface
+            # -6). Keep trying for up to ~12 s rather than skipping the band — the 800 MHz band goes
+            # first, and skipping it is skipping the control channel.
+            for attempt in range(12):
+                try:
+                    r = subprocess.run(shlex.split(f"rtl_power{dev}{ppm} -f {spec} -i 1 -e 6 -g 40 -"),
+                                       capture_output=True, text=True, timeout=30)
+                    rows, err = r.stdout.splitlines(), r.stderr
+                except FileNotFoundError:
+                    listen_status("trunked: rtl_power not found on the Pi (apt install rtl-sdr)")
+                    return
+                except subprocess.TimeoutExpired:
+                    rows = []
+                if rows or cancelled():
+                    break
+                time.sleep(1.0)
+            if not rows:
+                print(f"bridge: control-channel hunt: {label}: rtl_power gave nothing"
+                      + (": " + err.strip().splitlines()[-1] if err.strip() else ""), file=sys.stderr)
+                continue
+            here = [(m, lvl) for m, lvl in cc_steady(rows) if all(abs(m - f) > 0.02 for f, _ in found)]
+            print(f"bridge: control-channel hunt: {label}: {len(rows)} rows, {len(here)} steady"
+                  + (" — " + ", ".join(f"{m:.4f} (+{l:.0f} dB)" for m, l in sorted(here, key=lambda c: -c[1])[:4]) if here else ""),
+                  file=sys.stderr)
+            found += here
+        found.sort(key=lambda c: -c[1])
+        print("bridge: control-channel hunt: " + (", ".join(f"{m:.4f} (+{l:.0f} dB)" for m, l in found[:CC_MAX_TRIES]) or "nothing steady"),
+              file=sys.stderr)
+    finally:
+        if HUNT["gen"] == my_gen:
+            HUNT["on"], HUNT["sweeping"] = False, False
+    if cancelled():
+        return
+    tries = list(first)
+    # Like a scanner: the strongest steady carrier first, then the next. The RadioReference list only
+    # decides how to decode a carrier (P25 / DMR / EDACS) and which ones to skip (LTR can't be followed).
+    found.sort(key=lambda c: -c[1])
+    ranked, sites_seen = [], set()
+    for m, lvl in found[:CC_MAX_TRIES * 2]:
+        cc = RR.control_at(m) if RR else None
+        row = cc[2] if cc else (RR.site_at(m) if RR else None)
+        if cc:
+            m = cc[0]                        # the listed frequency is exact; the scan's is within a channel
+        if row is not None and row.get("Mode") == "ltr":
+            continue
+        # One entry per site: a site's voice channels are steady carriers too (busy systems keep several
+        # up), but they are the same system — the strongest carrier of the site stands for it, and the
+        # scanner rotation moves between systems, not between a system's own channels.
+        key = (row.get("System Name") or row.get("Agency/Category") or "", row.get("Description") or "") if row is not None else None
+        if key and key in sites_seen:
+            continue
+        if key:
+            sites_seen.add(key)
+        modes = trunk_modes(rr_site(row)[2] if row is not None else "p25", row)
+        name = f"{key[0]} ({key[1]})" if key and key[0] else ""
+        if key and key[0] and row is not None and rr_doubtful_site(row):
+            name = key[0]                    # the system is right (it owns the frequency); the site is a guess
+        public = system_public(row)
+        ranked.append({"mhz": m, "lvl": lvl, "modes": modes, "failed_at": 0.0, "ok": False, "name": name, "public": public})
+        if len(ranked) >= CC_MAX_TRIES:
+            break
+    if TRUNK.get("cats"):
+        ranked.sort(key=lambda r: not r.get("public", True))   # POLICE/FIRE/EMS asked for: public-safety systems first
+
+        def allowed(m: float) -> bool:
+            cc = RR.control_at(m) if RR else None
+            return system_public(cc[2] if cc else (RR.site_at(m) if RR else None))
+        tries = [t for t in tries if allowed(t[0])]          # last session's Duke Energy doesn't lead a POLICE scan
+    if ranked:
+        # the cached / listed candidates only go ahead of the ranking when the sweep actually heard them
+        heard = [t for t in tries if any(abs(t[0] - r["mhz"]) < 0.002 for r in ranked)]
+        tries = heard
+    for r in ranked:
+        tries += [(r["mhz"], md) for md in r["modes"]]
+    TRUNK["ranked"], TRUNK["ranked_at"] = ranked, time.time()
+    if ranked and RR and RR.sites and state.get("lat") is None and not TRUNK.get("pos_asked"):
+        TRUNK["pos_asked"] = True            # once per run: the phone shows a Share button on the Scanner tab
+        listen_status("scanner: share your position (Scanner tab → Share) so the nearest sites are named and far ones skipped")
+    if ranked:
+        print("bridge: systems ranked: " + "; ".join(f"{r['mhz']:.4f} (+{r['lvl']:.0f} dB){' ' + r['name'] if r['name'] else ''}" for r in ranked), file=sys.stderr)
+    if RR and RR.controls:
+        # After what was heard: the list's control channels in its own order, in case the hunt's floor
+        # judgement missed a weak one.
+        for f, _, row in rr_controls_ranked(CC_MAX_TRIES):
+            tries += [(f, md) for md in trunk_modes(rr_site(row)[2], row)]
+    trunk_try(tries, "the nearest system" + (f" ({len(found)} steady carriers heard)" if found else " (nothing steady heard; trying your list)"))
+
+
+HUNT_FROM_SWEEP_S = 75.0    # how long the hunt waits for the sweep to have passed the trunking bands three times
+
+
+def sweep_steady(lo_mhz: float, hi_mhz: float, now: float):
+    """(carriers, readings) from the rtl_power sweep's own passes over [lo, hi): carriers that stayed over
+    CC_STEADY_DB above the band's median in every one of the last ≥3 readings (within 3 min), as
+    [(MHz, dB over)], one per channel at the local peak. readings is the smallest count any bin has, so
+    the caller knows whether the band has been passed often enough yet."""
+    per = {}
+    with SPEC_LOCK:
+        for sw in SWEEPS:
+            if sw.src != "rtlpower":
+                continue
+            for hz, dq in sw.hist.items():
+                if lo_mhz * 1e6 <= hz < hi_mhz * 1e6:
+                    vals = [db for t, db in dq if now - t <= 180.0]
+                    if vals:
+                        per[hz] = vals
+    if not per:
+        return [], 0
+    nread = min(len(v) for v in per.values())
+    if nread < 3:
+        return [], nread
+    keys = sorted(per)
+    step = (keys[1] - keys[0]) if len(keys) > 1 else 12500.0
+    mins = {hz: min(v) for hz, v in per.items()}
+    med = sorted(sum(v) / len(v) for v in per.values())[len(per) // 2]
+    out = []
+    for j, hz in enumerate(keys):
+        over = mins[hz] - med
+        if over < CC_STEADY_DB:
+            continue
+        l = mins.get(keys[j - 1]) if j > 0 else None
+        r = mins.get(keys[j + 1]) if j + 1 < len(keys) else None
+        if (l is not None and l > mins[hz]) or (r is not None and r >= mins[hz]):
+            continue
+        off = 0.0
+        if l is not None and r is not None:
+            den = l - 2 * mins[hz] + r
+            if den < 0:
+                off = max(-0.5, min(0.5, 0.5 * (l - r) / den))
+        mhz = (hz + step / 2 + off * step) / 1e6
+        raster = 0.0025 if mhz < 300 else 0.00625
+        out.append((round(round(mhz / raster) * raster, 5), over))
+    return out, nread
+
+
+def sweep_covers(lo_mhz: float, hi_mhz: float) -> bool:
+    """Does an rtl_power range include this band? (Checked against the specs the sweeps were started with.)"""
+    for a, b in SWEEP_RANGES:
+        if a <= lo_mhz and b >= hi_mhz:
+            return True
+    return False
+
+
+SWEEP_RANGES = []           # (lo, hi) MHz of every --rtl-power range running, filled in main()
+
+
+def free_dongle(dev: str, wait_s: float = 3.0) -> None:
+    """Stop every rtl_power / rtl_fm / rtl_tcp holding this dongle (by serial or index as given on their
+    command line), waiting up to wait_s for a clean exit before killing."""
+    pat = f"(rtl_power|rtl_fm|rtl_tcp)( .*)? -d {re.escape(dev)}( |$)" if dev else r"(rtl_power|rtl_fm)( |$)"
+    for sig, pause in (("-TERM", wait_s), ("-KILL", 1.0)):
+        subprocess.call(["pkill", sig, "-f", pat], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        t0 = time.time()
+        while time.time() - t0 < pause:
+            if subprocess.call(["pgrep", "-f", pat], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+                time.sleep(0.5)              # libusb needs a moment after the process is gone
+                return
+            time.sleep(0.2)
+
+
+def cc_steady(rows: list) -> list:
+    """rtl_power CSV → [(MHz, dB over the band's median)] for carriers over CC_STEADY_DB in *every* reading,
+    one per channel: the local peak, placed by a parabola and snapped to the band's channel raster."""
+    per = {}
+    for ln in rows:
+        p = [s.strip() for s in ln.split(",")]
+        if len(p) < 7:
+            continue
+        try:
+            lo, step = float(p[2]), float(p[4])
+            vals = [float(v) for v in p[6:] if v]
+        except ValueError:
+            continue
+        for i, db in enumerate(vals):
+            per.setdefault(lo + i * step, []).append(db)
+    if not per:
+        return []
+    keys = sorted(per)
+    step = (keys[1] - keys[0]) if len(keys) > 1 else 12500.0
+    nread = max(len(v) for v in per.values())
+    if nread < 3:
+        return []
+    mins = {hz: min(v) for hz, v in per.items() if len(v) >= nread - 1}
+    med = sorted(sum(v) / len(v) for v in per.values())[len(per) // 2]
+    out = []
+    for j, hz in enumerate(keys):
+        if hz not in mins:
+            continue
+        over = mins[hz] - med
+        if over < CC_STEADY_DB:
+            continue
+        l = mins.get(keys[j - 1]) if j > 0 else None
+        r = mins.get(keys[j + 1]) if j + 1 < len(keys) else None
+        if (l is not None and l > mins[hz]) or (r is not None and r >= mins[hz]):
+            continue                         # not the local peak: a neighbour holds the carrier's centre
+        off = 0.0
+        if l is not None and r is not None:
+            den = l - 2 * mins[hz] + r
+            if den < 0:
+                off = max(-0.5, min(0.5, 0.5 * (l - r) / den))
+        mhz = (hz + step / 2 + off * step) / 1e6
+        raster = 0.0025 if mhz < 300 else 0.00625
+        out.append((round(round(mhz / raster) * raster, 5), over))
+    return out
+
+
+def write_trunk_map(site, row=None) -> str:
+    """dsd-fme channel map for a site: 'lcn,hz' per line. From a sites export, in the order RadioReference
+    lists the site's frequencies (its LCN order); otherwise LCN by ascending frequency (the common
+    convention; not guaranteed). All of the site's frequencies the overlay lists, not just those heard."""
+    if not RR:
+        return ""
+    if row is not None and row.get("_freqs"):
+        freqs = [fq for fq, _ in row["_freqs"]]
+        site = (row.get("Agency/Category") or "?", row.get("Description") or "?", "")
+    else:
+        freqs = sorted({f for f, side, r in RR.rows if side == "output" and (r.get("Tag") or "").upper() == "TRS"
+                        and (r.get("Agency/Category") or "?") == site[0] and (r.get("Description") or "?") == site[1]})
+    if not freqs:
+        return ""
+    path = "/tmp/wavelens-trunk-map.csv"
+    try:
+        with open(path, "w") as f:
+            for i, mhz in enumerate(freqs, 1):
+                f.write(f"{i},{int(round(mhz * 1e6))}\n")
+    except OSError:
+        return ""
+    print(f"bridge: trunk map for {site[0]} ({site[1]}): {len(freqs)} channels"
+          + (", LCN in RadioReference's order" if row is not None else ", LCN by ascending frequency"), file=sys.stderr)
+    return path
+
+
+def trunk_prep(mhz: float, mode: str) -> None:
+    """Before trying a candidate: which system it belongs to (for talkgroup names), and for EDACS / DMR the
+    channel map dsd-fme needs, from that site's own list."""
+    row = (RR.control_at(mhz) or (None, None, None))[2] if RR else None
+    if row is None and RR:
+        row = RR.site_at(mhz)
+    TRUNK["system"] = (row.get("Agency/Category") or "") if row else ""
+    if mode in ("trunke", "trunkd"):
+        TRUNK["map"] = write_trunk_map(TRUNK["site"] or ("?", "?", ""), row) if row is not None else TRUNK.get("map", "")
+
+
+def trunk_next(why: str) -> None:
+    """The candidate showed no control channel: the next one, or give up."""
+    if TRUNK["tries"]:
+        (nxt, md) = TRUNK["tries"].pop(0)
+        TRUNK["cc_at"] = time.time()
+        trunk_prep(nxt, md)
+        site = TRUNK["site"] or ("?", "?", "")
+        listen_status(f"trunked: {why}; trying {nxt:.4f} MHz ({'QPSK' if md == 'trunkq' else 'C4FM' if md == 'trunk' else md})"
+                      + (f" for {site[0]}" if site[0] != "?" else ""))
+        listen_start(nxt, md, LISTEN["sq"], 0.0)
+    elif not TRUNK.get("hunted"):
+        threading.Thread(target=cc_hunt, args=([],), daemon=True).start()
+    elif any(time.time() - r["failed_at"] > TRUNK_FAIL_SKIP_S and abs(r["mhz"] - LISTEN["mhz"]) > 0.001 for r in TRUNK.get("ranked") or []) \
+            and trunk_next_system(time.time()):
+        pass                                 # on to the next strongest system in the ranking
+    else:
+        listen_stop("no control channel found")
+        listen_status("trunked: no control channel found nearby — none of the steady carriers synced as P25 or DMR")
+
+
+def follow_hit(obj: dict) -> None:
+    x = obj.get("x") or {}
+    if "trunked_site" in x:
+        # A trunked site's channel is not voice to play; with automatic trunking on, the system is followed instead.
+        if TRUNK["auto"] and (LISTEN["req"] is None or LISTEN["mode"] not in TRUNK_MODES) and trunk_auto_ok(x):
+            site = (x.get("rr_agency") or "?", x.get("rr_description") or "?", trunk_kind(x.get("rr_mode") or ""))
+            if (LISTEN["req"] is None or not follow_busy(time.time())) and not HUNT["on"]:
+                trunk_start(site)
+        return
+    if "always_on" in x or "background" in x:
+        return
+    tol = 0.05
+    try:
+        parts = str(x.get("exact_mhz", "")).split()
+        mhz = float(parts[0])
+        if len(parts) >= 3:
+            tol = float(parts[2])
+    except (ValueError, IndexError):
+        mhz = float(obj.get("f") or 0)
+    mode = follow_mode(mhz)
+    if mode is None or locked_out(mhz):
+        return
+    if any(lo <= mhz <= hi for lo, hi in FOLLOW_NAMED_ONLY) and not (x.get("lic_mhz") or x.get("rr_agency") or x.get("licensee")):
+        return                               # an unnamed low-band carrier is almost always the receiver itself
+    known = str(x.get("listen") or "")      # the RadioReference overlay's mode for this channel
+    if known in ("fm", "am", "dmr", "p25", "nxdn"):
+        mode = known                         # no 8 s probe: tune it as what it is
+    try:
+        lic = float(x.get("lic_mhz") or 0)   # the licence's own centre beats any channel-plan guess
+    except ValueError:
+        lic = 0.0
+    if lic and abs(lic - mhz) <= max(tol, 0.0125):
+        mhz, tol = lic, 0.0
+    now = time.time()
+    with FOLLOW_LOCK:
+        LISTEN["recent"][follow_key(mhz)] = (now, mhz, mode, tol)
+    if LISTEN["req"] is not None:
+        if abs(LISTEN["mhz"] - mhz) < 0.02:
+            LISTEN["until"] = now + LISTEN_MAX_S
+            return                           # already on it
+        if follow_busy(now):
+            return                           # still tuning or probing, or busy with a live one: it's queued in "recent"
+    follow_next(now)
+
+
+def follow_next(now: float) -> bool:
+    """Tune the newest candidate that hasn't just been played. False when nothing is waiting."""
+    with FOLLOW_LOCK:
+        recent, played = LISTEN["recent"], LISTEN["played"]
+        for k in [k for k, (seen, _, _, _) in recent.items() if now - seen > FOLLOW_RECENT_S]:
+            del recent[k]
+        for k in [k for k, left in played.items() if now - left > FOLLOW_COOLDOWN_S]:
+            del played[k]
+        if HUNT["on"]:
+            return False                         # the hunt is reading the sweep; a listen now would pause it and stall the hunt
+        cur = follow_key(LISTEN["mhz"]) if LISTEN["req"] is not None else None
+        cands = [(seen, k, mhz, mode, tol) for k, (seen, mhz, mode, tol) in recent.items() if k not in played and k != cur]
+    if not cands:
+        return False
+    _, _, mhz, mode, tol = max(cands)
+    listen_start(mhz, mode, LISTEN["sq"], tol)
+    return True
+
+
+def follow_leave(now: float, why: str) -> None:
+    """Done with the current channel: remember it so it isn't returned to at once, then move on or wait."""
+    if LISTEN["req"] is not None:
+        with FOLLOW_LOCK:
+            LISTEN["played"][follow_key(LISTEN["mhz"])] = now
+    if not follow_next(now):
+        if TRUNK["auto"] and LISTEN["follow"] and not HUNT["on"] and "trunked system" not in why and trunk_resume():
+            listen_status(f"follow: {why}; back to the trunked system")
+            return
+        listen_stop(why)
+        listen_status(f"follow: {why}; waiting for the next signal")
+
+
+def trunk_resume() -> bool:
+    """Nothing conventional is waiting: return to a trunked system if one is known — the control channel
+    that worked last time, or a site the sweep has been seeing. No hunt here: that borrows the dongle
+    for a minute and belongs to a fresh Follow, not every quiet moment."""
+    last = cc_load()
+    if last:
+        TRUNK["tries"], TRUNK["cc_at"] = [], time.time()
+        if last[2]:
+            TRUNK["system"] = last[2]
+        listen_start(last[0], last[1], LISTEN["sq"], 0.0)
+        return True
+    site, cands = trunk_candidates(None)
+    if cands:
+        return trunk_start(site)
+    return False
+
+
+def follow_watch() -> None:
+    """Follow's 1 s supervisor thread. One bad pass (a field a racing command just cleared, a tool that
+    died mid-call) must not end Follow for the rest of the run: log it and carry on with the next second."""
+    while True:
+        time.sleep(1)
+        try:
+            _follow_tick(time.time())
+        except Exception as e:  # noqa: BLE001
+            print(f"bridge: follow: {type(e).__name__}: {e}", file=sys.stderr)
+
+
+def _follow_tick(now: float) -> None:
+    if not LISTEN["follow"]:
+        return
+    if now > LISTEN["follow_until"]:
+        LISTEN["follow"] = False
+        listen_stop("follow timed out (5 min without the app renewing it)", cancel_hunt=True)
+        listen_status("follow ended")
+        return
+    if LISTEN["proc"] is None:
+        return
+    if LISTEN["mode"] in TRUNK_MODES:
+        proc = LISTEN["proc"]
+        if LISTEN["detected"] and not LISTEN.get("call") and getattr(proc, "enc_cmds", 0) >= 3 \
+                and now - LISTEN["chan_at"] >= 15.0:
+            # The control channel keeps issuing encryption commands and no clear call has come: an
+            # encrypted system (a Harris-encrypted agency, say). Nothing to hear; on to the next, and
+            # don't come back to it for a while.
+            cc_forget(LISTEN["mhz"])
+            listen_status(f"trunked: {LISTEN['mhz']:.4f} MHz is an encrypted system; skipping it")
+            if not trunk_next_system(now):
+                follow_leave(now, "encrypted system")
+            return
+        if LISTEN["detected"] and now - max(LISTEN["chan_at"], LISTEN.get("call_at", 0.0)) >= TRUNK_IDLE_S:
+            if not trunk_next_system(now):
+                follow_leave(now, f"no call on the trunked system for {TRUNK_IDLE_S:.0f} s")
+        return
+    if now - LISTEN["chan_at"] >= FOLLOW_MAX_S:
+        follow_leave(now, f"{FOLLOW_MAX_S:.0f} s on {LISTEN['mhz']:.4f} MHz is enough")
+    elif not follow_busy(now):
+        # It went quiet: take the newest waiting signal, if any. The channel just left gets the same
+        # cooldown as one that used its 30 s, or two dead carriers would be tuned turn and turn about.
+        with FOLLOW_LOCK:
+            if LISTEN["req"] is not None and LISTEN["recent"] and any(k != follow_key(LISTEN["mhz"]) and k not in LISTEN["played"] for k in LISTEN["recent"]):
+                LISTEN["played"][follow_key(LISTEN["mhz"])] = now
+        follow_next(now)
+
+
+def listen_busy(dev: str) -> bool:
+    """The dongle is spoken for from the moment a listen is asked for until it ends — not just while
+    rtl_fm runs. Otherwise the sweep restarts in the gap and grabs it back (usb_claim_interface -6)."""
+    return (LISTEN["req"] is not None or LISTEN["proc"] is not None or LISTEN["starting"]
+            or (HUNT["on"] and not HUNT.get("sweeping"))) and LISTEN["dev"] == dev
+
+
+def listen_status(msg: str) -> None:
+    on = LISTEN["proc"] is not None
+    emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"],
+          "listen": {"mhz": LISTEN["mhz"] if on else 0, "mode": LISTEN["mode"] if on else "",
+                     "asked": LISTEN["asked"] if on else "", "detected": LISTEN["detected"] if on else "",
+                     "call": LISTEN["call"] if on else "",
+                     "sq": LISTEN["sq"], "follow": bool(LISTEN["follow"]),
+                     "lockout": LISTEN["lockout"],
+                     "system": (TRUNK.get("system") or "") if on and LISTEN["mode"] in TRUNK_MODES else "",
+                     "hold": bool(TRUNK.get("hold")), "tglock": int(TRUNK.get("tg_lock") or 0), "idle": TRUNK_IDLE_S,
+                     "tgavoid": sorted(TRUNK.get("tg_avoid") or []),
+                     "systems": [{"mhz": r["mhz"], "db": round(r["lvl"]),
+                                  "name": r.get("name", "") or TRUNK.get("learned", {}).get(round(r["mhz"], 4), ""),
+                                  "skip": time.time() - r["failed_at"] < TRUNK_FAIL_SKIP_S}
+                                 for r in (TRUNK.get("ranked") or [])[:8]],
+                     "cats": sorted(TRUNK.get("cats") or []),
+                     "tgs": [{"ts": int(ts), "tg": tg, "name": nm, "enc": e, "cat": c} for ts, tg, nm, e, c in TRUNK.get("tg_seen") or []][-12:]
+                     } if (on or LISTEN["follow"]) else "off"})
+
+
+def listen_stop(why: str = "stopped", cancel_hunt: bool = False) -> None:
+    """End the current listen. A control-channel hunt in progress is left alone unless cancel_hunt: only
+    the phone's "off" and the end of Follow should stop it — not a tool exiting or a stale listen timing out."""
+    if cancel_hunt and HUNT["on"]:
+        HUNT["cancel"] = True
+        print(f"bridge: control-channel hunt cancelled: {why}", file=sys.stderr)
+    with LISTEN_CV:
+        was = LISTEN["req"] is not None
+        LISTEN["req"] = None
+        LISTEN["gen"] += 1
+        LISTEN_CV.notify()
+    if was:
+        print(f"bridge: listen: {why}", file=sys.stderr)
+
+
+def listen_start(mhz: float, mode: str, sq: int, tol: float = 0.05) -> None:
+    """Ask the listener thread for a frequency. One thread, one rtl_fm: a new request while one is
+    starting or playing replaces it (the generation changes and the old one winds down).
+    mhz is where the sweep placed the carrier, tol how far it may be off; the listen is on the likeliest
+    channel for that (snap_channel), and later sweep readings may move it (hone)."""
+    mode = mode if mode in LISTEN_MODES or mode in DIGITAL_MODES else "fm"
+    raw = mhz
+    mhz = round(mhz, 4) if mode in TRUNK_MODES else snap_channel(mhz, tol)   # a control channel is given exactly
+    with LISTEN_CV:
+        same = (LISTEN["req"] is not None and abs(LISTEN["raw_mhz"] - raw) < 0.0005 and LISTEN["asked"] == mode
+                and LISTEN["sq"] == sq)
+        LISTEN["until"] = time.time() + LISTEN_MAX_S
+        if same:
+            return                           # a renewal: just push the deadline out
+        if LISTEN["req"] is not None and abs(LISTEN["mhz"] - mhz) < 0.0005 and LISTEN["asked"] == mode and LISTEN["sq"] == sq:
+            LISTEN["raw_mhz"] = raw          # another reading of the same channel: nothing to retune
+            return
+        LISTEN["req"] = (mhz, mode, sq)
+        LISTEN["mhz"], LISTEN["mode"], LISTEN["asked"], LISTEN["sq"] = mhz, mode, mode, sq
+        LISTEN["raw_mhz"], LISTEN["tol"], LISTEN["readings"], LISTEN["honed_at"] = raw, tol, [raw], 0.0
+        LISTEN["carrier_at"], LISTEN["detected"], LISTEN["call"] = 0.0, "", ""
+        LISTEN["reprobe"] = 0.0
+        LISTEN["chan_at"] = time.time()
+        LISTEN["gen"] += 1
+        LISTEN_CV.notify()
+    if abs(mhz - raw) >= 0.0005:
+        print(f"bridge: listen: {raw:.4f} read as channel {mhz:.4f}", file=sys.stderr)
+
+
+def listen_resolve(mode: str, why: str, mhz: "float | None" = None) -> None:
+    """Restart the current listen with a definite mode and/or a corrected frequency. The asked mode
+    stays what the app asked ("auto"), so its renewals don't undo the decision."""
+    with LISTEN_CV:
+        if LISTEN["req"] is None:
+            return
+        cur_mhz, cur_mode, sq = LISTEN["req"]
+        mhz = cur_mhz if mhz is None else mhz
+        LISTEN["req"] = (mhz, mode, sq)
+        LISTEN["mode"], LISTEN["mhz"] = mode, mhz
+        LISTEN["gen"] += 1
+        LISTEN_CV.notify()
+    print(f"bridge: listen: → {mhz:.4f} MHz {mode} ({why})", file=sys.stderr)
+
+
+def hone(reading: float) -> None:
+    """Each sweep reading of the tuned carrier refines its position; when the average lands on another
+    channel than the one tuned, retune there. A HackRF's ±25 kHz is more than a 12.5 kHz channel."""
+    if LISTEN["mode"] in TRUNK_MODES or LISTEN["tol"] == 0.0:
+        return                               # dsd-fme owns the tuning on a trunked system; a licensed centre is exact
+    rd = LISTEN["readings"]
+    rd.append(reading)
+    del rd[:-8]
+    now = time.time()
+    if len(rd) < HONE_MIN_READINGS or now - LISTEN["honed_at"] < HONE_RATE_S or LISTEN["proc"] is None:
+        return
+    mean = sum(rd) / len(rd)
+    target = snap_channel(mean, LISTEN["tol"] / len(rd) ** 0.5 + 0.003)
+    if abs(target - LISTEN["mhz"]) >= 0.002:
+        LISTEN["honed_at"] = now
+        del rd[:]
+        listen_resolve(LISTEN["req"][1], f"honed from {len(rd) or HONE_MIN_READINGS} readings averaging {mean:.4f}", mhz=target)
+        listen_status(f"retuned to {target:.4f} MHz: the carrier averages {mean:.4f}")
+
+
+def listen_worker() -> None:
+    while True:
+        with LISTEN_CV:
+            while LISTEN["req"] is None:
+                LISTEN_CV.wait()
+            req, gen = LISTEN["req"], LISTEN["gen"]
+        serve_listen(req, gen)
+
+
+SYNC_RE = re.compile(r"Sync:\s*[+-]?\s*([A-Za-z0-9]+)")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def stop_tools(procs: list) -> None:
+    """Stop a listen's tools, client first (dsd-fme, then rtl_tcp: rtl_tcp can sit on the dongle until its
+    client is gone), and kill what hasn't exited within a second and a half. A tool that lingers keeps the
+    dongle, and then neither the sweep nor the next listen can open it (usb_claim_interface -6)."""
+    for q in reversed(procs):
+        try:
+            q.terminate()
+        except Exception:
+            pass
+    deadline = time.time() + 1.5
+    for q in reversed(procs):
+        while q.poll() is None and time.time() < deadline:
+            time.sleep(0.05)
+        if q.poll() is None:
+            try:
+                q.kill()
+                q.wait(timeout=1)
+            except Exception:
+                pass
+
+
+def kill_strays() -> None:
+    """A bridge that died mid-listen leaves rtl_tcp/dsd-fme holding the dongle: clear them before starting."""
+    subprocess.call(["pkill", "-f", f"rtl_tcp -a 127.0.0.1 -p {RTL_TCP_PORT}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.call(["pkill", "-f", f"udp:127.0.0.1:{DSD_UDP_PORT}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
+    """Start a radio tool, retrying while the dongle is still being released by the sweep.
+    Returns the process, None if it never came up, or False if the tool isn't installed."""
+    for attempt in range(attempts):
+        if LISTEN["gen"] != gen:
+            return None                      # superseded while we were getting the dongle
+        try:
+            p = subprocess.Popen(shlex.split(cmd), stdout=kw.get("stdout", subprocess.DEVNULL), stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            return False
+        p.err_tail = deque(maxlen=3)
+        p.sync, p.sync_at = "", 0.0
+        p.call, p.call_at = "", 0.0
+        p.voice_at, p.enc_now, p.enc_at = 0.0, False, 0.0
+        tool = os.path.basename(cmd.split()[0])
+
+        def drain(proc=p):                   # dsd-fme chatters on stderr; an undrained pipe would stall it
+            for ln in proc.stderr:
+                ln = ln.decode("utf-8", "replace").strip()
+                if not ln:
+                    continue
+                ln = ANSI_RE.sub("", ln)
+                proc.err_tail.append(ln)
+                if "Explicit Encryption Command" in ln or "ENC LO" in ln:
+                    proc.enc_cmds = getattr(proc, "enc_cmds", 0) + 1
+                if re.search(r"(?i)sync:|\bTG\b|ENC|ALG|error|fail|cannot|unable|exit|frequency|ll\+|dropped", ln) \
+                        and not re.search(r"Sync: \+P25p1 .*(TSBK|duid:EE|TDULC)\s*$", ln) and ln != "Sync: no sync":
+                    log_line(f"{tool}: {ln}")     # the per-frame control-channel chatter stays out of the phone journal
+                if kw.get("watch_sync"):
+                    m = SYNC_RE.search(ln)
+                    if m and not getattr(proc, "alive_at", 0.0):
+                        proc.alive_at = time.time()       # demodulating: the auto-detect clock starts here
+                    if m and m.group(1).lower() not in ("no", "none", "lost"):
+                        proc.sync, proc.sync_at = m.group(1), time.time()
+                        mn = re.search(r"NAC(?:/CC)?:\s*([0-9A-Fa-f]{1,4})", ln)
+                        if mn:
+                            proc.nac = mn.group(1).upper()
+                    # Voice frames (P25 LDU1/LDU2, DMR voice bursts) mean a call is playing right now, whether
+                    # or not a TG line came with them — dsd-fme names the talkgroup on the grant, then just
+                    # streams LDUs for the rest of the call. ALG ID 0x80 / 0x00 = clear, anything else = encrypted.
+                    if re.search(r"\bLDU[12]\b|Voice Frame|VC[12]|\bHDU\b", ln):
+                        proc.voice_at = time.time()
+                    if re.search(r"\bTSBK\b|\bTDULC\b|duid:EE|\bTSDU\b|MAC_SIGNAL|CSBK|C_ALOHA|SYS_ID|Site ID", ln):
+                        proc.ctrl_at = time.time()           # control-channel traffic: what a CC and only a CC carries
+                    ma = re.search(r"ALG(?: ID)?:\s*0x([0-9A-Fa-f]+)", ln)
+                    if ma:
+                        e = ma.group(1).upper() not in ("80", "0", "00")
+                        # two frames in a row before the flag flips: one stray ALG line from the other TDMA
+                        # slot or a late header must not label a clear dispatch call "encrypted"
+                        proc.enc_run = (getattr(proc, "enc_run", 0) + 1) if e else 0
+                        proc.clr_run = (getattr(proc, "clr_run", 0) + 1) if not e else 0
+                        if proc.enc_run >= 2:
+                            proc.enc_now, proc.enc_at = True, time.time()
+                        elif proc.clr_run >= 2:
+                            proc.enc_now, proc.enc_at = False, time.time()
+                    m = CALL_RE.search(ln)
+                    if m and "Channel Update" in ln and proc.call and f"TG {m.group(1)}" not in proc.call:
+                        # an update LCW naming other calls on the system: activity, not a change of call
+                        m2 = re.search(rf"\bTG[:= ]\s*{re.escape(proc.call.split()[1]) if len(proc.call.split()) > 1 else 'x'}\b", ln)
+                        proc.call_at = time.time()
+                        m = m2
+                    if m:
+                        enc = ENC_RE.search(ln)
+                        tok = enc.group(1).strip() if enc else ""
+                        clear = bool(re.search(r"(?i)alg(?:id)?\s*[:=]?\s*(?:0x80|0x0|0|128)$", tok))   # P25 ALGID 0x80 = clear
+                        # Talkgroup only: the source radio's unit ID is never read or shown (public build policy).
+                        proc.call = f"TG {m.group(1)}" + (f" · encrypted ({tok})" if tok and not clear else "")
+                        proc.call_at = time.time()
+        threading.Thread(target=drain, daemon=True).start()
+        time.sleep(0.5)
+        if p.poll() is None:
+            return p
+        time.sleep(0.1)
+        LISTEN["why"] = " | ".join(p.err_tail)
+        if attempt == 1 and re.search(r"(?i)usb_claim_interface|busy|-6\b", LISTEN["why"]):
+            # Twice refused: the sweep's rtl_power is sitting on the dongle past its SIGTERM. Take it.
+            print(f"bridge: listen: {LISTEN['dev'] or 'dongle'} still held; stopping whatever has it", file=sys.stderr)
+            free_dongle(LISTEN["dev"])
+        elif attempt == 5 and LISTEN["dev"]:
+            # Still not opening after the holder is gone: the dongle itself is hung. Re-enumerate it.
+            usb_reset(LISTEN["dev"])
+    return None
+
+
+def dongle_holder() -> str:
+    """Which other program has an RTL-SDR open — on a PiAware Pi it is usually dump1090-fa or dump978-fa."""
+    try:
+        out = subprocess.run(["pgrep", "-a", "-f", "dump1090|dump978|readsb|rtl_433|rtl_tcp|rtl_fm|rtl_power|dsd-fme|piaware"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    mine = os.getpid()
+    names = []
+    for ln in out.splitlines():
+        pid, _, cmd = ln.partition(" ")
+        if pid.isdigit() and int(pid) != mine and "wavelens_bridge" not in cmd and "pgrep" not in cmd:
+            names.append(os.path.basename(cmd.split()[0]) if cmd else "?")
+    return ", ".join(sorted(set(names)))
+
+
+def no_dongle_status() -> None:
+    why = LISTEN.get("why", "")
+    dev = LISTEN["dev"] or "the first RTL-SDR"
+    if re.search(r"(?i)usb_claim_interface|busy|-6\b", why):
+        who = dongle_holder()
+        msg = f"RTL-SDR {dev} is in use by another program" + (f" ({who})" if who else "") + \
+              " — stop it (sudo systemctl stop dump1090-fa) or set --listen-device to a free dongle"
+    elif re.search(r"(?i)no (supported|matching) devices|no devices found|not found|invalid", why):
+        msg = f"RTL-SDR {dev} not found — check the serial with rtl_test -t and --listen-device / @SERIAL"
+    else:
+        msg = f"could not open RTL-SDR {dev} for listening" + (f": {why[-160:]}" if why else "")
+    print(f"bridge: listen: no dongle ({why or 'no output'})", file=sys.stderr)
+    listen_status(msg)
+
+
+def start_pager(gen: int, mhz: float):
+    """multimon-ng on the analog audio; its decoded pages go to the phone as {"t":"page"} lines."""
+    try:
+        pm = subprocess.Popen(shlex.split(PAGER_CMD), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return None
+
+    seen = {"good": 0, "junk": 0}
+
+    def reader():
+        for raw in pm.stdout:
+            ln = raw.decode("utf-8", "replace").strip()
+            m = PAGE_RE.match(ln)
+            if not m or LISTEN["gen"] != gen:
+                continue
+            proto, rest = m.group(1), m.group(2)
+            am = PAGE_ADDR_RE.search(rest)
+            mm = PAGE_MSG_RE.search(rest)
+            msg = page_clean((mm.group(1) or mm.group(2)) if mm else rest)
+            if not msg or not re.search(r"[A-Za-z0-9]", msg):
+                continue                     # a page that was only control bytes or tone codes
+            if not page_plausible(proto, page_kind(rest), msg):
+                seen["junk"] += 1
+                if seen["junk"] in (1, 20):  # said once, and once more if it keeps coming: not a line per decode
+                    print(f"bridge: pager: dropping implausible {proto} decodes on {mhz:.4f} MHz "
+                          f"(not a paging signal, or too weak to read)", file=sys.stderr)
+                continue
+            seen["good"] += 1
+            kind = "FLEX" if proto == "FLEX" else "POCSAG"
+            # One readable POCSAG decode can still be luck: the channel is only called pager data (and its
+            # audio muted) once a second one arrives. The page itself is shown either way.
+            if LISTEN["detected"] != kind and (kind == "FLEX" or seen["good"] >= PAGER_CONFIRM):
+                LISTEN["detected"] = kind
+                listen_status(f"{kind} pager data on {mhz:.4f} MHz: pages shown, audio muted")
+            emit({"t": "page", "f": round(mhz, 4), "proto": proto, "addr": (am.group(1) or am.group(2)) if am else "",
+                  "msg": msg[:300], "src": "rtlfm"})
+    threading.Thread(target=reader, daemon=True).start()
+    return pm
+
+
+SMARTNET_RATE = 24000       # rtl_fm output on the control channel; 6.7 samples per 3600-baud bit
+SMARTNET_CC_WAIT_S = 10.0   # no decodable OSW within this → not a Type II control channel
+SMARTNET_CALL_S = 6.0       # a voice channel is played this long after its grant / last update (off the control
+                            # channel nothing renews it; Type II calls are short and the next grant re-tunes)
+MOTO_BAND = "800"           # --moto-band: 800 | 800r | 800s | 900 | obt:base:spacing:offset
+
+
+def serve_smartnet(cc_mhz: float, sq: int, gen: int) -> None:
+    """Follow a Motorola Type II system. rtl_fm demodulates the control channel (narrow FM, discriminator
+    out) into smartnet.py, which prints grants as JSON lines. On a group grant the control-channel rtl_fm
+    is stopped, a second rtl_fm plays the voice channel (analog FM, squelch) for SMARTNET_CALL_S (or until
+    its squelch closes), then the control channel is resumed. One dongle does both, in turn — the way a
+    single-receiver scanner does it. Encrypted-flagged calls are skipped. Receive only."""
+    import select
+    dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
+    ppm = f" -p {LISTEN['ppm']}" if LISTEN["ppm"] else ""
+    dec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smartnet.py")
+    if not os.path.exists(dec_path):
+        listen_stop("smartnet.py missing"); listen_status("Motorola Type II needs companion/pi/smartnet.py next to the bridge"); return
+    cc_cmd = f"rtl_fm -f {cc_mhz:.4f}M -M fm -s {SMARTNET_RATE} -l 0 -g 40{ppm}{dev} -"
+
+    class Holder:                           # what the status loop reads (p.sync / p.call like a dsd-fme process)
+        sync, sync_at, call, call_at = "", 0.0, "", 0.0
+        err_tail = deque(maxlen=3)
+        def poll(self): return None
+    p = Holder()
+    LISTEN["proc"] = p
+    LISTEN["starting"] = False
+    LISTEN["tuned_at"] = LISTEN["last_audio"] = time.time()
+    print(f"bridge: listen: {cc_mhz:.4f} MHz trunkm (Motorola Type II, band {MOTO_BAND})", file=sys.stderr)
+    listen_status(f"listening on {cc_mhz:.4f} MHz (TRUNKM): decoding the Type II control channel")
+    enc = Ima()
+    cur = {"tg": 0, "mhz": 0.0, "since": 0.0, "voice": None, "cc": None, "dec": None}
+
+    def start_cc() -> bool:
+        cur["cc"] = start_tool(cc_cmd, gen, stdout=subprocess.PIPE)
+        if not cur["cc"]:
+            return False
+        cur["dec"] = subprocess.Popen([sys.executable, "-I", dec_path, "--rate", str(SMARTNET_RATE), "--band", MOTO_BAND],
+                                      stdin=cur["cc"].stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        return True
+
+    def stop_cc() -> None:
+        stop_tools([q for q in (cur["dec"], cur["cc"]) if q is not None])
+        cur["cc"] = cur["dec"] = None
+
+    def start_voice(mhz: float) -> bool:
+        cmd = f"rtl_fm -f {mhz:.4f}M -M fm -s 16000 -r {LISTEN_RATE} -l {sq} -E dc -g 40{ppm}{dev} -"
+        v = start_tool(cmd, gen, stdout=subprocess.PIPE, attempts=6)
+        cur["voice"] = v if v else None
+        return cur["voice"] is not None
+
+    def stop_voice() -> None:
+        if cur["voice"] is not None:
+            stop_tools([cur["voice"]])
+        cur["voice"] = None
+
+    if not start_cc():
+        listen_stop("no dongle"); no_dongle_status(); return
+    n_osw = 0
+    try:
+        while LISTEN["gen"] == gen:
+            now = time.time()
+            if now > LISTEN["until"]:
+                listen_stop("timed out (5 min); tap Listen again to continue")
+                break
+            if cur["voice"] is not None:
+                r, _, _ = select.select([cur["voice"].stdout], [], [], 0.5)
+                chunk = cur["voice"].stdout.read(LISTEN_FRAME * 2) if r else b""
+                if len(chunk) == LISTEN_FRAME * 2:
+                    LISTEN["last_audio"] = now
+                    LISTEN["seq"] = (LISTEN["seq"] + 1) & 0xFF
+                    try:
+                        aout.put_nowait(enc.frame(LISTEN["seq"], chunk))
+                    except Exception:
+                        pass
+                # back to the control channel when the call's time is up, or the squelch has been shut 1.5 s
+                done = now - cur["since"] > SMARTNET_CALL_S or (now - cur["since"] > 1.0 and now - LISTEN["last_audio"] > 1.5)
+                if done or (r and not chunk):
+                    stop_voice()
+                    p.call, cur["tg"] = "", 0
+                    if not start_cc():
+                        listen_stop("no dongle"); no_dongle_status(); break
+                continue
+            r, _, _ = select.select([cur["dec"].stdout], [], [], 0.25)
+            if not r:
+                if n_osw == 0 and now - LISTEN["tuned_at"] > SMARTNET_CC_WAIT_S and TRUNK["cc_at"]:
+                    TRUNK["cc_at"] = 0.0
+                    cc_forget(cc_mhz)
+                    stop_cc()
+                    trunk_next(f"no Type II control channel on {cc_mhz:.4f} MHz")
+                    return
+                continue
+            line = cur["dec"].stdout.readline()
+            if not line:
+                break
+            try:
+                ev = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            kind = ev.get("ev")
+            if n_osw == 0 and kind in ("grant", "update", "idle", "cc", "sysid", "stats"):
+                n_osw = 1
+                p.sync, p.sync_at = "MOTO", now
+                LISTEN["detected"] = "MOTO"
+            if kind == "sysid":
+                log_line(f"smartnet: system {int(ev.get('sysid') or 0):04X}, control channel {ev.get('mhz')} MHz")
+                continue
+            if kind not in ("grant", "update") or not ev.get("mhz"):
+                continue
+            tg = int(ev.get("tg") or 0)
+            if ev.get("enc"):
+                p.call, p.call_at = f"TG {tg} · encrypted", now
+                continue
+            if not tg or locked_out(float(ev["mhz"])):
+                continue
+            # Talkgroup only; the source radio ID in a grant is never kept or shown.
+            p.call, p.call_at = f"TG {tg}", now
+            cur["tg"], cur["mhz"], cur["since"] = tg, float(ev["mhz"]), now
+            stop_cc()
+            if start_voice(cur["mhz"]):
+                LISTEN["last_audio"] = now
+                log_line(f"smartnet: TG {tg} on {cur['mhz']:.4f} MHz")
+            elif not start_cc():
+                listen_stop("no dongle"); no_dongle_status(); break
+    finally:
+        stop_voice()
+        stop_cc()
+        LISTEN["proc"] = None
+
+
+def serve_listen(req: tuple, gen: int) -> None:
+    LISTEN["starting"] = True
+    try:
+        _serve_listen(req, gen)
+    finally:
+        LISTEN["starting"] = False
+
+
+def _serve_listen(req: tuple, gen: int) -> None:
+    mhz, mode, sq = req
+    if mode == "trunkm":
+        return serve_smartnet(mhz, sq, gen)
+    dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
+    procs = []
+    sock = None
+    pager, out_rate, demod_rate = False, LISTEN_RATE, float(AFC_RATE_IN)
+    if mode in DIGITAL_MODES:
+        flag, chans = DIGITAL_MODES[mode]
+        kill_strays()
+        # -b 32 / -n 64: more and bigger USB transfers than the defaults, so a busy moment on the Pi (the
+        # audio encoder, BLE) doesn't drop IQ samples before dsd-fme reads them (a drop is a chopped syllable).
+        p = start_tool(f"rtl_tcp -a 127.0.0.1 -p {RTL_TCP_PORT}{dev} -b 32 -n 64", gen)
+        if p is False:
+            listen_stop("rtl_tcp missing"); listen_status("rtl_tcp not found on the Pi (apt install rtl-sdr)"); return
+        if p is None:
+            if LISTEN["gen"] == gen:
+                listen_stop("no dongle"); no_dongle_status()
+            return
+        procs.append(p)
+        for _ in range(40):                  # rtl_tcp says "listening..." once the dongle is open: dsd-fme can connect then
+            if any("listening" in ln for ln in p.err_tail) or p.poll() is not None or LISTEN["gen"] != gen:
+                break
+            time.sleep(0.1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
+        except OSError:
+            pass
+        sock.bind(("127.0.0.1", DSD_UDP_PORT))
+        sock.settimeout(0.5)
+        time.sleep(0.8)                      # rtl_tcp needs a moment before it accepts a client
+        # rtltcp:host:port:freq:gain:ppm:bw(kHz):squelch:volume — dsd-fme does its own FM demodulation.
+        # No -N: that turns the ncurses screen ON, and under systemd there is no terminal to open.
+        bw = 24 if mode in TRUNK_MODES else 12
+        cmap = f" -C {shlex.quote(TRUNK['map'])}" if mode in ("trunke", "trunkd") and TRUNK.get("map") else ""
+        # Squelch 0 for dsd-fme: its "sq" is an RMS threshold in its own scale, not rtl_fm's, and a digital
+        # decode gates itself on frame sync anyway — a high value here silences voice that is decoding fine.
+        # -v D: dsd-fme's digital high-pass, low-pass and pass-band filters on (default leaves the low-pass off;
+        # it takes the vocoder's high-frequency hash out). -g 0: automatic digital output gain, so a quiet
+        # talkgroup and a loud one come out at the same level. The :vol field is the analog monitor, not this.
+        d = start_tool(f"dsd-fme {flag}{cmap} -v D -g 0 -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:{bw}:0:2 "
+                       f"-o udp:127.0.0.1:{DSD_UDP_PORT}", gen, attempts=4, watch_sync=True)
+        if d is False or d is None:
+            stop_tools(procs)
+            sock.close()
+            if d is False:
+                listen_stop("dsd-fme missing")
+                listen_status("digital voice needs dsd-fme on the Pi: run companion/pi/install-dsd.sh (10 min build)")
+            elif LISTEN["gen"] == gen:
+                listen_stop("dsd-fme failed"); listen_status("dsd-fme could not start; see journalctl -u wavelens-bridge")
+            return
+        procs.append(d)
+        p = d
+    else:
+        chans = 1
+        ppm = f" -p {LISTEN['ppm']}" if LISTEN["ppm"] else ""
+        dc = "" if mode == "fm" else " -E dc"    # FM keeps its DC: it is the AFC reading (removed below)
+        # With a pager decoder available, narrow FM is demodulated at its rate and fed to both the
+        # decoder and (resampled) the phone; without it, 16 kHz in and 8 kHz out as before.
+        # The pager decoder runs only for a client that asked for it ({"c":"pages","v":true}: the Lab app).
+        # … and only where paging is: on any other channel it reads telemetry as pages and mutes the audio.
+        pager = mode == "fm" and LISTEN["pages"] and pager_band_ok(mhz) and shutil.which("multimon-ng") is not None
+        rate_in = PAGER_RATE if pager else int(AFC_RATE_IN)
+        demod_rate = float(rate_in)
+        demod = f"-M fm -s {rate_in}" if mode == "fm" else LISTEN_MODES[mode]
+        out_rate = rate_in if pager else LISTEN_RATE
+        cmd = f"rtl_fm -f {mhz:.4f}M {demod} -r {out_rate} -l {sq}{dc} -g 40{ppm}{dev} -"
+        p = start_tool(cmd, gen, stdout=subprocess.PIPE)
+        if p is False:
+            listen_stop("rtl_fm missing"); listen_status("rtl_fm not found on the Pi (apt install rtl-sdr)"); return
+        if p is None:
+            if LISTEN["gen"] == gen:
+                listen_stop("no dongle"); no_dongle_status()
+            return
+        procs.append(p)
+        if pager:
+            pm = start_pager(gen, mhz)
+            if pm is not None:
+                procs.append(pm)
+            else:
+                pager = False
+    LISTEN["proc"] = p
+    LISTEN["starting"] = False
+    LISTEN["tuned_at"] = LISTEN["last_audio"] = time.time()
+    print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})", file=sys.stderr)
+    listen_status(f"listening on {mhz:.4f} MHz ({mode.upper()}); the RTL-SDR sweep is paused")
+    enc = Ima()
+    in_rate = out_rate if sock is None else LISTEN_RATE
+    need = int(in_rate * LISTEN_FRAME / LISTEN_RATE) * 2      # one 40 ms frame at the input rate
+    buf = b""
+
+    def watch():                             # squelched, the tools send nothing, so the reads below can't notice
+        while p.poll() is None:
+            if LISTEN["gen"] != gen:
+                break                        # retuned or stopped
+            now = time.time()
+            if now > LISTEN["until"]:
+                listen_stop("timed out (5 min); tap Listen again to continue")
+                break
+            if mode in TRUNK_MODES:
+                raw = getattr(p, "call", "")
+                voice = bool(LISTEN["detected"]) and now - getattr(p, "voice_at", 0.0) < 4.5   # LDU frames in the last 4.5 s, once locked
+                active = (bool(raw) and now - p.call_at < 8.0) or voice   # dsd-fme's last grant, or voice right now
+                if active:
+                    enc = getattr(p, "enc_now", False) and now - getattr(p, "enc_at", 0.0) < 5.0
+                    call = tg_named(raw) if raw else "call in progress"
+                    if enc and "encrypted" not in call:
+                        call += " · encrypted"
+                    mt = re.match(r"TG (\d+)", raw or "")
+                    tg = int(mt.group(1)) if mt else 0
+                    # TG lock / avoid: the call still shows, its audio is muted (dsd-fme keeps following
+                    # the system; the mute is on the bridge's audio frames)
+                    cat = tg_category(tg) if tg else ""
+                    muted = (TRUNK.get("tg_lock") and tg and tg != TRUNK["tg_lock"]) or (tg in TRUNK.get("tg_avoid") or set()) \
+                        or (TRUNK.get("cats") and tg and cat and cat not in TRUNK["cats"])
+                    LISTEN["mute"] = bool(muted)
+                    if muted and "· muted" not in call:
+                        call += " · muted"
+                    if LISTEN["call"] != call:                  # a new call: say so once, not every frame
+                        LISTEN["call"] = call
+                        if tg:
+                            seen = TRUNK.setdefault("tg_seen", [])
+                            if not seen or seen[-1][1] != tg or now - seen[-1][0] > 30:
+                                seen.append((now, tg, tg_named(f"TG {tg}").replace(f"TG {tg} · ", "").replace(f"TG {tg}", ""), enc, cat))
+                                del seen[:-40]
+                        listen_status(f"trunked call: {call}")
+                    LISTEN["call_at"] = now                     # the system is busy: the idle timer restarts
+                elif LISTEN["call"]:                            # the call ended
+                    LISTEN["call"] = ""
+                    LISTEN["mute"] = False
+                    listen_status(f"on the control channel {mhz:.4f} MHz, waiting for a call")
+                if not LISTEN["detected"] and not active and now - LISTEN["tuned_at"] >= TRUNK_CC_WAIT_S and TRUNK["cc_at"]:
+                    TRUNK["cc_at"] = 0.0         # once per candidate
+                    cc_forget(mhz)
+                    trunk_next(f"no control channel on {mhz:.4f} MHz")
+                    break
+                sync = getattr(p, "sync", "")
+                if sync and now - p.sync_at < 5.0 and LISTEN["detected"] != sync:
+                    voice_only = (sync.upper().startswith("P25") and now - getattr(p, "voice_at", 0.0) < 5.0
+                                  and not getattr(p, "ctrl_at", 0.0))
+                    if TRUNK["cc_at"] and voice_only and now - p.sync_at < 3.0 and now - LISTEN["tuned_at"] < 6.0:
+                        time.sleep(0.5)
+                        continue                 # P25p1 with voice frames: give a TSBK three seconds to show before deciding
+                    LISTEN["detected"] = sync
+                    if TRUNK["cc_at"] and (not cc_sync_ok(sync, mode) or voice_only):
+                        if voice_only:
+                            sync = f"{sync} voice (HDU/LDU, no TSBK)"
+                        # A sync, but not a control channel's: P25 phase 2 is TDMA voice, so this is one of the
+                        # system's voice channels. Its control channel is a phase 1 carrier nearby; keep looking.
+                        TRUNK["cc_at"] = 0.0
+                        cc_forget(mhz)
+                        trunk_next(f"{mhz:.4f} MHz carries {sync} (a voice channel, not the control channel)")
+                        break
+                    if TRUNK["cc_at"]:
+                        TRUNK["cc_at"], TRUNK["tries"] = 0.0, []
+                        site = TRUNK["site"] or ("?", "nearest system", "")
+                        name = site[0] if site[0] != "?" else site[1]
+                        cc = RR.control_at(mhz) if RR else None
+                        if cc:
+                            a, s, _ = rr_site(cc[2])
+                            name = f"{a} ({s})" if s != "?" and not rr_doubtful_site(cc[2]) else a
+                        nac = getattr(p, "nac", "")
+                        if name == "nearest system" and nac:
+                            name = f"unlisted P25 system (NAC {nac})"   # not in the RadioReference pack: named by its NAC
+                        TRUNK.setdefault("learned", {})[round(mhz, 4)] = name
+                        cc_save(mhz, mode, name)
+                        TRUNK["system"] = name
+                        TRUNK["tg_seen"] = []
+                        LISTEN["call_at"] = now          # the 5 s quiet clock starts at the lock, not at the tune
+                        listen_status(f"trunked: locked onto the control channel {mhz:.4f} MHz ({sync}, "
+                                      f"{'QPSK' if mode == 'trunkq' else 'C4FM' if mode == 'trunk' else mode}) — waiting for a call")
+            elif mode == "auto":
+                sync = getattr(p, "sync", "")
+                if sync and sync.upper().startswith(("DSTAR", "D-STAR", "NXDN")) and (764.0 <= mhz <= 776.0 or 851.0 <= mhz <= 869.0 or 935.0 <= mhz <= 941.0):
+                    sync = ""                    # no D-STAR or NXDN lives in these bands: a false sync on a data channel
+                if sync and now - p.sync_at < 5.0:
+                    if LISTEN["detected"] != sync:
+                        LISTEN["detected"] = sync
+                        listen_status(f"{sync} on {mhz:.4f} MHz")
+                elif not LISTEN["detected"]:
+                    carrier = LISTEN["carrier_at"]
+                    since_tune = now - LISTEN["tuned_at"]
+                    alive = getattr(p, "alive_at", 0.0)
+                    since_alive = now - alive if alive else 0.0
+                    reprobe = LISTEN.get("reprobe") == mhz
+                    wait = AUTO_REPROBE_S if reprobe else AUTO_WAIT_S
+                    if reprobe and alive and since_alive >= wait:
+                        LISTEN["detected"] = "DATA"
+                        LISTEN["reprobe"] = 0.0
+                        listen_status(f"digital carrier on {mhz:.4f} MHz: not a voice mode the companion decodes "
+                                      f"(NXDN, dPMR or data) — nothing to hear")
+                    elif not reprobe and ((carrier and now - carrier < 2.0 and alive and since_alive >= wait)
+                                          or since_tune >= AUTO_NO_CARRIER_WAIT_S + wait):
+                        LISTEN["detected"] = "FM"
+                        listen_resolve("fm", "carrier with no digital sync")
+                        break
+            time.sleep(0.5)
+        stop_tools(procs)
+    threading.Thread(target=watch, daemon=True).start()
+
+    # dsd-fme's UDP output (dsd_rigctl.c udp_socket_blaster, dsd_main.c pulse_digi_out_channels) is
+    # always 8 kHz 16-bit, and the channel count is fixed by the decoder flag, not by what it syncs to:
+    # -ft / -fs / -fa are stereo (two TDMA slots, L and R — a phase 1 call just plays the same on both),
+    # -f1 / -fi / -fd / -fE are mono. That is what DIGITAL_MODES records, and it never changes mid-listen.
+    # (Switching it on the sync line — "P25p1, so mono" — while dsd-fme kept sending stereo played every
+    # call at half speed an octave down.)
+    def read_chunk():
+        if sock is None:
+            return p.stdout.read(need - len(buf))
+        while p.poll() is None and LISTEN["gen"] == gen:
+            try:
+                data = sock.recv(65536)
+            except socket.timeout:
+                continue
+            if chans != 2:
+                return data[:len(data) & ~1]
+            data = data[:len(data) & ~3]     # two TDMA slots, L and R: mix to mono
+            if audioop is not None:
+                return audioop.tomono(data, 2, 0.5, 0.5)
+            n = len(data) // 4
+            lr = struct.unpack(f"<{2 * n}h", data)
+            return struct.pack(f"<{n}h", *[(lr[2 * i] + lr[2 * i + 1]) // 2 for i in range(n)])
+
+    ended_itself = True
+    afc = []                                 # offsets (Hz) from frames with signal, analog FM only
+
+    digi = []                                # per-frame (zcr, rms) of recent FM frames with signal
+
+    def digi_frame(pcm: bytes) -> bool:
+        """True when the last DIGI_FRAMES frames of FM audio look like a digital carrier, not voice."""
+        n = len(pcm) // 2
+        samples = struct.unpack(f"<{n}h", pcm)
+        m = sum(samples) / n
+        rms = (sum((v - m) ** 2 for v in samples) / n) ** 0.5
+        if rms < 300:
+            del digi[:]                      # squelch tail / silence: start over
+            return False
+        zc = 0
+        prev = samples[0] - m
+        for v in samples[1:]:
+            v -= m
+            if (v < 0) != (prev < 0):
+                zc += 1
+            prev = v
+        digi.append((zc / (n - 1), rms))
+        if len(digi) < DIGI_FRAMES:
+            return False
+        del digi[:-DIGI_FRAMES]
+        zcrs = sorted(z for z, _ in digi)
+        rmss = [r for _, r in digi]
+        steady = (max(rmss) - min(rmss)) < 0.35 * (sum(rmss) / len(rmss))
+        return zcrs[len(zcrs) // 4] >= DIGI_ZCR and steady
+
+    def afc_frame(pcm: bytes) -> bytes:
+        """Measure the carrier offset from this frame's DC level, then remove the DC so it plays clean.
+        Retune when enough frames agree the carrier sits on another channel."""
+        n = len(pcm) // 2
+        samples = struct.unpack(f"<{n}h", pcm)
+        mean = sum(samples) / n
+        if max(samples) - min(samples) > 600:            # audio present, not the squelch tail
+            afc.append(mean / 16384.0 * (demod_rate / 2))
+            if len(afc) >= AFC_FRAMES:
+                srt = sorted(afc)
+                off_hz = srt[len(srt) // 2]
+                del afc[:]
+                now = time.time()
+                if abs(off_hz) >= AFC_MIN_HZ and now - LISTEN["honed_at"] >= HONE_RATE_S:
+                    target = snap_channel(mhz + off_hz / 1e6, 0.003)
+                    if abs(target - mhz) >= 0.002:
+                        LISTEN["honed_at"] = now
+                        listen_resolve(mode, f"carrier {off_hz:+.0f} Hz from the tuned frequency", mhz=target)
+                        listen_status(f"retuned to {target:.4f} MHz: the carrier was {off_hz / 1000:+.1f} kHz off")
+        m = int(mean)
+        if pager:
+            try:                                         # the decoder gets the full-rate audio, DC removed
+                procs[-1].stdin.write(struct.pack(f"<{n}h", *[max(-32768, min(32767, v - m)) for v in samples]))
+                procs[-1].stdin.flush()
+            except Exception:
+                pass
+        if n != LISTEN_FRAME:                            # 22050 → 8000 for the phone: linear interpolation
+            step = n / LISTEN_FRAME
+            out = []
+            for i in range(LISTEN_FRAME):
+                x = i * step
+                j = int(x)
+                j2 = min(j + 1, n - 1)
+                v = samples[j] + (samples[j2] - samples[j]) * (x - j) - m
+                out.append(max(-32768, min(32767, int(v))))
+            return struct.pack(f"<{LISTEN_FRAME}h", *out)
+        return struct.pack(f"<{n}h", *[max(-32768, min(32767, v - m)) for v in samples])
+
+    try:
+        while True:
+            chunk = read_chunk()
+            if not chunk:
+                ended_itself = LISTEN["gen"] == gen
+                break
+            buf += chunk
+            while len(buf) >= need:
+                pcm, buf = buf[:need], buf[need:]
+                if sock is None and mode == "fm":
+                    pcm = afc_frame(pcm)
+                    if LISTEN["asked"] == "auto" and LISTEN.get("reprobe") != mhz and digi_frame(pcm):
+                        # the probe missed it (started late, or the repeater was idle): back to dsd-fme once
+                        LISTEN["reprobe"] = mhz
+                        LISTEN["detected"] = ""
+                        listen_status(f"{mhz:.4f} MHz sounds like a digital carrier — trying the decoders again")
+                        listen_resolve("auto", "FM audio is a digital carrier")
+                        break
+                if LISTEN["detected"] == "DATA":
+                    continue                 # digital carrier nobody can decode here: no audio, and Follow sees it as quiet
+                LISTEN["last_audio"] = time.time()
+                if LISTEN["detected"] in ("POCSAG", "FLEX"):
+                    continue                 # pager data: nothing to hear; the pages go as lines
+                if LISTEN.get("mute"):
+                    continue                 # TG lock / avoid: the call is shown but not heard
+                LISTEN["seq"] = (LISTEN["seq"] + 1) & 0xFF
+                try:
+                    aout.put_nowait(enc.frame(LISTEN["seq"], pcm))
+                except Exception:
+                    pass                     # the link is behind: drop this frame, keep the latest
+    finally:
+        stop_tools(procs)                    # the dongle stays "busy" until the tools are gone (listen_busy)
+        LISTEN["proc"] = None
+        if sock is not None:
+            sock.close()
+        if ended_itself and LISTEN["req"] is not None and LISTEN["gen"] == gen:
+            if time.time() > LISTEN["until"]:
+                listen_status("listening timed out after 5 min; tap Listen again to continue")
+            else:
+                time.sleep(0.2)
+                err = list(getattr(p, "err_tail", []))[-2:]
+                listen_stop(f"{procs[-1].args[0]} exited")
+                listen_status("listening ended: " + (" | ".join(err) or "the decoder exited"))
+        elif LISTEN["req"] is None:
+            listen_status("listening stopped; sweep resumes")
+
+
+# ---------------------------------------------------------------- ADS-B (dump1090 / readsb, SBS BaseStation port 30003)
+
+def feed_dump1090(hostport: str) -> None:
+    host, _, port = hostport.partition(":")
+    port = int(port or 30003)
+    seen = {}
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=10) as sk:
+                f = sk.makefile("r", encoding="utf-8", errors="replace")
+                for line in f:
+                    p = line.strip().split(",")
+                    if len(p) < 22 or p[0] != "MSG":
+                        continue
+                    icao = p[4].strip().lower()
+                    if not icao:
+                        continue
+                    now = time.time()
+                    if now - seen.get(icao, 0) < 5:
+                        continue
+                    seen[icao] = now
+                    callsign = p[10].strip()
+                    x = {}
+                    if p[11]: x["alt_ft"] = p[11]
+                    if p[12]: x["gs_kt"] = p[12]
+                    if p[14] and p[15]: x["lat"], x["lon"] = p[14], p[15]
+                    if p[17]: x["squawk"] = p[17]
+                    emit({"t": "rf", "id": f"adsb/{icao}", "n": f"aircraft {callsign or icao.upper()}",
+                          "f": 1090, "r": -60, "src": "adsb", "x": x})
+        except OSError as e:
+            print(f"bridge: dump1090 {hostport}: {e}; retrying", file=sys.stderr)
+            time.sleep(5)
+
+
+# ---------------------------------------------------------------- feeds
+
+# rtl_433 model names → what they probably are. Anything else lands as unclassified RF
+# with the model as its name, which is still useful on the map.
+RTL433_CAT = {
+    "TPMS": ("VEHICLE", "LIKELY"),
+    "Schrader": ("VEHICLE", "LIKELY"),
+    "Toyota": ("VEHICLE", "LIKELY"),
+    "Ford": ("VEHICLE", "LIKELY"),
+    "Citroen": ("VEHICLE", "LIKELY"),
+    "Abarth": ("VEHICLE", "LIKELY"),
+    "Renault": ("VEHICLE", "LIKELY"),
+    "Hyundai": ("VEHICLE", "LIKELY"),
+    "PMV": ("VEHICLE", "LIKELY"),
+    "Elantra": ("VEHICLE", "LIKELY"),
+    "Acurite": ("IOT", "LIKELY"),
+    "Oregon": ("IOT", "LIKELY"),
+    "LaCrosse": ("IOT", "LIKELY"),
+    "Ambient": ("IOT", "LIKELY"),
+    "Fineoffset": ("IOT", "LIKELY"),
+    "Honeywell": ("IOT", "LIKELY"),
+    "DSC": ("IOT", "LIKELY"),
+    "Interlogix": ("IOT", "LIKELY"),
+    "Generic-Remote": ("BEACON", "POSSIBLE"),
+}
+
+
+def feed_rtl433(line: str) -> None:
+    try:
+        d = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    model = str(d.get("model", "rtl_433"))
+    ident = str(d.get("id", d.get("sensor_id", d.get("channel", ""))))
+    cat, conf = ("UNKNOWN", "POSSIBLE")
+    for k, v in RTL433_CAT.items():
+        if k.lower() in model.lower():
+            cat, conf = v
+            break
+    if "tpms" in model.lower() or "pressure" in d:
+        cat, conf = ("VEHICLE", "LIKELY")
+    freq_f = d.get("freq") or d.get("freq1")
+    try:
+        freq_f = float(freq_f) if freq_f else 0.0
+    except (TypeError, ValueError):
+        freq_f = 0.0
+    freq = int(freq_f)
+    rssi = d.get("rssi")
+    try:
+        rssi = int(float(rssi))
+    except (TypeError, ValueError):
+        rssi = -70
+    x = {k: str(v) for k, v in d.items() if k in ("pressure_kPa", "pressure_PSI", "temperature_C", "battery_ok", "mic", "type")}
+    if (FCC or RR) and cat == "UNKNOWN" and freq_f:
+        lic = licensed_label(freq_f, 12.5)
+        if lic:
+            _, cat, conf, lx = lic
+            x.update(lx)
+    emit({"t": "rf", "id": f"{model}/{ident}", "n": model, "f": freq, "r": rssi, "cat": cat, "conf": conf, "src": "rtl433", "x": x})
+
+
+def feed_kismet_json(path: str) -> None:
+    """Re-reads a Kismet 'devices' JSON export every few seconds and relays Wi-Fi APs."""
+    seen = {}
+    while True:
+        try:
+            with open(path) as f:
+                devs = json.load(f)
+        except Exception:
+            devs = []
+        now = time.time()
+        for d in devs if isinstance(devs, list) else []:
+            if d.get("kismet.device.base.phyname") != "IEEE802.11":
+                continue
+            mac = d.get("kismet.device.base.macaddr", "").lower()
+            if len(mac) != 17 or now - seen.get(mac, 0) < 2:
+                continue
+            seen[mac] = now
+            ssid = d.get("kismet.device.base.name", "") or ""
+            ch = d.get("kismet.device.base.channel", "0")
+            try:
+                ch = int(str(ch).split(".")[0])
+            except ValueError:
+                ch = 0
+            rssi = d.get("kismet.device.base.signal", {}).get("kismet.common.signal.last_signal", -70)
+            emit({"t": "wifi", "id": mac, "n": ssid, "r": int(rssi), "ch": ch, "src": "kismet"})
+        time.sleep(3)
+
+
+def feed_stdin(mode: str) -> None:
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        if mode == "rtl433":
+            feed_rtl433(line)
+        else:
+            if line.startswith("{"):
+                out.put(line + "\n")        # a foreign JSON line (kismet): bulk
+    if mode == "rtl433":
+        # rtl_433 has exited (dongle busy, unplugged, wrong serial). If it died within seconds of start
+        # — the sensor dongle isn't there — carry on without sensors rather than restart-loop the whole
+        # bridge: the scanner, sweep and trunking don't need it. A later exit (it ran for a while, then
+        # the dongle dropped) still restarts the service so both come back together.
+        up = time.time() - START_AT
+        if up < 20.0:
+            print(f"bridge: rtl_433 exited {up:.0f} s after start (no sensor dongle?): carrying on without TPMS / sensor decoding "
+                  "— replug the rtl_433 dongle and restart the service to get it back", file=sys.stderr)
+            if "rf" in CAPS and not (HACKRF_ON or SWEEP_RANGES):
+                CAPS.remove("rf")
+            return
+        print("bridge: rtl_433 stopped sending; exiting so the service restarts it", file=sys.stderr)
+        os._exit(1)
+
+
+def feed_rtl433_child(dev: str, extra: str = "") -> None:
+    """Run rtl_433 ourselves on this dongle (auto plan): restart it when it exits, give up on it for a
+    minute if it can't open the dongle, and keep the rest of the bridge up either way."""
+    while True:
+        if dev not in usb_rtl_serials():
+            time.sleep(10); continue
+        cmd = f"rtl_433 -F json -d :{dev} {extra or region_packs.rtl433_args(REGION['pack'], RTL433_DEFAULT_ARGS)}"
+        p = spawn(cmd)
+        RTL433_CHILD["p"] = p
+        if p is None:
+            print("bridge: rtl_433 not on PATH: no sensor decoding (apt install rtl-433)", file=sys.stderr); return
+        for line in p.stdout:
+            line = line.strip()
+            if line.startswith("{"):
+                feed_rtl433(line)
+        reap(p, cmd)
+        time.sleep(5)
+
+
+RTL433_DEFAULT_ARGS = "-f 315M -f 433.92M -f 915M -H 30 -g 40"
+RTL433_CHILD = {"p": None}       # the rtl_433 the auto plan runs, so a region change can restart it
+AUTO = {"on": False, "known": set(), "hackrf": False, "args": None}
+
+
+def hotplug_watch() -> None:
+    """Every 10 s: what radios are on the bus now versus a moment ago. A dongle that appears when nothing
+    is listening becomes the listening/sweep dongle; a HackRF that appears starts sweeping; something that
+    vanishes is said once (the hardware line on the phone shows it too). Serials never matter: the plan
+    is redone from what is present."""
+    a = AUTO["args"]
+    while True:
+        time.sleep(10)
+        try:
+            now_rtl = set(usb_rtl_serials())
+            hk = hackrf_on_usb()
+            gone = AUTO["known"] - now_rtl
+            new = now_rtl - AUTO["known"]
+            for sn in gone:
+                role = "listen" if sn == LISTEN.get("dev") else "a sweep/sensor"
+                print(f"bridge: hotplug: RTL-SDR {sn} ({role} dongle) left the bus", file=sys.stderr)
+                if sn == LISTEN.get("dev"):
+                    spare = [x for x in now_rtl if x != AUTO.get("rtl433")]
+                    if spare:
+                        LISTEN["dev"] = spare[0]
+                        print(f"bridge: hotplug: listening moves to {spare[0]}", file=sys.stderr)
+                        emit({"t": "status", "msg": f"RTL-SDR {sn} unplugged; listening on {spare[0]} now", "band": state["band"], "mode": state["mode"]})
+                    else:
+                        emit({"t": "status", "msg": f"RTL-SDR {sn} unplugged: nothing left to listen with", "band": state["band"], "mode": state["mode"]})
+            for sn in new:
+                print(f"bridge: hotplug: RTL-SDR {sn} appeared", file=sys.stderr)
+                if not LISTEN.get("dev") or LISTEN["dev"] not in now_rtl:
+                    LISTEN["dev"] = sn
+                    if "listen" not in CAPS:
+                        CAPS.extend(["listen", "trunk"])
+                    if a is not None and not any(sn in d for d in SWEEP_DEVS):
+                        specs = SWEEP_VHF + SWEEP_UHF + ([] if sweep_specs_cover(SWEEP_VHF + SWEEP_UHF, CC_BANDS[0]) else [CC_BANDS[0][0]])
+                        SWEEP_DEVS.add(sn)
+                        for sp in specs:
+                            SWEEP_RANGES.append((_mhz(sp.split(":")[0]), _mhz(sp.split(":")[1])))
+                        threading.Thread(target=feed_rtl_power, args=(specs, sn, max(3, a.rtl_power_dwell), a.rtl_ppm, a.rtl_gain), daemon=True).start()
+                        if "sweep" not in CAPS:
+                            CAPS.append("sweep")
+                    print(f"bridge: hotplug: {sn} is now the listening + sweep dongle", file=sys.stderr)
+                    emit({"t": "status", "msg": f"RTL-SDR {sn} plugged in: listening and sweeping on it", "band": state["band"], "mode": state["mode"]})
+                    hello()
+                elif AUTO["on"] and not AUTO.get("rtl433") and shutil.which("rtl_433"):
+                    AUTO["rtl433"] = sn
+                    threading.Thread(target=feed_rtl433_child, args=(sn,), daemon=True).start()
+                    print(f"bridge: hotplug: {sn} is now the sensor (rtl_433) dongle", file=sys.stderr)
+                    hello()
+            if hk and not AUTO["hackrf"] and a is not None and not HACKRF_ON:
+                print("bridge: hotplug: HackRF appeared; sweeping 1–6000 MHz with it", file=sys.stderr)
+                globals()["HACKRF_ON"] = True
+                if "sweep" not in CAPS: CAPS.append("sweep")
+                if "park" not in CAPS: CAPS.append("park")
+                hackrf_start(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask, a.hackrf_ppm)
+                hello()
+            AUTO["known"], AUTO["hackrf"] = now_rtl, hk
+        except Exception as e:
+            print(f"bridge: hotplug: {e}", file=sys.stderr)
+
+
+SWEEP_DEVS: "set[str]" = set()
+
+
+# ---------------------------------------------------------------- BLE peripheral
+
+def blink(secs: int) -> None:
+    """Identify: flash the Pi's activity LED (needs root) and say so on the console either way."""
+    secs = max(1, min(30, secs))
+    print(f"{FW}: identify — blinking for {secs} s (code {state.get('code', '?')})", file=sys.stderr)
+    led = next((p for p in ("/sys/class/leds/ACT", "/sys/class/leds/led0") if os.path.isdir(p)), None)
+    if not led:
+        return
+    try:
+        with open(f"{led}/trigger", "w") as f:
+            f.write("none")
+        end = time.time() + secs
+        on = False
+        while time.time() < end:
+            on = not on
+            with open(f"{led}/brightness", "w") as f:
+                f.write("1" if on else "0")
+            time.sleep(0.15)
+        with open(f"{led}/trigger", "w") as f:
+            f.write("mmc0")
+    except OSError:
+        pass
+
+
+def drop_stale_centrals() -> None:
+    """A restart leaves the phone's connection alive in BlueZ while the GATT server it was talking to
+    is gone: the app shows "connected" and hears nothing. Disconnect whoever is still attached, so the
+    app sees the drop and reconnects to this instance."""
+    try:
+        import dbus
+        bus = dbus.SystemBus()
+        om = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
+        for path, ifaces in om.GetManagedObjects().items():
+            d = ifaces.get("org.bluez.Device1")
+            if d and d.get("Connected"):
+                try:
+                    dbus.Interface(bus.get_object("org.bluez", path), "org.bluez.Device1").Disconnect()
+                    print("bridge: dropped a central left over from the previous run; it will reconnect", file=sys.stderr)
+                except Exception as e:
+                    print(f"bridge: could not drop a stale central ({e})", file=sys.stderr)
+    except Exception as e:
+        print(f"bridge: stale-central check skipped ({e})", file=sys.stderr)
+
+
+def run_peripheral(name: str) -> None:
+    from bluezero import adapter, peripheral
+    from bluezero import advertisement as bz_ad
+
+    ADVERT_MARK = "/run/wavelens-advert-failed"   # run-bridge.sh restarts bluetooth when it finds this
+
+    def ad_failed(error):
+        # Without the advert the phone can't find the companion, while the radios keep running:
+        # a half-alive bridge. Leave a mark so the next start restarts BlueZ, and exit.
+        print(f"bridge: Bluetooth advertisement failed ({error}); exiting so the service restarts bluetooth and retries",
+              file=sys.stderr)
+        try:
+            open(ADVERT_MARK, "w").close()
+        except OSError:
+            pass
+        os._exit(1)
+
+    def ad_ok():
+        # Only now is the companion findable. "advertising as" is what wavelens-update's health check waits
+        # for, so it must not be printed before BlueZ has accepted the advert (it used to be, before publish).
+        print("Advertisement registered", file=sys.stderr)
+        print(f"{FW}: advertising as {name!r} on {dongle.address}  (pair code {code})", file=sys.stderr)
+        try:
+            os.remove(ADVERT_MARK)
+        except OSError:
+            pass
+    bz_ad.register_ad_error_cb = ad_failed      # bluezero looks these names up when it registers
+    bz_ad.register_ad_cb = ad_ok
+
+    dongle = list(adapter.Adapter.available())[0]
+    code = dongle.address.replace(":", "")[-4:].upper()
+    if name in ("", "Wavelens Pi", "Wavelens-Pi"):
+        name = f"Wavelens-{code}"          # same scheme as the ESP32: the code is the end of the BT address
+    state["name"], state["code"] = name, code
+    drop_stale_centrals()
+    dev = peripheral.Peripheral(dongle.address, local_name=name)
+    dev.add_service(srv_id=1, uuid=SVC, primary=True)
+
+    rx_lines = RxLines()
+
+    def on_rx(value, options):
+        cmd = rx_lines.feed(bytes(value))
+        if cmd is None:
+            return
+        c = cmd.get("c")
+        if c == "ping":
+            hello()
+            emit({"t": "status", "msg": "ok", "band": state["band"], "mode": state["mode"]})
+        elif c == "spotter" and HUB:
+            # Companion screen / admin page: give a Pi-hosted Spotter a job ("ble", "wifi:1,6,11", "both", "auto")
+            msg = HUB.set_role(str(cmd.get("u") or ""), str(cmd.get("role") or "auto"))
+            emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
+            hello()
+        elif c == "peer" and HUB:
+            # the phone also holds a Spotter over Bluetooth: the Pi's units take Wi-Fi, the phone's takes Bluetooth
+            HUB.set_phone_spotter(bool(cmd.get("spotter")))
+            hello()
+        elif c == "blink":
+            threading.Thread(target=blink, args=(int(cmd.get("v") or 5),), daemon=True).start()
+            emit({"t": "status", "msg": "blinking", "band": state["band"], "mode": state["mode"]})
+        elif c == "net":
+            # The Companion screen's Wi-Fi card: what the Pi is on, what it can see, join one (see net_command).
+            net_command(cmd)
+        elif c == "update":
+            # The Companion screen's Check / Install update / Roll back buttons. The Pi does the network
+            # work (git pull from the public repo); the phone never needs a network permission for it.
+            threading.Thread(target=run_update, args=(str(cmd.get("v") or "check"),), daemon=True).start()
+        elif c == "area":
+            # The set-up step and the Companion screen's Area row: country + postcode, or a position.
+            if "area" in CAPS:
+                threading.Thread(target=run_area, args=(dict(cmd),), daemon=True).start()
+            else:
+                emit({"t": "area", "state": "failed", "msg": "this Pi has no area tool: update it first"})
+        elif c == "pos":
+            # Opt-in from the phone: its GPS fix, so licensed sites can be ranked by distance.
+            # Kept in memory only, never written anywhere, forgotten after two minutes.
+            if cmd.get("lat") is None:
+                state["lat"], state["lon"], state["pos_at"] = None, None, 0.0     # the phone turned sharing off
+            else:
+                try:
+                    state["lat"], state["lon"] = float(cmd["lat"]), float(cmd["lon"])
+                    state["pos_at"] = time.time()
+                except (KeyError, TypeError, ValueError):
+                    pass
+        elif c == "log":
+            # The Alerts screen is showing the bridge's journal: send the backlog once, then live lines.
+            if not cmd.get("on", True):
+                LOG["on"] = False
+            else:
+                fresh = not LOG["on"]
+                LOG["on"], LOG["until"] = True, time.time() + LOG_TTL_S
+                if fresh:
+                    with LOG["lock"]:
+                        LOG["pending"].clear()
+                        LOG["pending"].extend(LOG["lines"])
+        elif c == "spec":
+            # A Scanner / Spectrum screen is looking: send the sweep's readings in this window about once a second.
+            if "sweep" not in CAPS:
+                emit({"t": "status", "msg": "no sweep running to draw a spectrum from (add --hackrf-sweep or --rtl-power)",
+                      "band": state["band"], "mode": state["mode"]})
+            elif not cmd.get("on", True):
+                spec_route(False)
+            else:
+                try:
+                    lo, hi = float(cmd.get("lo", 1.0)), float(cmd.get("hi", 6000.0))
+                except (TypeError, ValueError):
+                    lo, hi = 1.0, 6000.0
+                if hi - lo < 0.1:
+                    lo, hi = 1.0, 6000.0
+                spec_route(True, lo, hi)
+        elif c == "park":
+            v = str(cmd.get("v") or "off")
+            state["park"] = v if v in PARK_RANGES else "off"
+            hackrf_ctl({"park": state["park"]})
+            if state["park"] != "off" and not HACKRF_ON:
+                msg = "park noted; no HackRF on this bridge (add --hackrf-sweep)"
+            elif state["park"] != "off":
+                msg = f"parked: HackRF on {PARK_RANGES[state['park']].replace(':', '–')} MHz (radios keying up nearby)"
+            else:
+                msg = "sweeping the full range"
+            emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"], "park": state["park"]})
+        elif c == "region":
+            want = str(cmd.get("v") or "US").upper()[:2]
+            if REGION["home"] and want != REGION["home"]:
+                # This Scanner's area is set to a country with its own pack; a phone that has not picked that
+                # pack (it sends US by default) must not put US band names and US sweeps' labels back.
+                if REGION["code"] != REGION["home"]:
+                    set_region(REGION["home"], announce=False)
+                name = (REGION["pack"] or {}).get("name") or REGION["home"]
+                emit({"t": "status", "msg": f"this Scanner is set up for {name}: keeping its band names "
+                                            f"(pick the {name} pack in the app to match)",
+                      "band": state["band"], "mode": state["mode"]})
+            else:
+                set_region(want)
+        elif c == "pages":
+            LISTEN["pages"] = bool(cmd.get("v", True))
+            emit({"t": "status", "msg": "pager decoding " + ("on" if LISTEN["pages"] else "off"), "band": state["band"], "mode": state["mode"]})
+        elif c == "listen":
+            if "listen" not in CAPS:
+                emit({"t": "status", "msg": "no RTL-SDR to listen with (add --rtl-power …@SERIAL or --listen-device)",
+                      "band": state["band"], "mode": state["mode"], "listen": "off"})
+            elif str(cmd.get("v") or "") == "off":
+                LISTEN["follow"] = False
+                listen_stop("stopped", cancel_hunt=True)
+                listen_status("listening stopped")
+            elif str(cmd.get("v") or "") == "lockout":
+                # The phone's list of frequencies Follow must never tune (it resends it on every connect).
+                try:
+                    lst = sorted({round(float(f), 4) for f in (cmd.get("mhz") or [])})[:200]
+                except (TypeError, ValueError):
+                    lst = []
+                LISTEN["lockout"] = lst
+                with FOLLOW_LOCK:
+                    for k in [k for k, (_, m, _, _) in LISTEN["recent"].items() if locked_out(m)]:
+                        del LISTEN["recent"][k]
+                if LISTEN["follow"] and LISTEN["req"] is not None and locked_out(LISTEN["mhz"]):
+                    follow_leave(time.time(), f"{LISTEN['mhz']:.4f} MHz locked out")
+                emit({"t": "status", "msg": f"lockout: {len(lst)} frequencies Follow will skip", "band": state["band"],
+                      "mode": state["mode"], "lockout": lst})
+            elif str(cmd.get("v") or "") == "hold":
+                TRUNK["hold"] = bool(cmd.get("on", True))
+                listen_status("system held: staying on this system" if TRUNK["hold"] else "system released: scanning again")
+            elif str(cmd.get("v") or "") == "skip":
+                # leave this system now, and don't come back to it for a while
+                if LISTEN["req"] is not None and LISTEN["mode"] in TRUNK_MODES:
+                    for r in TRUNK.get("ranked") or []:
+                        if abs(r["mhz"] - LISTEN["mhz"]) <= 0.001:
+                            r["failed_at"] = time.time()
+                    if not trunk_next_system(time.time(), force=True):
+                        listen_status("skip: no other system in the ranking right now")
+                else:
+                    follow_leave(time.time(), "skipped")
+            elif str(cmd.get("v") or "") == "tglock":
+                try:
+                    TRUNK["tg_lock"] = int(cmd.get("tg") or 0)
+                except (TypeError, ValueError):
+                    TRUNK["tg_lock"] = 0
+                listen_status(f"talkgroup lock: {tg_named('TG %d' % TRUNK['tg_lock'])} only" if TRUNK["tg_lock"] else "talkgroup lock off")
+            elif str(cmd.get("v") or "") == "cats":
+                # category filter from the phone's POLICE / FIRE / EMS / OTHER buttons; [] = everything
+                cats = {str(c).lower() for c in (cmd.get("cats") or []) if str(c).lower() in ("police", "fire", "ems", "other")}
+                TRUNK["cats"] = cats
+                listen_status(("hearing " + " + ".join(sorted(cats))) if cats else "hearing every talkgroup")
+            elif str(cmd.get("v") or "") == "tgavoid":
+                try:
+                    TRUNK["tg_avoid"] = {int(t) for t in (cmd.get("tgs") or [])}
+                except (TypeError, ValueError):
+                    TRUNK["tg_avoid"] = set()
+                listen_status(f"{len(TRUNK['tg_avoid'])} talkgroup(s) muted" if TRUNK["tg_avoid"] else "no talkgroups muted")
+            elif str(cmd.get("v") or "") == "system":
+                # the phone tapped a system in the ranking: lock onto it now
+                try:
+                    want = float(cmd.get("mhz") or 0)
+                except (TypeError, ValueError):
+                    want = 0.0
+                r = next((r for r in TRUNK.get("ranked") or [] if abs(r["mhz"] - want) <= 0.001), None)
+                if r is not None:
+                    r["failed_at"] = 0.0
+                    TRUNK["tries"], TRUNK["cc_at"] = [(r["mhz"], md) for md in r["modes"][1:]], time.time()
+                    trunk_prep(r["mhz"], r["modes"][0])
+                    LISTEN["follow"] = True
+                    listen_status(f"trunked: tuning {r['mhz']:.4f} MHz {r.get('name', '')}")
+                    listen_start(r["mhz"], r["modes"][0], LISTEN["sq"], 0.0)
+                elif want:
+                    TRUNK["tries"], TRUNK["cc_at"] = [], time.time()
+                    listen_start(want, "trunkq" if TRUNK["qpsk"] else "trunk", LISTEN["sq"], 0.0)
+            elif str(cmd.get("v") or "") == "trunkauto":
+                TRUNK["auto"] = bool(cmd.get("on", True))
+                if cmd.get("idle") is not None:
+                    try:                     # the phone's "hand off after N s of silence" setting
+                        globals()["TRUNK_IDLE_S"] = float(min(120.0, max(2.0, float(cmd.get("idle")))))
+                        globals()["TRUNK_HOLD_S"] = TRUNK_IDLE_S
+                    except (TypeError, ValueError):
+                        pass
+                was = TRUNK["qpsk"]
+                TRUNK["qpsk"] = bool(cmd.get("qpsk", TRUNK["qpsk"]))
+                listen_status(("trunked systems: Follow takes them automatically" if TRUNK["auto"] else "trunked systems: manual only")
+                              + (" · simulcast (QPSK) first" if TRUNK["qpsk"] else ""))
+                if TRUNK["qpsk"] != was and LISTEN["req"] is not None and LISTEN["mode"] in ("trunk", "trunkq"):
+                    # re-lock the current system with the other demodulator
+                    TRUNK["tries"], TRUNK["cc_at"] = [], time.time()
+                    listen_start(LISTEN["mhz"], "trunkq" if TRUNK["qpsk"] else "trunk", LISTEN["sq"], 0.0)
+            elif str(cmd.get("v") or "") == "trunk":
+                TRUNK["qpsk"] = bool(cmd.get("qpsk", TRUNK["qpsk"]))
+                try:
+                    mhz = float(cmd.get("mhz") or 0)
+                except (TypeError, ValueError):
+                    mhz = 0.0
+                searching = HUNT["on"] or bool(TRUNK["cc_at"]) or (LISTEN["req"] is not None and LISTEN["mode"] in TRUNK_MODES)
+                if mhz and 24.0 <= mhz <= 1766.0:
+                    TRUNK["tries"], TRUNK["cc_at"] = [], 0.0
+                    listen_start(mhz, "trunkq" if TRUNK["qpsk"] else "trunk", LISTEN["sq"], 0.0)
+                elif searching:
+                    # The app re-sends its request about once a minute to keep the listen alive: renew,
+                    # don't start the search over (it would never get past the first candidate).
+                    LISTEN["until"] = time.time() + LISTEN_MAX_S
+                else:
+                    trunk_start(None)
+            elif str(cmd.get("v") or "") == "follow":
+                sq = cmd.get("sq")
+                if sq is not None:
+                    LISTEN["sq"] = max(0, min(1000, int(sq)))
+                fresh = not LISTEN["follow"]
+                LISTEN["follow"], LISTEN["follow_until"] = True, time.time() + FOLLOW_TTL_S
+                if fresh:
+                    listen_status("following hits: each new carrier in a voice band is tuned and played")
+                    # A scanner starts listening at once: with nothing playing, lock onto the nearest trunked
+                    # system (its control channel is found by the sweep, the RadioReference list, or a hunt),
+                    # and conventional hits take turns with it as they come.
+                    if TRUNK["auto"] and not HUNT["on"] and (LISTEN["req"] is None or LISTEN["mode"] not in TRUNK_MODES):
+                        trunk_start(None)
+            else:
+                try:
+                    mhz = float(cmd.get("mhz"))
+                except (TypeError, ValueError):
+                    return
+                if 24.0 <= mhz <= 1766.0:
+                    sq = cmd.get("sq")
+                    try:
+                        tol = max(0.0, min(0.5, float(cmd.get("tol", 0.05))))
+                    except (TypeError, ValueError):
+                        tol = 0.05
+                    mode = str(cmd.get("mode") or "fm")
+                    # A tap on a channel the RadioReference list knows as part of a trunked system: follow the
+                    # system (P25 / EDACS / DMR with its control channel and channel map) instead of probing
+                    # the channel as if it were conventional — AUTO on an EDACS or P25 data stream yields a
+                    # false D-STAR / NXDN sync and noise.
+                    row = None
+                    if RR and mode in ("auto", "fm") and "listen" in CAPS and "trunk" in CAPS:
+                        cc = RR.control_at(mhz)
+                        row = cc[2] if cc else RR.site_at(mhz)
+                    if row is not None and trunk_kind(row.get("Mode") or row.get("System Type") or "") in TRUNK_KINDS:
+                        site = rr_site(row)
+                        TRUNK["tries"], TRUNK["cc_at"] = [], 0.0
+                        listen_status(f"{mhz:.4f} MHz is a channel of {site[0]} ({site[1]}, {site[2].upper()}): following the system")
+                        trunk_start(site)
+                    else:
+                        listen_start(mhz, mode, max(0, min(1000, int(sq))) if sq is not None else LISTEN["sq"], tol)
+                else:
+                    emit({"t": "status", "msg": f"{mhz:g} MHz is outside the RTL-SDR's 24–1766 MHz; can't listen there",
+                          "band": state["band"], "mode": state["mode"], "listen": "off"})
+        elif c in ("band", "mode", "ch"):
+            state[c] = cmd.get("v")
+            # An SDR bridge has nothing to park; say so once rather than pretend.
+            emit({"t": "status", "msg": f"{c} noted; this bridge relays what rtl_433/kismet give it", "band": state["band"], "mode": state["mode"]})
+
+    chars = {}
+
+    def notify_cb(notifying, characteristic):
+        chars["tx"] = characteristic if notifying else None
+        state["linked"] = bool(notifying)
+        if notifying:
+            hello()
+        else:
+            write_run_status()
+
+    dev.add_characteristic(srv_id=1, chr_id=1, uuid=TX, value=[], notifying=False,
+                           flags=["notify"], notify_callback=notify_cb)
+    dev.add_characteristic(srv_id=1, chr_id=2, uuid=RX, value=[], notifying=False,
+                           flags=["write", "write-without-response"], write_callback=on_rx)
+
+    def au_notify_cb(notifying, characteristic):
+        chars["au"] = characteristic if notifying else None
+        if not notifying and LISTEN["req"] is not None:
+            LISTEN["follow"] = False
+            listen_stop("stopped (phone unsubscribed)", cancel_hunt=True)
+
+    dev.add_characteristic(srv_id=1, chr_id=3, uuid=AU, value=[], notifying=False,
+                           flags=["notify"], notify_callback=au_notify_cb)
+
+    # Audio pacing. Frames are 40 ms of audio each; the link carries them as BLE notifications, which the
+    # controller sends at the connection interval (7.5–30 ms on Android, usually 15). Sent as fast as they
+    # arrive they are fine in steady state, but after any stall (the Pi busy, the phone's BLE stack
+    # pausing) the backlog bursts out at hundreds a second, BlueZ queues what it can and drops the rest,
+    # and the phone hears a gap. So: a jitter buffer. Playback over the link starts once AUDIO_PREFILL
+    # frames are queued (or a frame has waited AUDIO_PREFILL_MAX_S), then one frame goes out every 40 ms on
+    # the Pi's clock, whatever the queue holds. The queue absorbs bursts; a frame older than AUDIO_DROP_S
+    # is dropped in bulk so the lag never grows beyond a second. JSON lines go out between audio frames —
+    # at most one every AUDIO_JSON_GAP frames — so status and journal keep flowing during a call.
+    FRAME_S = LISTEN_FRAME / LISTEN_RATE          # 0.040
+    AUDIO_PREFILL = 6                             # 240 ms before the first frame leaves
+    AUDIO_PREFILL_MAX_S = 0.5
+    AUDIO_DROP_S = 2.0                            # the queue never holds more than this much lag (then the oldest go)
+    CHUNK = 180                                   # under a 247-byte MTU; the app reassembles on newline
+    pace = {"next": 0.0, "primed": False, "first_at": 0.0, "cur": b"", "pos": 0}
+
+    def audio_due(now: float) -> bool:
+        return chars.get("au") is not None and pace["primed"] and now >= pace["next"] - 0.004 and aout.qsize() > 0
+
+    def send_chunk() -> bool:
+        """One ≤180-byte chunk of the line in progress (taking the next line when none is). False if nothing to send."""
+        tx = chars.get("tx")
+        if tx is None:
+            return False
+        if pace["pos"] >= len(pace["cur"]):
+            # bulk goes only when the audio isn't behind its clock: a call in progress keeps the link for itself
+            behind = pace["primed"] and aout.qsize() > AUDIO_PREFILL + 2
+            nxt = out.next(bulk_ok=not behind)
+            if nxt is None:
+                return False
+            pace["cur"], pace["pos"] = nxt, 0
+        end = min(pace["pos"] + CHUNK, len(pace["cur"]))
+        try:
+            tx.set_value(list(pace["cur"][pace["pos"]:end]))
+        except Exception:
+            pace["cur"], pace["pos"] = b"", 0          # link gone mid-line: the rest is lost with the link
+            return False
+        pace["pos"] = end
+        return True
+
+    def pump():
+        while True:
+            au = chars.get("au")
+            now = time.monotonic()
+            n = aout.qsize()
+            if au is not None and n:
+                if not pace["primed"]:
+                    if not pace["first_at"]:
+                        pace["first_at"] = now
+                    if n >= AUDIO_PREFILL or now - pace["first_at"] >= AUDIO_PREFILL_MAX_S:
+                        pace["primed"] = True
+                        pace["next"] = now
+                if pace["primed"] and now >= pace["next"]:
+                    while aout.qsize() > int(AUDIO_DROP_S / FRAME_S):   # far behind: the oldest frames go
+                        try:
+                            aout.get_nowait()
+                        except Empty:
+                            break
+                    try:
+                        frame = aout.get_nowait()
+                    except Empty:
+                        frame = None
+                    if frame is not None:
+                        try:
+                            au.set_value(list(frame))     # one 164-byte frame per notification
+                        except Exception:
+                            pass
+                        pace["next"] += FRAME_S
+                        if pace["next"] < now - FRAME_S:  # fell behind the clock (a slow notify): resync
+                            pace["next"] = now
+                # the gap until the next frame is for one JSON chunk — control first, bulk if the audio is keeping up
+                if not audio_due(time.monotonic()):
+                    send_chunk()
+                time.sleep(0.002)
+                continue
+            if au is not None and not n and pace["primed"]:
+                pace["primed"], pace["first_at"] = False, 0.0   # the burst ended: re-prime for the next
+            # no audio: drain everything, a chunk at a time, pausing only when there is nothing to send
+            if not send_chunk():
+                time.sleep(0.02 if au is not None else 0.1)
+            else:
+                time.sleep(0.004)
+
+    threading.Thread(target=pump, daemon=True).start()
+    print(f"{FW}: registering the Bluetooth advert as {name!r} on {dongle.address}", file=sys.stderr)
+    # systemd stops the service with SIGTERM. bluezero only withdraws its advert on Ctrl+C, so a
+    # restart would leave BlueZ holding the old advert and the next start fails to register one.
+    # Withdraw it ourselves; GLib's own signal hook, because the GLib main loop owns the thread.
+    try:
+        import signal
+        from gi.repository import GLib
+
+        def on_term():
+            # The radio tools go first, hard: rtl_fm / rtl_power ignore SIGTERM while blocked in a USB
+            # read, and systemd would wait out TimeoutStopSec before killing them (a slow restart that
+            # also leaves the phone's link dangling). Our own children only: pkill -P.
+            try:
+                subprocess.call(["pkill", "-KILL", "-P", str(os.getpid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            try:
+                mgr, adv = getattr(dev, "ad_manager", None), getattr(dev, "advert", None)
+                if mgr is not None and adv is not None:
+                    mgr.unregister_advertisement(adv)
+            except Exception as e:                      # already gone, or BlueZ restarting
+                print(f"bridge: advert not withdrawn ({e})", file=sys.stderr)
+            os._exit(0)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, on_term)
+    except Exception as e:
+        print(f"bridge: no SIGTERM hook ({e})", file=sys.stderr)
+    dev.publish()
+
+
+
+# ---------------------------------------------------------------- radio plan: adapt to what is plugged in
+
+def probe_radios():
+    """RTL-SDR dongles (index, serial) from rtl_test -t, and whether a HackRF answers. Both tools are
+    quick and release the device when done; a dongle another process holds still lists."""
+    rtls = []
+    try:
+        out = subprocess.run(["rtl_test", "-t"], capture_output=True, text=True, timeout=15)
+        for ln in (out.stdout + out.stderr).splitlines():
+            # maker and product may be empty on a cheap dongle ("1:  , , SN: 00000001"): still a dongle
+            m = re.match(r"\s*(\d+):\s*(.*?),\s*(.*?),\s*SN:\s*(\S+)", ln)
+            if m:
+                rtls.append((int(m.group(1)), m.group(4).strip(), f"{m.group(2)} {m.group(3)}".strip()))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    # rtl_test can miss a dongle that the USB bus has (seen on a Pi 5 with two RTL2838s: one listed, the
+    # other left "free" for good, because the hot-plug watch only takes up dongles that appear later).
+    # The bus is the authority on what is plugged in: anything it has that rtl_test did not list is planned
+    # too, addressed by its serial.
+    listed = {r[1] for r in rtls}
+    for sn in usb_rtl_serials():
+        if sn and sn not in listed:
+            listed.add(sn)
+            rtls.append((len(rtls), sn, ""))
+            print(f"bridge: auto: RTL-SDR {sn} is on the USB bus but rtl_test did not list it; using it by serial", file=sys.stderr)
+    hackrf = False
+    ensure_hackrf_mode()
+    if shutil.which("hackrf_info"):
+        try:
+            r = subprocess.run(["hackrf_info"], capture_output=True, text=True, timeout=15)
+            hackrf = r.returncode == 0 and "Serial number" in (r.stdout + r.stderr)
+        except (OSError, subprocess.TimeoutExpired):
+            hackrf = False
+    return rtls, hackrf
+
+
+SWEEP_VHF = ["144M:174M:12.5k"]
+SWEEP_UHF = ["440M:470M:12.5k", "806M:824M:12.5k"]
+SWEEP_ISM = ["902M:928M:25k", "1240M:1300M:100k", "1559M:1610M:100k"]
+# The lists above, CC_BANDS and FOLLOW_BANDS are the United States plan. A country's pack may carry its own
+# (companion.sweeps / cc_bands / follow_bands, see regions.py); apply_radio_plan swaps them in place.
+_US_RADIO = {"vhf": list(SWEEP_VHF), "uhf": list(SWEEP_UHF), "ism": list(SWEEP_ISM), "cc": list(CC_BANDS),
+             "follow": list(FOLLOW_BANDS), "named_only": list(FOLLOW_NAMED_ONLY)}
+
+
+def apply_radio_plan(pack) -> None:
+    """Sweep ranges, control-channel hunt bands and Follow bands for this pack's country (None = United States).
+    The sweeps a running bridge already started are not moved: a change of plan takes effect at the next start."""
+    plan = region_packs.radio_plan(pack) if pack else {}
+    sw = plan.get("sweeps") or {}
+    SWEEP_VHF[:] = sw.get("vhf", []) if sw else _US_RADIO["vhf"]
+    SWEEP_UHF[:] = sw.get("uhf", []) if sw else _US_RADIO["uhf"]
+    SWEEP_ISM[:] = (sw.get("ism") or _US_RADIO["ism"]) if sw else _US_RADIO["ism"]
+    CC_BANDS[:] = plan.get("cc_bands") or _US_RADIO["cc"]
+    FOLLOW_BANDS[:] = plan.get("follow_bands") or _US_RADIO["follow"]
+    # low band is tuned only for a licence-list name; a country with its own Follow list has no such list yet
+    FOLLOW_NAMED_ONLY[:] = [] if plan.get("follow_bands") else _US_RADIO["named_only"]
+    if plan:
+        print("bridge: radio plan from the " + str((pack or {}).get("name") or "local") + " pack: sweeps "
+              + ", ".join(SWEEP_VHF + SWEEP_UHF) + "; control channels looked for in "
+              + ", ".join(label for _, _, _, label in CC_BANDS), file=sys.stderr)
+
+
+def sweep_specs_cover(specs: "list[str]", band) -> bool:
+    """Does any of these rtl_power ranges ("lo:hi:step", optionally "@serial") span this CC_BANDS entry?"""
+    _, lo, hi, _ = band
+    for sp in specs:
+        try:
+            a, b = sp.split("@")[0].split(":")[:2]
+            if _mhz(a) <= lo and _mhz(b) >= hi:
+                return True
+        except (ValueError, IndexError):
+            pass
+    return False
+
+
+def start_region(explicit: str, area_file: str = "") -> str:
+    """The country whose tables this companion starts with: --region / WAVELENS_REGION when given, else the
+    country its area is set to (wavelens-area), else US. An area country that has a pack is also remembered
+    as REGION["home"]: a phone still on its default (US) must not relabel a Scanner set up for Australia."""
+    home = ""
+    try:
+        import area as area_mod
+        home = str((area_mod.read_area(area_file) or {}).get("country") or "").upper()[:2]
+    except Exception as e:  # noqa: BLE001  a missing or broken area file never stops the bridge
+        print(f"bridge: area not read for the region: {e}", file=sys.stderr)
+    if home and home != "US" and region_packs.find(home) is None:
+        home = ""
+    REGION["home"] = home
+    return (explicit or home or "US").upper()[:2]
+
+
+def plan_radios(rtls, hackrf) -> dict:
+    """Roles by how many RTL-SDRs there are. The sensor decoder (rtl_433) always comes first: it is what
+    the app's TPMS / sensor side needs. Then the VHF/UHF sweeps, then a dongle of its own for listening,
+    then the two sweeps on separate dongles, then the ISM / video / GNSS ranges.
+      1  rtl_433
+      2  VHF+UHF+800 sweep · listen (no sensors: the scanner needs both)
+      3  rtl_433 · VHF+UHF+800 sweep · listen
+      4  rtl_433 · VHF sweep · UHF+800 sweep · listen
+      5+ … · 900 MHz / 1.2 GHz / GNSS sweep
+    Dongles are addressed by serial when the serials are unique, else by index (cheap ones all say
+    00000001; rtl_eeprom -s sets a new serial)."""
+    # The best radio goes to listening / sweeping, not to the sensor decoder: an RTL-SDR Blog V4 (R828D
+    # front end, proper filtering, bias tee) hears 800 MHz where a bare RTL2838 struggles, and rtl_433
+    # only needs 315/433/915 MHz. So a V4 is moved off the first slot when there is another dongle.
+    rtls = [tuple(r) + ("",) * (3 - len(r)) for r in rtls]
+    if len(rtls) >= 2:
+        v4 = [r for r in rtls if "v4" in r[2].lower() or "blog" in r[2].lower()]
+        if v4 and rtls[0] in v4 and len(v4) < len(rtls):
+            rest = [r for r in rtls if r not in v4]
+            rtls = rest[:1] + v4 + rest[1:]
+    serials = [r[1] for r in rtls]
+    unique = len(set(serials)) == len(serials)
+    ids = [r[1] if unique else str(r[0]) for r in rtls]
+    plan = {"rtl433": "", "sweeps": [], "listen": "", "hackrf": hackrf, "by": "serial" if unique else "index",
+            "roles": []}
+    n = len(ids)
+    if n >= 1:
+        plan["rtl433"] = ids[0]; plan["roles"].append((ids[0], "rtl_433 sensors (TPMS, 315/433/915 MHz)"))
+    if n == 2:
+        # The scanner needs two dongles at once: the sweep keeps measuring the trunking bands (that is how
+        # the control-channel hunt and the rotation know what is on air) while the other one decodes. Sharing
+        # one left the hunt with stale readings whenever it was listening, and rtl_fm and rtl_power fighting
+        # over the USB device (usb_claim_interface -6). So with two, no sensor decoder: it comes back with a
+        # third dongle, or name one with WAVELENS_RTL433 to keep sensors and share the other.
+        plan["rtl433"] = ""; plan["roles"] = []
+        plan["sweeps"] += [f"{r}@{ids[0]}" for r in SWEEP_VHF + SWEEP_UHF]
+        plan["listen"] = ids[1]
+        plan["roles"] += [(ids[0], "VHF + UHF sweep"), (ids[1], "listen / Follow / trunking"),
+                          ("", "no rtl_433 sensors with two dongles (a third brings them back)")]
+    elif n == 3:
+        plan["sweeps"] += [f"{r}@{ids[1]}" for r in SWEEP_VHF + SWEEP_UHF]
+        plan["listen"] = ids[2]
+        plan["roles"] += [(ids[1], "VHF + UHF sweep"), (ids[2], "listen / Follow / trunking")]
+    elif n >= 4:
+        plan["sweeps"] += [f"{r}@{ids[1]}" for r in SWEEP_VHF] + [f"{r}@{ids[2]}" for r in SWEEP_UHF]
+        plan["listen"] = ids[3]
+        plan["roles"] += [(ids[1], "VHF sweep"), (ids[2], "UHF sweep"), (ids[3], "listen / Follow / trunking")]
+        if n >= 5:
+            plan["sweeps"] += [f"{r}@{ids[4]}" for r in SWEEP_ISM]
+            plan["roles"].append((ids[4], "ISM / 1.2 GHz video / GNSS sweep"))
+        for extra in ids[5:]:
+            plan["roles"].append((extra, "spare"))
+    return plan
+
+
+def print_plan_shell(extra_hackrf: str) -> None:
+    """--plan: print shell assignments for run-bridge.sh (WAVELENS_AUTO=1). Everything else the user put
+    in WAVELENS_ARGS (masks, packs, name) is appended by the script as before."""
+    rtls, hackrf = probe_radios()
+    plan = plan_radios(rtls, hackrf)
+    for dev, role in plan["roles"]:
+        print(f"bridge: plan: {'RTL-SDR ' + dev + ' → ' if dev else ''}{role}", file=sys.stderr)
+    print(f"bridge: plan: HackRF {'found → 1–6000 MHz sweep' if hackrf else 'not found'}; {len(rtls)} RTL-SDR(s) by {plan['by']}", file=sys.stderr)
+    args = []
+    for sp in plan["sweeps"]:
+        args += ["--rtl-power", sp]
+    if plan["listen"]:
+        args += ["--listen-device", plan["listen"]]
+    if hackrf:
+        args += ["--hackrf-sweep", "--hackrf-range", "1:6000", "--hackrf-lna", "16", "--hackrf-bin", "100000"]
+    rtl433 = ""
+    if plan["rtl433"]:
+        rtl433 = f"-d {':' + plan['rtl433'] if plan['by'] == 'serial' else plan['rtl433']}"
+    print(f"PLAN_RTL433_DEV={shlex.quote(rtl433)}")
+    # the sensor frequencies of this companion's country (Australia: no 315 MHz); run-bridge.sh uses them
+    # unless WAVELENS_RTL433 says otherwise
+    print(f"PLAN_RTL433_ARGS={shlex.quote(region_packs.rtl433_args(REGION['pack'], RTL433_DEFAULT_ARGS))}")
+    print(f"PLAN_ARGS={shlex.quote(' '.join(shlex.quote(x) for x in args))}")
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--rtl433", action="store_true", help="stdin is rtl_433 -F json")
+    ap.add_argument("--hackrf-sweep", action="store_true", help="run hackrf_sweep and report carriers by band")
+    ap.add_argument("--auto", action="store_true", help="plan the radios from what is on the USB bus (the default when no "
+                    "--rtl-power / --listen-device / --hackrf-sweep / --rtl433 is given): rtl_433 on the first RTL-SDR, "
+                    "sweeps + listening on the next, HackRF if present; dongles plugged in later are taken up")
+    ap.add_argument("--hackrf-range", default="1:6000", help="MHz range for hackrf_sweep (default 1:6000, the whole range)")
+    ap.add_argument("--hackrf-bin", type=int, default=500000, help="bin width Hz (default 500000)")
+    ap.add_argument("--portapack-port", metavar="TTY", default="",
+                    help="PortaPack serial console (default: found automatically); the bridge sends Mayhem's "
+                         "`hackrf` command there when the HackRF is sitting in the PortaPack menu")
+    ap.add_argument("--hackrf-lna", type=int, default=32, help="HackRF LNA gain 0-40 dB in 8 dB steps (default 32); lower it if nearby transmitters overload the sweep")
+    ap.add_argument("--hackrf-vga", type=int, default=20, help="HackRF baseband gain 0-62 dB in 2 dB steps (default 20)")
+    ap.add_argument("--hackrf-mask", metavar="LO:HI[,LO:HI...]", default="",
+                    help="MHz ranges never reported: this unit's own spurs, found with find_spurs.py (antenna off)")
+    ap.add_argument("--hackrf-ppm", type=float, default=0.0,
+                    help="HackRF crystal correction: reported MHz are scaled by (1 + ppm/1e6). Key a radio on a known "
+                         "frequency, read exact_mhz, then ppm = (known - read) / read * 1e6 (typically -20..20)")
+    ap.add_argument("--trunk-idle", type=float, default=5.0, metavar="SECONDS",
+                    help="Follow leaves a locked trunked system after this long without a call, for the next strongest (default 5)")
+    ap.add_argument("--trunk-min-db", type=float, default=18.0, metavar="DB",
+                    help="only rotate to a system whose control channel is at least this far over the band floor (default 18)")
+    ap.add_argument("--moto-band", default="800",
+                    help="Motorola Type II channel plan: 800 (standard), 800r (rebanded), 800s (splinter), 900, or obt:BASE:SPACING:OFFSET "
+                         "for UHF/VHF systems (default 800)")
+    ap.add_argument("--hackrf-keep-sweeping", action="store_true",
+                    help="keep hackrf_sweep running during digital voice (default: pause it — its USB stream and the parsing of "
+                         "60,000 bins a pass cost dsd-fme audio frames on a Pi)")
+    ap.add_argument("--hackrf-park-range", metavar="LO:HI", default="",
+                    help="MHz slice the HackRF parks on when the phone asks (default 796:816, public-safety radios)")
+    ap.add_argument("--rtl-power", metavar="SPEC", action="append", default=[],
+                    help="run rtl_power with this -f spec, e.g. 150M:174M:12.5k; repeat for several ranges, which take turns; "
+                         "add @SERIAL to put a range on a specific dongle (one sweep per dongle runs in parallel)")
+    ap.add_argument("--rtl-power-device", metavar="N|SERIAL", default="",
+                    help="which RTL-SDR rtl_power uses: index or serial (see rtl_test); default the first free one")
+    ap.add_argument("--listen-device", metavar="SERIAL", default="",
+                    help="RTL-SDR the phone can listen with (rtl_fm); default: the first --rtl-power dongle pinned with @SERIAL")
+    ap.add_argument("--listen-squelch", type=int, default=30,
+                    help="rtl_fm squelch while listening (default 30; 0 = never mute, static between transmissions)")
+    ap.add_argument("--rtl-gain", type=int, default=30,
+                    help="RTL-SDR tuner gain for rtl_power in dB (default 30; 0 = the dongle's own AGC, which rides out a "
+                         "handheld keyed beside it instead of smearing it over 10 MHz)")
+    ap.add_argument("--rtl-ppm", type=int, default=0,
+                    help="RTL-SDR crystal correction passed to rtl_power -p (rtl_test -p measures it; 0 for TCXO dongles)")
+    ap.add_argument("--rtl-power-dwell", metavar="SECONDS", type=int, default=15,
+                    help="seconds on each range when several --rtl-power ranges are given (default 15)")
+    ap.add_argument("--dump1090", metavar="HOST:PORT", help="relay aircraft from a dump1090/readsb SBS port")
+    ap.add_argument("--kismet-json", metavar="PATH", help="relay Wi-Fi devices from a Kismet JSON export")
+    ap.add_argument("--fcc-pack", metavar="PATH", help="local FCC license pack from tools/fcc_local_pack.py; labels licensed carriers")
+    ap.add_argument("--rr-pack", metavar="CSV", action="append", default=[],
+                    help="a RadioReference frequency export (CSV); repeatable, most local first (county, then statewide, then "
+                         "nationwide). Names hits by agency, description, alpha tag and mode, on both sides of a repeater pair. "
+                         "Preferred over --fcc-pack where it has the frequency")
+    ap.add_argument("--rr-county", metavar="NAME", action="append", default=[],
+                    help="county (repeatable) whose rows in a statewide export rank ahead of other counties'")
+    ap.add_argument("--pager-any-band", action="store_true",
+                    help="run the pager decoder (Lab: POCSAG / FLEX) on any analog channel, not only the paging bands; "
+                         "implausible decodes are still dropped")
+    ap.add_argument("--area-dir", metavar="DIR", default=os.environ.get("WAVELENS_AREA_DIR", "/var/lib/wavelens/area"),
+                    help="the area folder, read at start with nothing to list: fcc-local.json (written by wavelens-area for "
+                         "the postcode set on this companion) and RadioReference exports in rr/*.csv. --fcc-pack and "
+                         "--rr-pack still work and come first. 'none' turns it off")
+    ap.add_argument("--echo", action="store_true", help="print every line sent to the phone on stderr (see it with journalctl -u wavelens-bridge -f)")
+    ap.add_argument("--region", default=os.environ.get("WAVELENS_REGION", ""),
+                    help="local pack to start with (its two-letter country code). Default: the country the area is set to "
+                         "(wavelens-area), else US. The phone's choice replaces it on connect, unless the area names a country with a pack. "
+                         "Packs are read from /etc/wavelens/packs, ~/.config/wavelens/packs, packs/ beside this script and the repo's packs/")
+    ap.add_argument("--name", default="", help="advertised name (default Wavelens-XXXX from the adapter address)")
+    ap.add_argument("--no-spotters", action="store_true",
+                    help="don't drive ESP32 Spotters plugged into the Pi over USB (they keep talking to the phone over Bluetooth)")
+    ap.add_argument("--plan", action="store_true",
+                    help="print shell assignments (PLAN_RTL433_DEV, PLAN_ARGS) for the radios found, and exit; run-bridge.sh uses it when WAVELENS_AUTO=1")
+    a = ap.parse_args()
+    sys.stderr = _StderrTee(sys.stderr)
+    threading.Thread(target=log_pump, daemon=True).start()
+    CAPS.append("log")
+    CAPS.append("update")
+    if net_available():
+        CAPS.append("net")           # the phone may set this computer's Wi-Fi over the link
+    globals()["PORTAPACK_TTY"] = a.portapack_port
+    a.region = start_region(a.region, os.environ.get("WAVELENS_AREA_FILE", ""))
+    if a.plan:
+        set_region(a.region, announce=False)
+        print_plan_shell("")
+        return
+
+    global FCC, RR, ECHO, HACKRF_ON
+    ECHO = a.echo
+    set_region(a.region, announce=False)
+    # The area folder: what wavelens-area downloaded for this companion's postcode, and the owner's own
+    # RadioReference exports. A file that will not load is logged and skipped; it never stops the bridge.
+    found = {"fcc": "", "rr": [], "counties": [], "area": {}}
+    if a.area_dir and a.area_dir != "none":
+        try:
+            import area as area_mod
+            AREA["dir"] = a.area_dir
+            CAPS.append("area")          # the phone may set the area: its set-up step asks when none is set
+            found = area_mod.inputs_for_bridge(a.area_dir)
+            if found["area"]:
+                print(f"bridge: area {area_mod.describe(found['area'])}", file=sys.stderr)
+        except Exception as e:  # noqa: BLE001
+            print(f"bridge: area folder not read: {e}", file=sys.stderr)
+    FCC, RR, problems = load_local_packs(a.fcc_pack, a.rr_pack, a.rr_county, found)
+    PACK_PROBLEMS[:] = problems
+    if FCC is not None:
+        CAPS.append("fcc")
+    if RR is not None:
+        CAPS.append("rr")
+
+    if a.kismet_json:
+        CAPS.append("wifi")
+        threading.Thread(target=feed_kismet_json, args=(a.kismet_json,), daemon=True).start()
+    if a.hackrf_park_range:
+        PARK_RANGES["le"] = a.hackrf_park_range
+    if a.hackrf_keep_sweeping:
+        globals()["HACKRF_PAUSE_ON_LISTEN"] = False
+    globals()["MOTO_BAND"] = a.moto_band
+    globals()["PAGER_ANY_BAND"] = a.pager_any_band
+    globals()["TRUNK_IDLE_S"] = max(2.0, a.trunk_idle)
+    globals()["TRUNK_HOLD_S"] = max(2.0, a.trunk_idle)
+    globals()["TRUNK_MIN_DB"] = a.trunk_min_db
+    AUTO["args"] = a
+    if a.auto or not (a.rtl_power or a.listen_device or a.hackrf_sweep or a.rtl433):
+        # Nothing names a radio: look at the bus and take what is there, whatever its serial. Re-done at
+        # every start and (by hotplug_watch) while running. --rtl433 from the shell pipe still wins when given.
+        AUTO["on"] = True
+        rtls, hackrf = probe_radios()
+        plan = plan_radios(rtls, hackrf)
+        for dev, role in plan["roles"]:
+            print(f"bridge: auto: {'RTL-SDR ' + dev + ' → ' if dev else ''}{role}", file=sys.stderr)
+        print(f"bridge: auto: HackRF {'found' if hackrf else 'not found'}; {len(rtls)} RTL-SDR(s)", file=sys.stderr)
+        if plan["rtl433"] and not a.rtl433 and shutil.which("rtl_433"):
+            AUTO["rtl433"] = plan["rtl433"]
+            CAPS.append("rf")
+            threading.Thread(target=feed_rtl433_child, args=(plan["rtl433"],), daemon=True).start()
+        a.rtl_power = a.rtl_power or plan["sweeps"]
+        a.listen_device = a.listen_device or plan["listen"]
+        a.hackrf_sweep = a.hackrf_sweep or hackrf
+        if not rtls and not hackrf:
+            print("bridge: auto: no radio on the bus yet — waiting; plug one in and it is taken up", file=sys.stderr)
+    AUTO["known"] = set(usb_rtl_serials()); AUTO["hackrf"] = hackrf_on_usb()
+    threading.Thread(target=hotplug_watch, daemon=True).start()
+    if not a.no_spotters:
+        globals()["HUB"] = spotters.Hub(emit, lambda s: print("bridge: " + s, file=sys.stderr))
+        HUB.on_change = hello
+        CAPS.append("spotters")
+    if a.hackrf_sweep or a.rtl_power or AUTO["on"]:
+        threading.Thread(target=spec_pump, daemon=True).start()
+    if a.hackrf_sweep:
+        HACKRF_ON = True
+        CAPS.append("sweep")
+        CAPS.append("park")
+        if not a.rtl_power:
+            _, a.listen_device = adapt_radios({}, a.listen_device, True)
+        hackrf_start(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask, a.hackrf_ppm)
+    if a.rtl_power:
+        CAPS.append("sweep")
+        groups = group_sweeps(a.rtl_power, a.rtl_power_device)
+        groups, a.listen_device = adapt_radios(groups, a.listen_device, a.hackrf_sweep)
+        # The control-channel hunt reads the sweep: make sure the listening dongle's sweep passes the first
+        # trunking band of this country's plan (US: 851–869, where most public-safety control channels are)
+        # even if the config only lists the 806–824 input side.
+        ldev = a.listen_device or next((d for d in groups if d), "")
+        if ldev in groups and not sweep_specs_cover(groups[ldev], CC_BANDS[0]):
+            groups[ldev].append(CC_BANDS[0][0])
+            print(f"bridge: sweep on {ldev}: added {CC_BANDS[0][1]:g}–{CC_BANDS[0][2]:g} MHz for the control-channel hunt", file=sys.stderr)
+        for specs in groups.values():
+            for sp in specs:
+                try:
+                    SWEEP_RANGES.append((_mhz(sp.split(":")[0]), _mhz(sp.split(":")[1].split("@")[0])))
+                except (ValueError, IndexError):
+                    pass
+        for dev, specs in groups.items():
+            SWEEP_DEVS.add(dev)
+            threading.Thread(target=feed_rtl_power, args=(specs, dev, max(3, a.rtl_power_dwell), a.rtl_ppm, a.rtl_gain), daemon=True).start()
+        if not a.listen_device:
+            a.listen_device = next((d for d in groups if d), "")
+    LISTEN["sq"], LISTEN["ppm"] = a.listen_squelch, a.rtl_ppm
+    if a.listen_device:
+        LISTEN["dev"] = a.listen_device
+        CAPS.append("listen")
+        CAPS.append("trunk")                   # digital voice + trunk-tracking (dsd-fme); an ESP32 companion has "listen" only
+        kill_strays()
+        threading.Thread(target=listen_worker, daemon=True).start()
+        threading.Thread(target=follow_watch, daemon=True).start()
+    if a.dump1090:
+        CAPS.append("adsb")
+        threading.Thread(target=feed_dump1090, args=(a.dump1090,), daemon=True).start()
+    if a.rtl433 or not sys.stdin.isatty():
+        threading.Thread(target=feed_stdin, args=("rtl433" if a.rtl433 else "raw",), daemon=True).start()
+    run_peripheral(a.name)
+
+
+if __name__ == "__main__":
+    main()

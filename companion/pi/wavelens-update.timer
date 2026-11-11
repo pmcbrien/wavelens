@@ -1,0 +1,13 @@
+[Unit]
+Description=Wavelens companion: check for updates every night
+
+[Timer]
+# 03:00–04:00 local, spread so every Pi doesn't hit GitHub at the same minute; also 10 min after boot
+# (a car Pi that is never up at 3 am still gets checked). Persistent catches up after being off.
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=3600
+OnBootSec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,77 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 980 680' width='980' height='680' font-family='Inter, Helvetica, Arial, sans-serif'>
+<defs><marker id='arr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#9aa5b1'/></marker><marker id='arrb' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#7c3aed'/></marker><marker id='arrr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b45309'/></marker><marker id='arrp' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b91c1c'/></marker><marker id='arrd' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#1d4ed8'/></marker></defs>
+<rect width='980' height='680' fill='#ffffff'/>
+<text x='24' y='34' font-size='20' font-weight='700' fill='#1f2933'>Carputer: a Linux box, an antenna farm, one bridge</text>
+<text x='24' y='56' font-size='12' font-weight='400' fill='#6b7280' text-anchor='start'>Same software as the Pi build, on whatever runs Linux in the car — a mini PC under the seat,</text>
+<text x='24' y='72' font-size='12' font-weight='400' fill='#6b7280' text-anchor='start'>an Intel NUC, a Pi 5 in a case. Scales by USB port.</text>
+<rect x='24' y='92' width='300' height='170' rx='6' fill='#f3f4f6' stroke='#9aa5b1' stroke-width='1'/>
+<text x='34' y='110' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>When a carputer makes sense</text>
+<text x='34' y='124' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'></text>
+<text x='34' y='138' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Two or more SDRs: one parked on 315/433 MHz for</text>
+<text x='34' y='152' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  TPMS and remotes, one on 915 MHz for LoRa / ISM.</text>
+<text x='34' y='166' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• A monitor-mode adapter parked on the 5 GHz channel</text>
+<text x='34' y='180' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  a body-cam hotspot uses — every beacon, no throttling.</text>
+<text x='34' y='194' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• A HackRF for hackrf_sweep: 1 MHz–6 GHz energy peaks.</text>
+<text x='34' y='208' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Logging raw captures locally (never to the phone).</text>
+<text x='34' y='222' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'></text>
+<text x='34' y='236' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Only want Wi-Fi + BLE with a better antenna? The ESP32</text>
+<text x='34' y='250' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>build is a tenth of the effort.</text>
+<rect x='656' y='92' width='300' height='142' rx='6' fill='#f3f4f6' stroke='#9aa5b1' stroke-width='1'/>
+<text x='666' y='110' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Mounting and RF hygiene</text>
+<text x='666' y='124' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'></text>
+<text x='666' y='138' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Antennas forward, on the roof, with a ground plane</text>
+<text x='666' y='152' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  (the roof is one). Keep them 20 cm+ apart.</text>
+<text x='666' y='166' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Short coax: every 3 m of RG-58 at 2.4 GHz costs ~3 dB,</text>
+<text x='666' y='180' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  which cancels a cheap Yagi&#39;s gain.</text>
+<text x='666' y='194' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• A 433 MHz LPDA is big; a 915 MHz one is about 30 cm.</text>
+<text x='666' y='208' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Fuse the DC-DC. Ignition-switched so it never flattens</text>
+<text x='666' y='222' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  the battery.</text>
+<rect x='300' y='316' width='220' height='14' rx='3' fill='#cbd5e1' stroke='#1f2933'/>
+<text x='410' y='348' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>mag-mount / NMO plate with bulkhead SMAs</text>
+<line x1='306' y1='290' x2='351.0' y2='290' stroke='#b45309' stroke-width='3'/>
+<line x1='306.0' y1='275.0' x2='306.0' y2='305.0' stroke='#b45309' stroke-width='3'/>
+<line x1='314.0' y1='277.0' x2='314.0' y2='303.0' stroke='#b45309' stroke-width='3'/>
+<line x1='322.0' y1='278.5' x2='322.0' y2='301.5' stroke='#b45309' stroke-width='3'/>
+<line x1='330.0' y1='280.0' x2='330.0' y2='300.0' stroke='#b45309' stroke-width='3'/>
+<line x1='338.0' y1='281.0' x2='338.0' y2='299.0' stroke='#b45309' stroke-width='3'/>
+<line x1='346.0' y1='282.0' x2='346.0' y2='298.0' stroke='#b45309' stroke-width='3'/>
+<text x='328' y='274' font-size='10' font-weight='600' fill='#b45309' text-anchor='middle'>2.4 GHz Yagi</text>
+<rect x='380' y='276' width='34' height='28' rx='4' fill='#fff7ed' stroke='#b45309' stroke-width='2'/>
+<rect x='386.8' y='281.6' width='20.4' height='16.8' rx='3' fill='none' stroke='#b45309' stroke-width='1.2'/>
+<text x='397' y='262' font-size='10' font-weight='600' fill='#b45309' text-anchor='middle'>5 GHz panel</text>
+<line x1='436' y1='292' x2='476.5' y2='292' stroke='#1d4ed8' stroke-width='3'/>
+<line x1='436.0' y1='278.5' x2='436.0' y2='305.5' stroke='#1d4ed8' stroke-width='3'/>
+<line x1='443.2' y1='280.3' x2='443.2' y2='303.7' stroke='#1d4ed8' stroke-width='3'/>
+<line x1='450.4' y1='281.65' x2='450.4' y2='302.35' stroke='#1d4ed8' stroke-width='3'/>
+<line x1='457.6' y1='283.0' x2='457.6' y2='301.0' stroke='#1d4ed8' stroke-width='3'/>
+<line x1='464.8' y1='283.9' x2='464.8' y2='300.1' stroke='#1d4ed8' stroke-width='3'/>
+<line x1='472.0' y1='284.8' x2='472.0' y2='299.2' stroke='#1d4ed8' stroke-width='3'/>
+<text x='470' y='274' font-size='10' font-weight='600' fill='#1d4ed8' text-anchor='middle'>400–1000 MHz LPDA</text>
+<line x1='505' y1='316' x2='505' y2='284' stroke='#1f2933' stroke-width='3'/>
+<circle cx='505' cy='280' r='5' fill='#1f2933'/>
+<text x='520' y='290' font-size='10' font-weight='400' fill='#6b7280' text-anchor='start'>GPS puck (optional)</text>
+<path d='M60,430 L120,430 L190,330 L560,330 L660,430 L880,430 L880,500 L60,500 Z' fill='#f3f4f6' stroke='#1f2933' stroke-width='2'/>
+<circle cx='200' cy='500' r='30' fill='#e5e7eb' stroke='#1f2933' stroke-width='2'/>
+<circle cx='760' cy='500' r='30' fill='#e5e7eb' stroke='#1f2933' stroke-width='2'/>
+<text x='900' y='470' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>→ forward</text>
+<path d='M326,330 L326,338 L570,338 L650,436' fill='none' stroke='#b45309' stroke-width='1.8'/>
+<path d='M397,330 L397,338 L570,338 L650,436' fill='none' stroke='#b45309' stroke-width='1.8'/>
+<path d='M448,330 L448,338 L570,338 L650,436' fill='none' stroke='#1d4ed8' stroke-width='1.8'/>
+<text x='690' y='350' font-size='10' font-weight='400' fill='#6b7280' text-anchor='start'>coax bundle through</text>
+<text x='690' y='362' font-size='10' font-weight='400' fill='#6b7280' text-anchor='start'>the hatch seal / C-pillar</text>
+<rect x='522' y='348' width='22' height='38' rx='4' fill='#ecfdf5' stroke='#0f766e' stroke-width='1.5'/>
+<text x='533' y='404' font-size='10' font-weight='600' fill='#0f766e' text-anchor='middle'>phone on the dash</text>
+<rect x='660' y='440' width='210' height='52' rx='8' fill='#ffffff' stroke='#1f2933' stroke-width='1.5'/>
+<text x='672' y='462' font-size='13' font-weight='700' fill='#1f2933' text-anchor='start'>Mini PC / NUC / Pi 5 (trunk)</text>
+<text x='672' y='480' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Linux · rtl_433 · Kismet · bridge</text>
+<line x1='660' y1='466' x2='546' y2='372' stroke='#7c3aed' stroke-width='1.5' stroke-dasharray='4,3' marker-end='url(#arrb)'/>
+<text x='600' y='440' font-size='10' font-weight='600' fill='#7c3aed' text-anchor='middle'>BLE</text>
+<path d='M765,492 L765,540' fill='none' stroke='#9aa5b1' stroke-width='1.5'/>
+<rect x='620' y='540' width='290' height='60' rx='8' fill='#eff6ff' stroke='#1d4ed8' stroke-width='1.5'/>
+<text x='632' y='562' font-size='13' font-weight='700' fill='#1d4ed8' text-anchor='start'>USB hub (powered)</text>
+<text x='632' y='580' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>RTL-SDR ×2 (433 + 915 MHz) · HackRF (optional)</text>
+<text x='632' y='594' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>USB Wi-Fi monitor adapter · BLE 5 dongle</text>
+<rect x='620' y='612' width='290' height='44' rx='8' fill='#fef2f2' stroke='#b91c1c' stroke-width='1.5'/>
+<text x='632' y='634' font-size='13' font-weight='700' fill='#b91c1c' text-anchor='start'>12 V accessory → DC-DC, fused, ignition-switched</text>
+<line x1='765' y1='600' x2='765' y2='612' stroke='#b91c1c' stroke-width='1.5' marker-end='url(#arrp)'/>
+</svg>

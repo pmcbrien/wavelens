@@ -1,0 +1,73 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 980 680' width='980' height='680' font-family='Inter, Helvetica, Arial, sans-serif'>
+<defs><marker id='arr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#9aa5b1'/></marker><marker id='arrb' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#7c3aed'/></marker><marker id='arrr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b45309'/></marker><marker id='arrp' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b91c1c'/></marker><marker id='arrd' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#1d4ed8'/></marker></defs>
+<rect width='980' height='680' fill='#ffffff'/>
+<text x='24' y='34' font-size='20' font-weight='700' fill='#1f2933'>Arduino variant — shown for completeness; build the ESP32 instead</text>
+<text x='24' y='56' font-size='12' font-weight='400' fill='#6b7280' text-anchor='start'>An Arduino has no radio. To be a companion it needs a BLE module for the link and a radio module for the</text>
+<text x='24' y='72' font-size='12' font-weight='400' fill='#6b7280' text-anchor='start'>listening; an ESP32 has both on one $8 board and also sniffs Wi-Fi.</text>
+<rect x='330' y='150' width='230' height='250' rx='10' fill='#f1f5f9' stroke='#6b7280' stroke-width='2'/>
+<text x='445' y='176' font-size='13' font-weight='700' fill='#1f2933' text-anchor='middle'>Arduino Nano / Uno</text>
+<text x='445' y='194' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>(5 V logic: level-shift to 3.3 V modules)</text>
+<rect x='338' y='222' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='232' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>D2 / D3</text>
+<text x='315' y='232' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>HM-10 TX / RX (SoftwareSerial)</text>
+<rect x='338' y='246' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='256' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>D10</text>
+<text x='315' y='256' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>RX5808 CH1 data</text>
+<rect x='338' y='270' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='280' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>D11</text>
+<text x='315' y='280' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>RX5808 CH2 LE</text>
+<rect x='338' y='294' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='304' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>D12</text>
+<text x='315' y='304' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>RX5808 CH3 clock</text>
+<rect x='338' y='318' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='328' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>A0</text>
+<text x='315' y='328' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>RX5808 RSSI</text>
+<rect x='338' y='342' width='8' height='12' fill='#1f2933'/>
+<text x='352' y='352' font-size='10' font-weight='600' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>3V3 / GND</text>
+<text x='315' y='352' font-size='10' font-weight='400' fill='#6b7280' text-anchor='end'>both modules</text>
+<rect x='620' y='160' width='180' height='80' rx='8' fill='#f8fafc' stroke='#7c3aed' stroke-width='1.5'/>
+<text x='632' y='182' font-size='13' font-weight='700' fill='#7c3aed' text-anchor='start'>HM-10 BLE 4.0 (CC2541)</text>
+<text x='632' y='200' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>UART ↔ BLE bridge</text>
+<text x='632' y='214' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>service UUID set via AT+UUID</text>
+<path d='M560,230 L620,230' fill='none' stroke='#7c3aed' stroke-width='1.5'/>
+<text x='590' y='220' font-size='9' font-weight='400' fill='#7c3aed' text-anchor='middle'>UART</text>
+<rect x='860' y='150' width='92' height='170' rx='12' fill='#ecfdf5' stroke='#0f766e' stroke-width='2'/>
+<rect x='868' y='164' width='76' height='132' rx='4' fill='#ffffff' stroke='#0f766e' stroke-width='1'/>
+<rect x='874' y='172' width='64' height='10' rx='2' fill='#0f766e' fill-opacity='0.5'/>
+<rect x='874' y='190' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.12'/>
+<rect x='874' y='214' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.16999999999999998'/>
+<rect x='874' y='238' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.22'/>
+<rect x='874' y='262' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.27'/>
+<text x='906' y='340' font-size='12' font-weight='700' fill='#0f766e' text-anchor='middle'>Phone</text>
+<text x='906' y='356' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>Wavelens</text>
+<line x1='800' y1='200' x2='858' y2='200' stroke='#7c3aed' stroke-width='1.6' marker-end='url(#arrb)' marker-start='url(#arrb)'/>
+<rect x='620' y='270' width='180' height='90' rx='8' fill='#f8fafc' stroke='#b45309' stroke-width='1.5'/>
+<text x='632' y='292' font-size='13' font-weight='700' fill='#b45309' text-anchor='start'>RX5808 5.8 GHz</text>
+<text x='632' y='310' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>SPI-tuned video receiver,</text>
+<text x='632' y='324' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>RSSI out; sweep 5645–5945 MHz</text>
+<text x='632' y='338' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>→ 5.8 GHz video carriers only</text>
+<path d='M560,278 L620,278' fill='none' stroke='#b45309' stroke-width='1' stroke-dasharray='3,3'/>
+<path d='M560,302 L620,302' fill='none' stroke='#b45309' stroke-width='1' stroke-dasharray='3,3'/>
+<path d='M560,326 L620,326' fill='none' stroke='#b45309' stroke-width='1' stroke-dasharray='3,3'/>
+<path d='M560,350 L620,350' fill='none' stroke='#b45309' stroke-width='1' stroke-dasharray='3,3'/>
+<path d='M710,360 L710,384' fill='none' stroke='#b45309' stroke-width='3'/>
+<rect x='685' y='384' width='50' height='40' rx='4' fill='#fff7ed' stroke='#b45309' stroke-width='2'/>
+<rect x='695.0' y='392.0' width='30.0' height='24.0' rx='3' fill='none' stroke='#b45309' stroke-width='1.2'/>
+<text x='710.0' y='440' font-size='11' font-weight='600' fill='#b45309' text-anchor='middle'>5.8 GHz patch · 14 dBi</text>
+<path d='M735,404 L805,378.5220836013658 A70,70 0 0 1 805,429.4779163986342 Z' fill='#b45309' fill-opacity='0.12' stroke='#b45309' stroke-opacity='0.5' stroke-dasharray='4,4'/>
+<rect x='400' y='430' width='150' height='50' rx='8' fill='#fef2f2' stroke='#b91c1c' stroke-width='1.5'/>
+<text x='412' y='452' font-size='13' font-weight='700' fill='#b91c1c' text-anchor='start'>USB 5 V</text>
+<text x='412' y='470' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>car adapter</text>
+<path d='M475,400 L475,430' fill='none' stroke='#b91c1c' stroke-width='2'/>
+<rect x='24' y='500' width='600' height='156' rx='6' fill='#f3f4f6' stroke='#9aa5b1' stroke-width='1'/>
+<text x='34' y='518' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Why it is the worst option</text>
+<text x='34' y='532' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'></text>
+<text x='34' y='546' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• The HM-10 cannot run the GATT service the app expects without AT-command setup, and its</text>
+<text x='34' y='560' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  20-byte notifies make the link slow.</text>
+<text x='34' y='574' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• No Wi-Fi, no BLE scanning: the Arduino hears only what the extra module decodes (5.8 GHz carriers here).</text>
+<text x='34' y='588' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• An ESP32-S3-WROOM-1U does all of this plus Wi-Fi and BLE sniffing, with a u.FL for the antenna,</text>
+<text x='34' y='602' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  for less money and one sketch.</text>
+<text x='34' y='616' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'></text>
+<text x='34' y='630' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>If you already own the parts: wire as shown, speak the protocol in companion/README.md over the HM-10,</text>
+<text x='34' y='644' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>and it pairs like any other companion.</text>
+</svg>

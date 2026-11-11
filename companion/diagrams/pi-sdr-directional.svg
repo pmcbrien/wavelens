@@ -1,0 +1,88 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 980 640' width='980' height='640' font-family='Inter, Helvetica, Arial, sans-serif'>
+<defs><marker id='arr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#9aa5b1'/></marker><marker id='arrb' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#7c3aed'/></marker><marker id='arrr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b45309'/></marker><marker id='arrp' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b91c1c'/></marker><marker id='arrd' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#1d4ed8'/></marker></defs>
+<rect width='980' height='640' fill='#ffffff'/>
+<text x='24' y='34' font-size='20' font-weight='700' fill='#1f2933'>Raspberry Pi + RTL-SDR with directional antennas</text>
+<text x='24' y='56' font-size='12' font-weight='400' fill='#6b7280' text-anchor='start'>The Pi runs rtl_433 (sub-GHz decoders) and optionally Kismet (monitor-mode Wi-Fi);</text>
+<text x='24' y='72' font-size='12' font-weight='400' fill='#6b7280' text-anchor='start'>wavelens_bridge.py relays both to the phone over the Pi&#39;s own Bluetooth.</text>
+<rect x='310' y='150' width='230' height='170' rx='10' fill='#f1f5f9' stroke='#1d4ed8' stroke-width='2'/>
+<text x='415' y='176' font-size='13' font-weight='700' fill='#1d4ed8' text-anchor='middle'>Raspberry Pi 4 / 5</text>
+<text x='326' y='198' font-size='11' font-weight='400' fill='#1f2933' text-anchor='start'>Raspberry Pi OS (Bookworm)</text>
+<text x='326' y='213' font-size='11' font-weight='400' fill='#1f2933' text-anchor='start'>rtl_433 · Kismet · BlueZ 5.x</text>
+<text x='326' y='228' font-size='11' font-weight='400' fill='#1f2933' text-anchor='start'>python3-bluezero</text>
+<text x='326' y='243' font-size='11' font-weight='400' fill='#1f2933' text-anchor='start'>companion/pi/wavelens_bridge.py</text>
+<rect x='516' y='168' width='18' height='20' rx='2' fill='#cbd5e1' stroke='#1f2933'/>
+<rect x='516' y='198' width='18' height='20' rx='2' fill='#cbd5e1' stroke='#1f2933'/>
+<rect x='516' y='228' width='18' height='20' rx='2' fill='#cbd5e1' stroke='#1f2933'/>
+<rect x='516' y='258' width='18' height='20' rx='2' fill='#cbd5e1' stroke='#1f2933'/>
+<text x='525' y='300' font-size='9' font-weight='400' fill='#6b7280' text-anchor='middle'>USB</text>
+<rect x='405' y='320' width='40' height='14' rx='2' fill='#cbd5e1' stroke='#1f2933'/>
+<line x1='534' y1='178' x2='600' y2='178' stroke='#1d4ed8' stroke-width='2' marker-end='url(#arrd)'/>
+<rect x='600' y='150' width='140' height='56' rx='8' fill='#f8fafc' stroke='#1d4ed8' stroke-width='1.5'/>
+<text x='612' y='172' font-size='13' font-weight='700' fill='#1d4ed8' text-anchor='start'>RTL-SDR Blog v4</text>
+<text x='612' y='190' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>24–1766 MHz, 2.4 MS/s</text>
+<path d='M740,178 L780,178' fill='none' stroke='#b45309' stroke-width='3'/>
+<rect x='780' y='150' width='64' height='56' rx='8' fill='#f9fafb' stroke='#6b7280' stroke-width='1.5'/>
+<text x='792' y='172' font-size='13' font-weight='700' fill='#6b7280' text-anchor='start'>LNA</text>
+<text x='792' y='190' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>optional</text>
+<text x='792' y='204' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>+20 dB</text>
+<path d='M844,178 L876,178' fill='none' stroke='#b45309' stroke-width='3'/>
+<line x1='880' y1='178' x2='929.5' y2='178' stroke='#b45309' stroke-width='3'/>
+<line x1='880.0' y1='161.5' x2='880.0' y2='194.5' stroke='#b45309' stroke-width='3'/>
+<line x1='888.8' y1='163.7' x2='888.8' y2='192.3' stroke='#b45309' stroke-width='3'/>
+<line x1='897.6' y1='165.35' x2='897.6' y2='190.65' stroke='#b45309' stroke-width='3'/>
+<line x1='906.4' y1='167.0' x2='906.4' y2='189.0' stroke='#b45309' stroke-width='3'/>
+<line x1='915.2' y1='168.1' x2='915.2' y2='187.9' stroke='#b45309' stroke-width='3'/>
+<line x1='924.0' y1='169.2' x2='924.0' y2='186.8' stroke='#b45309' stroke-width='3'/>
+<text x='905' y='230' font-size='10' font-weight='600' fill='#b45309' text-anchor='middle'>log-periodic 400–1000 MHz</text>
+<text x='905' y='243' font-size='10' font-weight='400' fill='#b45309' text-anchor='middle'>315 / 433 / 915 MHz</text>
+<line x1='534' y1='268' x2='600' y2='268' stroke='#1d4ed8' stroke-width='2' marker-end='url(#arrd)'/>
+<rect x='600' y='240' width='140' height='56' rx='8' fill='#f8fafc' stroke='#1d4ed8' stroke-width='1.5'/>
+<text x='612' y='262' font-size='13' font-weight='700' fill='#1d4ed8' text-anchor='start'>USB Wi-Fi adapter</text>
+<text x='612' y='280' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>monitor mode (mt76 / rtl8812au)</text>
+<path d='M740,268 L780,268' fill='none' stroke='#b45309' stroke-width='3'/>
+<rect x='782' y='250' width='46' height='36' rx='4' fill='#fff7ed' stroke='#b45309' stroke-width='2'/>
+<rect x='791.2' y='257.2' width='27.599999999999998' height='21.599999999999998' rx='3' fill='none' stroke='#b45309' stroke-width='1.2'/>
+<text x='805.0' y='302' font-size='11' font-weight='600' fill='#b45309' text-anchor='middle'>2.4 / 5 GHz panel</text>
+<rect x='80' y='150' width='92' height='170' rx='12' fill='#ecfdf5' stroke='#0f766e' stroke-width='2'/>
+<rect x='88' y='164' width='76' height='132' rx='4' fill='#ffffff' stroke='#0f766e' stroke-width='1'/>
+<rect x='94' y='172' width='64' height='10' rx='2' fill='#0f766e' fill-opacity='0.5'/>
+<rect x='94' y='190' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.12'/>
+<rect x='94' y='214' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.16999999999999998'/>
+<rect x='94' y='238' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.22'/>
+<rect x='94' y='262' width='64' height='18' rx='2' fill='#0f766e' fill-opacity='0.27'/>
+<text x='126' y='340' font-size='12' font-weight='700' fill='#0f766e' text-anchor='middle'>Phone · Wavelens</text>
+<text x='126' y='356' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>on the dash</text>
+<line x1='310' y1='235' x2='172' y2='235' stroke='#7c3aed' stroke-width='1.6' marker-end='url(#arrb)' marker-start='url(#arrb)'/>
+<text x='241' y='223' font-size='11' font-weight='600' fill='#7c3aed' text-anchor='middle'>BLE (Pi built-in radio)</text>
+<path d='M425,334 L425,400' fill='none' stroke='#b91c1c' stroke-width='2'/>
+<text x='435' y='355' font-size='10' font-weight='600' fill='#b91c1c' text-anchor='start'>USB-C 5 V / 3 A</text>
+<rect x='345' y='400' width='160' height='56' rx='8' fill='#fef2f2' stroke='#b91c1c' stroke-width='1.5'/>
+<text x='357' y='422' font-size='13' font-weight='700' fill='#b91c1c' text-anchor='start'>12 V → 5 V 3 A buck</text>
+<text x='357' y='440' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>fused from the accessory circuit</text>
+<rect x='40' y='400' width='260' height='150' rx='8' fill='#ffffff' stroke='#1f2933' stroke-width='1.5'/>
+<text x='52' y='422' font-size='13' font-weight='700' fill='#1f2933' text-anchor='start'>Data flow on the Pi</text>
+<text x='52' y='440' font-size='10' font-weight='700' fill='#1d4ed8' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>rtl_433 -F json</text>
+<text x='170' y='440' font-size='10' font-weight='400' fill='#6b7280' text-anchor='start'>sub-GHz frames → JSON</text>
+<line x1='90' y1='445' x2='90' y2='454' stroke='#9aa5b1' stroke-width='1' marker-end='url(#arr)'/>
+<text x='52' y='464' font-size='10' font-weight='700' fill='#1d4ed8' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>kismet → devices.json</text>
+<text x='170' y='464' font-size='10' font-weight='400' fill='#6b7280' text-anchor='start'>Wi-Fi APs, monitor adapter</text>
+<line x1='90' y1='469' x2='90' y2='478' stroke='#9aa5b1' stroke-width='1' marker-end='url(#arr)'/>
+<text x='52' y='488' font-size='10' font-weight='700' fill='#1d4ed8' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>wavelens_bridge.py</text>
+<text x='170' y='488' font-size='10' font-weight='400' fill='#6b7280' text-anchor='start'>Wavelens lines + cat/conf</text>
+<line x1='90' y1='493' x2='90' y2='502' stroke='#9aa5b1' stroke-width='1' marker-end='url(#arr)'/>
+<text x='52' y='512' font-size='10' font-weight='700' fill='#1d4ed8' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>BlueZ GATT peripheral</text>
+<text x='170' y='512' font-size='10' font-weight='400' fill='#6b7280' text-anchor='start'>notify, 180-byte chunks</text>
+<rect x='540' y='330' width='420' height='184' rx='6' fill='#f3f4f6' stroke='#9aa5b1' stroke-width='1'/>
+<text x='550' y='348' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Why this build</text>
+<text x='550' y='362' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'></text>
+<text x='550' y='376' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Sub-GHz is where TPMS, key fobs, wireless sensors and LoRa live;</text>
+<text x='550' y='390' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  no phone hears any of it.</text>
+<text x='550' y='404' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Kismet on a monitor-mode adapter sees every channel it is parked</text>
+<text x='550' y='418' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  on, including 5 GHz hidden-SSID hotspots, with no OS throttling.</text>
+<text x='550' y='432' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• A HackRF (1 MHz–6 GHz) on another port adds hackrf_sweep: energy</text>
+<text x='550' y='446' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  peaks in the 900 MHz, 1.2 GHz, 2.4 GHz and 5.8 GHz bands.</text>
+<text x='550' y='460' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• The bridge does not classify beyond a hint; the app&#39;s signature</text>
+<text x='550' y='474' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  pack still has the last word.</text>
+<text x='550' y='488' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>• Antennas: a log-periodic covers 400–1000 MHz in one unit; a</text>
+<text x='550' y='502' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>  2.4/5 GHz panel for the Wi-Fi adapter. Point both forward.</text>
+</svg>

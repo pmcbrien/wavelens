@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up a Wavelens Scanner on a Raspberry Pi</title>
+<meta name="description" content="Turn a Raspberry Pi 4 or 5 with an RTL-SDR into a Wavelens Scanner with one command. This page builds the command for your setup.">
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0f1216; color: #e8ebf0; font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 680px; margin: 0 auto; padding: 32px 20px 60px; }
+  h1 { font-size: 26px; margin: 0 0 6px; } h2 { font-size: 18px; margin: 28px 0 8px; }
+  a { color: #f2b705; } p, li { color: #c9cfd8; }
+  .box { background: #15181b; border: 1px solid #262b31; border-radius: 12px; padding: 18px 20px; margin: 18px 0; }
+  .ver { color: #8c96a3; font-size: 14px; }
+  code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 14px; background: #1b1f24; padding: 1px 5px; border-radius: 4px; }
+  ol li, ul li { margin: 4px 0; }
+  .step { color: #f2b705; font-weight: 600; }
+  label { display: block; margin: 12px 0 4px; color: #e8ebf0; font-size: 15px; }
+  input[type=text], select { width: 100%; box-sizing: border-box; background: #0f1216; color: #e8ebf0; border: 1px solid #343a42; border-radius: 8px; padding: 9px 10px; font: inherit; }
+  input[type=text]:focus, select:focus, button:focus-visible { outline: 2px solid #f2b705; outline-offset: 1px; }
+  .hint { color: #8c96a3; font-size: 14px; margin: 4px 0 0; }
+  .err { color: #ff8a7a; font-size: 14px; margin: 4px 0 0; min-height: 0; }
+  pre { margin: 14px 0 10px; background: #0b0d10; border: 1px solid #262b31; border-radius: 8px; padding: 12px 14px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace; color: #e8ebf0; }
+  button { background: #f2b705; color: #111; border: 0; border-radius: 8px; font: 600 16px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding: 10px 18px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #copied { color: #8c96a3; font-size: 14px; margin-left: 10px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Set up a Wavelens Scanner</h1>
+  <p class="ver">Turns a Raspberry Pi with one or more RTL-SDR dongles into a Wavelens Scanner: one command, about ten minutes, and it starts by itself at every boot. A browser can't write an SD card or reach into a Pi the way it can flash a <a href="../flash/">Spotter</a>, so the Pi runs the installer itself; this page builds the command.</p>
+
+  <h2>What you need</h2>
+  <ul>
+    <li>A Raspberry Pi 4 or Pi 5 with its official power supply (the 5&nbsp;A one on a Pi 5, or its USB ports are held to 600&nbsp;mA between them).</li>
+    <li>At least one RTL-SDR dongle. More can be added later; the Scanner works out what each one does.</li>
+    <li>A microSD card, and internet on the Pi while the installer runs.</li>
+  </ul>
+  <p class="ver">Which Pi, dongle, hub and antenna work: <a href="https://github.com/pmcbrien/wavelens/blob/main/companion/HARDWARE.md">HARDWARE.md</a>.</p>
+
+  <div class="box">
+    <p><span class="step">1. Put Raspberry Pi OS on the card.</span> Use <a href="https://www.raspberrypi.com/software/">Raspberry Pi Imager</a> and pick <strong>Raspberry Pi OS Lite (64-bit)</strong>. In Imager's settings, set a username and password, your Wi-Fi, and turn on <strong>SSH</strong>. Put the card in the Pi, plug in the dongles, and power it up.</p>
+    <p><span class="step">2. Open a terminal on the Pi.</span> From a computer on the same network: <code>ssh yourname@raspberrypi.local</code> (the username and hostname you set in Imager). A keyboard and screen on the Pi work too.</p>
+    <p><span class="step">3. Paste this command</span> and press Enter.</p>
+
+    <label for="host">Name for this Scanner</label>
+    <input type="text" id="host" value="wavelens" maxlength="32" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="hosthint hosterr">
+    <p class="hint" id="hosthint">Its admin page will be at <code id="adminurl">http://wavelens.local:8080</code>. Change it if you run more than one.</p>
+    <p class="err" id="hosterr" role="alert"></p>
+
+    <label for="country">Where you'll use it (optional)</label>
+    <input type="text" id="country" value="" maxlength="2" size="4" placeholder="US" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-label="Two-letter country code" style="width:5em;display:inline-block">
+    <input type="text" id="postcode" value="" maxlength="12" placeholder="Postcode / ZIP" autocomplete="off" spellcheck="false" aria-label="Postcode or ZIP" aria-describedby="areahint areaerr" style="width:12em;display:inline-block">
+    <p class="hint" id="areahint">A two-letter country and a postcode, any country. The Scanner downloads the public licence records around that place, where a country publishes them (today the United States), so a hit reads as the licensee's name instead of a bare frequency. Leave it empty to set it later on the admin page's <em>Area</em> tab.</p>
+    <p class="err" id="areaerr" role="alert"></p>
+
+    <label for="blog">RTL-SDR Blog V4 driver</label>
+    <select id="blog" aria-describedby="bloghint">
+      <option value="auto" selected>Install it if a V4 is plugged in (recommended)</option>
+      <option value="1">Install it now (I'll add a V4 later)</option>
+      <option value="0">Don't install it</option>
+    </select>
+    <p class="hint" id="bloghint">Only the RTL-SDR Blog V4 needs it, and only on a Raspberry Pi OS whose own driver is older than 2.0. Building it adds about five minutes. Other dongles (RTL-SDR Blog V3, Nooelec NESDR, plain RTL2838) use the driver that comes with the OS.</p>
+
+    <pre id="cmd" aria-label="Install command"></pre>
+    <button type="button" id="copy">Copy command</button><span id="copied" role="status"></span>
+
+    <p style="margin-top:18px"><span class="step">4. Pair it.</span> When it says <em>Done</em>, open <a id="adminlink" href="http://wavelens.local:8080">http://wavelens.local:8080</a> and set the admin password, then in the Wavelens app: <em>More → Companion radio → Find → Pair</em>.</p>
+  </div>
+
+  <h2>What the command does</h2>
+  <ul>
+    <li>Checks the Pi model, power supply and internet, and tells you what it found.</li>
+    <li>Installs the radio tools (<code>rtl-sdr</code>, <code>rtl_433</code>), Bluetooth and the Scanner's bridge, updater and admin page from the <a href="https://github.com/pmcbrien/wavelens/tree/main/companion/pi">public repository</a>.</li>
+    <li>Stops the kernel's TV driver from taking the dongle, names the Pi, and starts the Scanner as a service.</li>
+    <li>Lists the dongles it can see at the end. It is safe to run again, to repair or after re-imaging the card.</li>
+  </ul>
+  <p class="ver">Read it before you run it: <a href="https://github.com/pmcbrien/wavelens/blob/main/companion/pi/provision.sh">provision.sh</a>.</p>
+
+  <h2>Digital voice</h2>
+  <p>P25, DMR and NXDN voice is a separate, longer build with a patent notice you have to read and accept, so it is not part of the one-line install. After step 3: <code>sudo /opt/wavelens/companion/pi/install-dsd.sh</code></p>
+
+  <h2>If something is off</h2>
+  <ul>
+    <li><strong>The page at <code>.local</code> doesn't open:</strong> use the Pi's IP address instead (<code>hostname -I</code> on the Pi), port 8080.</li>
+    <li><strong>No dongle listed at the end:</strong> try another USB port, then <code>sudo systemctl restart wavelens-bridge</code>. On a Pi 5 with a smaller power supply, more than one dongle needs a powered hub.</li>
+    <li><strong>A V4 hears nothing above VHF or shows <code>PLL not locked</code>:</strong> run the command again with the driver option set to <em>Install it now</em>.</li>
+    <li><strong>Anything else:</strong> <code>journalctl -u wavelens-bridge -f</code> shows what the Scanner is doing; the admin page has <em>Download log for support</em>.</li>
+  </ul>
+  <p class="ver">Receive-only; it transmits nothing. Updates are free for life: <code>sudo wavelens-update check</code>, the admin page, or the app's Companion screen. More: <a href="https://github.com/pmcbrien/wavelens/blob/main/companion/UPDATES.md">UPDATES.md</a>, <a href="https://github.com/pmcbrien/wavelens/blob/main/companion/pi/ADMIN.md">ADMIN.md</a>.</p>
+</main>
+<script>
+  // Builds the one-liner from the options. Values are validated to a strict pattern before they go into the
+  // command, so nothing typed here can add shell syntax to what gets pasted into a root shell.
+  var URL_ = "https://raw.githubusercontent.com/pmcbrien/wavelens/main/companion/pi/provision.sh";
+  var host = document.getElementById("host"), blog = document.getElementById("blog");
+  var country = document.getElementById("country"), postcode = document.getElementById("postcode");
+  var COUNTRY_OK = /^[A-Z]{2}$/, POSTCODE_OK = /^[A-Z0-9]([A-Z0-9-]{0,10}[A-Z0-9])?$/;
+  var cmd = document.getElementById("cmd"), copy = document.getElementById("copy"), copied = document.getElementById("copied");
+  var HOST_OK = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
+
+  function build() {
+    var h = host.value.trim().toLowerCase(), b = blog.value;
+    var ok = HOST_OK.test(h);
+    document.getElementById("hosterr").textContent = ok ? "" : "Use lowercase letters, digits and hyphens (not at the start or end).";
+    // spaces are dropped: the Scanner stores postcodes without them, and none then goes into the command
+    var c = country.value.trim().toUpperCase(), p = postcode.value.toUpperCase().replace(/\s+/g, "");
+    var areaOk = (!c && !p) || ((!c || COUNTRY_OK.test(c)) && POSTCODE_OK.test(p));
+    document.getElementById("areaerr").textContent = areaOk ? "" : (p ? "Country is two letters (US, CA, AU, GB, DE …); the postcode is letters and digits." : "Add the postcode, or clear the country.");
+    copy.disabled = !ok || !areaOk;
+    copied.textContent = "";
+    if (!ok) { cmd.textContent = "Fix the name above to see the command."; return; }
+    if (!areaOk) { cmd.textContent = "Fix the country and postcode above to see the command."; return; }
+    var env = [];
+    if (h !== "wavelens") env.push("WAVELENS_HOSTNAME=" + h);
+    if (b === "1" || b === "0") env.push("WAVELENS_RTLSDR_BLOG=" + b);
+    if (p) { env.push("WAVELENS_COUNTRY=" + (c || "US")); env.push("WAVELENS_POSTCODE=" + p); }
+    cmd.textContent = "curl -fsSL " + URL_ + " | sudo " + (env.length ? "env " + env.join(" ") + " " : "") + "bash";
+    var admin = "http://" + h + ".local:8080";
+    document.getElementById("adminurl").textContent = admin;
+    var link = document.getElementById("adminlink"); link.textContent = admin; link.href = admin;
+  }
+  host.addEventListener("input", build);
+  blog.addEventListener("change", build);
+  country.addEventListener("input", build);
+  postcode.addEventListener("input", build);
+  copy.addEventListener("click", function () {
+    var text = cmd.textContent;
+    function done() { copied.textContent = "Copied. Paste it into the Pi's terminal."; }
+    function fallback() {
+      var r = document.createRange(); r.selectNodeContents(cmd);
+      var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+      try { document.execCommand("copy"); done(); } catch (e) { copied.textContent = "Select the command and copy it."; }
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback); else fallback();
+  });
+  build();
+</script>
+</body>
+</html>

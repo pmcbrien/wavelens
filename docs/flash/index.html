@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flash a Wavelens Spotter from your browser</title>
+<meta name="description" content="Install or update the Wavelens Spotter (ESP32 companion) firmware from Chrome or Edge on a computer, over USB. No tools to install.">
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0f1216; color: #e8ebf0; font: 16px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 680px; margin: 0 auto; padding: 32px 20px 60px; }
+  h1 { font-size: 26px; margin: 0 0 6px; } h2 { font-size: 18px; margin: 28px 0 8px; }
+  a { color: #f2b705; } p, li { color: #c9cfd8; }
+  .box { background: #15181b; border: 1px solid #262b31; border-radius: 12px; padding: 18px 20px; margin: 18px 0; }
+  .ver { color: #8c96a3; font-size: 14px; }
+  .fw { margin: 0 0 10px; font-size: 15px; } .fw strong { color: #f2b705; font-family: ui-monospace, Menlo, Consolas, monospace; }
+  esp-web-install-button { --esp-tools-button-color: #f2b705; --esp-tools-button-text-color: #111; --esp-tools-button-border-radius: 8px; }
+  esp-web-install-button button { font-size: 16px; padding: 10px 18px; font-weight: 600; }
+  .nope { color: #f2b705; }
+  code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 14px; background: #1b1f24; padding: 1px 5px; border-radius: 4px; }
+  ol li { margin: 4px 0; }
+</style>
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+</head>
+<body>
+<main>
+  <h1>Flash a Wavelens Spotter</h1>
+  <p class="fw">Current firmware: <strong id="fwver"><a href="VERSION">see VERSION</a></strong></p>
+  <p class="ver">Installs the current Spotter firmware onto an ESP32 over USB, from this page. Works in Chrome and Edge on Windows, macOS, Linux and ChromeOS. Phones can't do this (no Web Serial): on Android, update from inside the Wavelens app instead — <em>More → Companion radio → Update firmware</em>, over Bluetooth.</p>
+
+  <div class="box">
+    <ol>
+      <li>Plug the Spotter, or any of these dev boards, into the computer with a <strong>data</strong> USB cable: classic ESP32 (ESP32-WROOM-32 / -32U), ESP32-S3, ESP32-C3, ESP32-C6 or ESP32-C5. The page reads which chip it is and installs the matching firmware. On boards with two USB ports, use the one marked <strong>USB</strong> (not UART) on a C3, C5 or C6.</li>
+      <li>Click the button, pick the serial port that appears (usually <code>USB Serial</code>, <code>USB JTAG/serial debug unit</code>, <code>CP210x</code> or <code>CH340</code>), and let it run — about a minute.</li>
+      <li>When it says done, unplug and plug it back in. The LED blinks twice (white on boards with a colour LED) and it advertises as <code>Wavelens-XXXX</code>; pair it in the app.</li>
+    </ol>
+    <esp-web-install-button manifest="manifest.json">
+      <span slot="unsupported" class="nope">This browser can't talk to USB serial. Use Chrome or Edge on a computer.</span>
+      <span slot="not-allowed" class="nope">Open this page over HTTPS to flash.</span>
+    </esp-web-install-button>
+  </div>
+
+  <h2>If the port doesn't show up</h2>
+  <ul>
+    <li>Try another cable; many are charge-only.</li>
+    <li>Windows may need the CP210x or CH340 driver for the board's USB chip (the board's maker links it).</li>
+    <li>Some boards need <strong>BOOT</strong> held while the connection starts (common on C3 SuperMini and XIAO boards: hold BOOT, tap RESET, let go of BOOT); the Spotter we ship doesn't.</li>
+  </ul>
+
+  <h2>Other ways to update</h2>
+  <ul>
+    <li><strong>From the phone, no computer:</strong> Wavelens app → <em>More → Companion radio → Update firmware</em>. The app carries the firmware inside it; the update goes over Bluetooth in about a minute.</li>
+    <li><strong>From a Scanner Pi:</strong> plug the Spotter into the Pi's USB and use the admin page (<code>http://wavelens.local:8080</code> → Spotter).</li>
+    <li><strong>Command line:</strong> <code>pip install esptool</code>, then <code>esptool.py --chip esp32 write_flash 0x0 wavelens-esp32-merged.bin</code> (for another chip swap both names, e.g. <code>--chip esp32c6</code> and <code>wavelens-esp32c6-merged.bin</code>) (the image is on the <a href="https://github.com/pmcbrien/wavelens/releases/tag/firmware">firmware release</a>).</li>
+  </ul>
+  <p class="ver">Receive-only firmware; it transmits nothing. A C3, C5 or C6 shares one core between Wi-Fi and Bluetooth, so it hears a little less than a classic ESP32; the C5 is the only one that also hears 5&nbsp;GHz Wi-Fi. Source: <a href="https://github.com/pmcbrien/wavelens/tree/main/companion/esp32">companion/esp32</a>. Updates are free for life.</p>
+</main>
+<script>
+  // VERSION sits next to this page (the firmware workflow writes both), so the line always matches what the button installs.
+  fetch("VERSION", { cache: "no-store" }).then(r => r.ok ? r.text() : null).then(v => {
+    v = v && v.trim();
+    if (v && /^[0-9][0-9.]*$/.test(v)) document.getElementById("fwver").textContent = v;
+  }).catch(() => {});
+</script>
+</body>
+</html>
