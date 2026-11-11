@@ -567,6 +567,10 @@ def admin_address() -> str:
 # back the password. Anyone holding the Bluetooth link can use it, as with every other command here, so
 # WAVELENS_WIFI_SETUP=0 in /etc/default/wavelens-bridge turns it off for a Pi that is already set up.
 NET_ON = os.environ.get("WAVELENS_WIFI_SETUP", "1").strip().lower() not in ("0", "no", "off", "false")
+# Updates and the area from the app (the Companion screen's Check / Install / Roll back buttons and its Area
+# row). Like Wi-Fi set-up these come over the Bluetooth link from whoever is connected, so the admin page's
+# Settings tab can turn them off (WAVELENS_APP_CONTROL=0); the admin page's own Update and Area tabs keep working.
+APP_CONTROL = os.environ.get("WAVELENS_APP_CONTROL", "1").strip().lower() not in ("0", "no", "off", "false")
 NET_MAX = 12            # networks listed to the phone, strongest first
 NET_JOIN_GAP_S = 8.0    # between join attempts: a wrong password is not a reason to hammer the access point
 NET = {"lock": threading.Lock(), "busy": "", "last_join": 0.0}
@@ -811,7 +815,7 @@ def hello() -> None:
         spec = None
     msg = {"t": "hello", "fw": FW, "name": state.get("name", "Wavelens-Pi"), "code": state.get("code", ""),
            "caps": sorted(set(CAPS)), "hw": hw, "region": REGION["code"], "ver": VERSION, "update": update_info()}
-    if "area" in CAPS:
+    if AREA.get("on"):               # shown even when setting it from the app is off (WAVELENS_APP_CONTROL=0)
         msg["area"] = area_info()
     if HUB:
         msg["spotters"] = HUB.info()
@@ -4843,6 +4847,12 @@ def run_peripheral(name: str) -> None:
         elif c == "net":
             # The Companion screen's Wi-Fi card: what the Pi is on, what it can see, join one (see net_command).
             net_command(cmd)
+        elif c == "update" and not APP_CONTROL:
+            emit({"t": "status", "msg": "update: turned off from the app on this Scanner (admin page, Settings)",
+                  "band": state["band"], "mode": state["mode"]})
+        elif c == "area" and not APP_CONTROL:
+            emit({"t": "area", "state": "failed",
+                  "msg": "setting the area from the app is turned off on this Scanner (admin page, Settings)"})
         elif c == "update":
             # The Companion screen's Check / Install update / Roll back buttons. The Pi does the network
             # work (git pull from the public repo); the phone never needs a network permission for it.
@@ -5452,7 +5462,7 @@ def main() -> None:
     sys.stderr = _StderrTee(sys.stderr)
     threading.Thread(target=log_pump, daemon=True).start()
     CAPS.append("log")
-    CAPS.append("update")
+    CAPS.append("update")            # kept with WAVELENS_APP_CONTROL=0 too: older apps read its absence as "too old"
     if net_available():
         CAPS.append("net")           # the phone may set this computer's Wi-Fi over the link
     globals()["PORTAPACK_TTY"] = a.portapack_port
@@ -5472,7 +5482,9 @@ def main() -> None:
         try:
             import area as area_mod
             AREA["dir"] = a.area_dir
-            CAPS.append("area")          # the phone may set the area: its set-up step asks when none is set
+            AREA["on"] = True
+            if APP_CONTROL:
+                CAPS.append("area")      # the phone may set the area: its set-up step asks when none is set
             found = area_mod.inputs_for_bridge(a.area_dir)
             if found["area"]:
                 print(f"bridge: area {area_mod.describe(found['area'])}", file=sys.stderr)

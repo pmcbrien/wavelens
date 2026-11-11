@@ -30,7 +30,7 @@ later visit asks for that password; a login lasts 12 hours on that device. Chang
 |------|--------------|
 | **Status** | If something is wrong, a red box at the top says what in plain words and has the fix as a button (below). Bridge running or not, phone connected or not, the radios it found (and anything missing), the Pi's name, IP, Wi-Fi, temperature, disk and uptime. A banner appears when an update is available. Buttons to restart the bridge or reboot. |
 | **Logs** | The last 300 lines of the bridge's log, refreshing every 2 seconds. The very chatty signal lines are hidden unless you tick *include rf/spec lines*. *Download full log* saves the last 5000 lines to send to support. |
-| **Settings** | The radio name the app lists under *Find*, and the bridge's options from `/etc/default/wavelens-bridge`, with the file's own explanations below. Saving restarts the bridge. |
+| **Settings** | The radio name the app lists under *Find*, and the bridge's options from `/etc/default/wavelens-bridge`, with the file's own explanations below. Saving restarts the bridge. The **Bluetooth and remote access** card has four on/off switches: Wi-Fi set-up from the app (`WAVELENS_WIFI_SETUP`), updates and area from the app (`WAVELENS_APP_CONTROL`), accepting Bluetooth pairing without a prompt (the `wavelens-bt-agent` service) and SSH login (the `ssh` service). Only what changed is touched; the bridge restarts only for the first two. |
 | **Area** | Where the Scanner is used: a two-letter country and a postcode, any country. *Set area and download* fetches the public licence records around that place (where a country publishes them, today the United States) so hits are named by licensee. Also lists the RadioReference exports you copied into `/var/lib/wavelens/area/rr/`. Needs Wi-Fi; restarts the bridge. |
 | **Update** | Installed and available version, *Check now*, *Install update*, *Roll back to previous*, and a box for installing updates automatically overnight. Progress streams onto the page. Updates are free for life and come from the public GitHub repo `pmcbrien/wavelens`; the Pi needs Wi-Fi to fetch them. |
 | **Wi-Fi** | Networks nearby, join one, forget saved ones, and rename the Pi. Do this on your home Wi-Fi, not public Wi-Fi: the password you type travels over the local network unencrypted. |
@@ -77,7 +77,7 @@ admin page is. *Other network…* is for a network that hides its name.
 - Forgetting a saved network and renaming the Pi stay on this page's **Wi-Fi** tab.
 - The Bluetooth link to a Scanner is not paired or encrypted, so do this at home, not in a public place.
   Anyone in Bluetooth range who connects to the Pi could use it too; to switch it off once the Pi is set up,
-  put `WAVELENS_WIFI_SETUP=0` in `/etc/default/wavelens-bridge` (the **Settings** page) and restart the bridge.
+  turn off **Wi-Fi set-up from the app** on the **Settings** page (*Bluetooth and remote access*).
 - Needs the Pi's software at 2026.11.10.8 or later and NetworkManager (Raspberry Pi OS Bookworm and later).
 
 ## Forgot the password?

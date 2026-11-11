@@ -71,6 +71,11 @@ WAVELENS_ARGS=""
 # your network you can turn it off here (0); the admin page's Wi-Fi tab keeps working either way.
 WAVELENS_WIFI_SETUP=1
 
+# Updates and the area from the app. The Companion screen's Check / Install / Roll back buttons and its Area
+# row send commands over the same Bluetooth link, open to whoever connects. 0 turns both off; the admin page's
+# Update and Area tabs keep working. (Settings tab, "Bluetooth and remote access", sets this and the line above.)
+WAVELENS_APP_CONTROL=1
+
 # Updates. "sudo wavelens-update check" / "apply" / "rollback" by hand, or from the app's Companion screen, or
 # the admin page (http://<hostname>.local:8080). A timer checks every night; with WAVELENS_AUTO_UPDATE=1 it also
 # installs what it finds (never while a phone is connected) and rolls back by itself if the new bridge won't start.

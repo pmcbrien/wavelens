@@ -8,7 +8,8 @@ phone over the home Wi-Fi to look after the Pi that runs wavelens-bridge:
 
 Pages:  /          status, Pi facts, update banner, quick actions
         /logs      bridge journal (last 300 lines, live polling, download)
-        /settings  /etc/default/wavelens-bridge editor (comments preserved)
+        /settings  /etc/default/wavelens-bridge editor (comments preserved), and the Bluetooth / Wi-Fi
+                   set-up / SSH switches (POST /security)
         /update    check / install / roll back via /usr/local/bin/wavelens-update
         /wifi      join a network, forget saved ones, rename the Pi
         /spotter   flash a Wavelens Spotter (ESP32) over USB with esptool
@@ -407,6 +408,83 @@ def defaults_help():
         if txt:
             return "\n".join(l[1:].strip() for l in txt.splitlines() if l.startswith("#"))
     return ""
+
+
+# --------------------------------------------------------------------------------------------
+# Bluetooth and remote access (Settings tab): the switches for what a nearby phone or the home network can do
+# --------------------------------------------------------------------------------------------
+BT_AGENT_UNIT = "wavelens-bt-agent"
+SSH_UNITS = ("ssh", "sshd")          # Raspberry Pi OS / Debian call it ssh; sshd is an alias on some images
+OFF_WORDS = ("0", "no", "off", "false")
+
+
+def env_on(d, key, default="1"):
+    """The bridge's own reading of an on/off key in /etc/default/wavelens-bridge."""
+    return str(d.get(key, default)).strip().lower() not in OFF_WORDS
+
+
+def unit_enabled(unit):
+    """'on', 'off' or 'missing' for a systemd unit: enabled at boot counts as on."""
+    rc, out = run(["systemctl", "is-enabled", unit], timeout=10)
+    word = (out.splitlines() or [""])[-1].strip()
+    if word in ("enabled", "enabled-runtime", "alias", "static", "indirect"):
+        return "on"
+    if word in ("disabled", "masked", "masked-runtime"):
+        return "off"
+    return "missing"
+
+
+def ssh_unit():
+    """The SSH server's unit name on this Pi, or None if none is installed."""
+    for u in SSH_UNITS:
+        if unit_enabled(u) != "missing":
+            return u
+    return None
+
+
+def unit_set(unit, on):
+    """Enable and start, or disable and stop, a unit. Returns (ok, output)."""
+    rc, out = run(["systemctl", "enable" if on else "disable", "--now", unit], timeout=30)
+    return rc == 0, out
+
+
+def security_state():
+    """What the Settings tab's 'Bluetooth and remote access' card shows."""
+    d = defaults_read()
+    ssh = ssh_unit()
+    return {"wifi_setup": env_on(d, "WAVELENS_WIFI_SETUP"),
+            "app_control": env_on(d, "WAVELENS_APP_CONTROL"),
+            "bt_autopair": unit_enabled(BT_AGENT_UNIT),      # on / off / missing
+            "ssh": unit_enabled(ssh) if ssh else "missing",
+            "ssh_unit": ssh}
+
+
+def security_apply(form, cur):
+    """Apply the card's form against the current state. Only what changed is touched.
+    Returns (messages, restart_bridge)."""
+    msgs, restart, env = [], False, {}
+    want = {k: form.get(k) == "1" for k in ("wifi_setup", "app_control", "bt_autopair", "ssh")}
+    if want["wifi_setup"] != cur["wifi_setup"]:
+        env["WAVELENS_WIFI_SETUP"] = "1" if want["wifi_setup"] else "0"
+        msgs.append("Wi-Fi set-up from the app " + ("on" if want["wifi_setup"] else "off") + ".")
+    if want["app_control"] != cur["app_control"]:
+        env["WAVELENS_APP_CONTROL"] = "1" if want["app_control"] else "0"
+        msgs.append("Updates and area from the app " + ("on" if want["app_control"] else "off") + ".")
+    if env:
+        defaults_write(env)
+        restart = True
+    if cur["bt_autopair"] != "missing" and want["bt_autopair"] != (cur["bt_autopair"] == "on"):
+        ok, out = unit_set(BT_AGENT_UNIT, want["bt_autopair"])
+        if ok and not want["bt_autopair"]:
+            run(["bluetoothctl", "pairable", "off"], timeout=10)   # the agent turned it on; don't leave it on
+        msgs.append(("Pairing without a prompt " + ("on" if want["bt_autopair"] else "off") + ".") if ok
+                    else f"Pairing setting failed: {out}")
+    if cur["ssh"] != "missing" and want["ssh"] != (cur["ssh"] == "on"):
+        ok, out = unit_set(cur["ssh_unit"], want["ssh"])
+        if ok and not want["ssh"] and unit_enabled("ssh.socket") == "on":
+            unit_set("ssh.socket", False)     # newer Debian can start sshd from a socket instead
+        msgs.append(("SSH login " + ("on" if want["ssh"] else "off") + ".") if ok else f"SSH setting failed: {out}")
+    return msgs, restart
 
 
 # --------------------------------------------------------------------------------------------
@@ -954,7 +1032,7 @@ class Handler(BaseHTTPRequestHandler):
                 form, files = self.form(), {}
             if not csrf_ok(form.get("csrf"), sess["csrf"]):
                 return self.send_html(page("Rejected", "<p>Form token mismatch — go back, reload the page and try again.</p>"), 403)
-            handlers = {"/logout": self.post_logout, "/account": self.post_account, "/settings": self.post_settings,
+            handlers = {"/logout": self.post_logout, "/account": self.post_account, "/settings": self.post_settings, "/security": self.post_security,
                         "/area": self.post_area, "/update": self.post_update, "/wifi": self.post_wifi, "/spotter": self.post_spotter,
                         "/bridge/restart": self.post_bridge_restart}
             if path in handlers:
@@ -1159,9 +1237,40 @@ Support: wavelensapp@gmail.com — attach the downloaded log.</p></div>"""
 <label>WAVELENS_ARGS (extra bridge flags; the radio name above is kept in sync)</label>
 <textarea name="args" rows="4">{esc(args)}</textarea>
 <button class="btn" type="submit">Save and restart bridge</button></form></div>
+{self.security_card(sess)}
 <div class="card"><h2>What these mean</h2><p class="note">From the comments in <code>/etc/default/wavelens-bridge</code>:</p>
 <pre style="max-height:40vh">{esc(defaults_help())}</pre></div>"""
         self.render(sess, "Settings", body, "/settings")
+
+    def security_card(self, sess):
+        st = security_state()
+
+        def row(key, label, note, state):
+            if state == "missing":
+                return f'<label>{label}</label><p class="note">Not installed on this Pi.</p>'
+            on = state is True or state == "on"
+            return (f'<label>{label}</label><select name="{key}">'
+                    f'<option value="1" {"selected" if on else ""}>On</option>'
+                    f'<option value="0" {"" if on else "selected"}>Off</option></select>'
+                    f'<p class="note">{note}</p>')
+
+        return f"""<div class="card"><h2>Bluetooth and remote access</h2>
+<p class="note">Commands from the app come over Bluetooth from whichever phone is connected. Once this Scanner is on
+your Wi-Fi and set up, you can turn off what you don't use. This page keeps working either way.</p>
+<form method="post" action="/security">{csrf_field(sess)}
+{row("wifi_setup", "Wi-Fi set-up from the app", "The app can list networks and join this Scanner to one. Needed only for first set-up; the Wi-Fi tab here does the same.", st["wifi_setup"])}
+{row("app_control", "Updates and area from the app", "The app's Check / Install / Roll back buttons and its Area row. The Update and Area tabs here keep working.", st["app_control"])}
+{row("bt_autopair", "Accept Bluetooth pairing without a prompt", "Lets a phone or computer that asks to pair do so without confirming on the Pi. The app doesn't need it to connect.", st["bt_autopair"])}
+{row("ssh", "SSH login", "Command-line login from your home network. Change the shipped password first if you keep it on.", st["ssh"])}
+<button class="btn" type="submit">Save</button></form></div>"""
+
+    def post_security(self, sess, form, files, tok):
+        msgs, restart = security_apply(form, security_state())
+        if restart:
+            rc, out = run(["systemctl", "restart", BRIDGE_UNIT], timeout=30)
+            msgs.append("Bridge restarted." if rc == 0 else f"Bridge restart failed: {out}")
+        self.flash(sess, " ".join(msgs) or "Nothing changed.")
+        self.redirect("/settings")
 
     def post_settings(self, sess, form, files, tok):
         name = form.get("name", "").strip()
