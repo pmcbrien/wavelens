@@ -66,5 +66,18 @@ class ProbeTest(unittest.TestCase):
         self.assertEqual([r[1] for r in self.probe("", ["11110001"])], ["11110001"])
 
 
+
+class RepeaterInputTest(unittest.TestCase):
+    """A mobile's licence on the output half of a paired band is talk-around, not a repeater input."""
+
+    def test_mobile_class_on_each_half(self):
+        b = load_bridge()
+        self.assertTrue(b.is_input({"class": "MO", "mhz": 465.6}))       # the mobile half: a radio nearby
+        self.assertTrue(b.is_input({"class": "MO3", "mhz": 155.25}))     # VHF has no fixed plan: class decides
+        self.assertFalse(b.is_input({"class": "MO", "mhz": 460.6}))      # the tower's half: the repeater itself
+        self.assertFalse(b.is_input({"class": "MO", "mhz": 853.9875}))
+        self.assertFalse(b.is_input({"class": "FB2", "mhz": 465.6}))
+        self.assertTrue(b.is_input({"class": "MO"}))                     # an older pack row with no frequency
+
 if __name__ == "__main__":
     unittest.main()

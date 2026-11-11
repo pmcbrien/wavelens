@@ -1404,9 +1404,23 @@ def agency_of(e: dict) -> str:
     return e.get("agency") or e.get("service_label") or "Licensed"
 
 
+# The output half of the bands that have a fixed repeater plan: the tower transmits here and the mobiles
+# answer on the other half (456–459, 465–470, 799–805, 806–824, 896–901). A mobile is licensed on the
+# output too, for talk-around, so its MO record there does not make the frequency a repeater input: a
+# carrier on it is the repeater, heard for miles.
+OUTPUT_HALVES_MHZ = ((451.0, 454.0), (460.0, 465.0), (769.0, 775.0), (851.0, 869.0), (935.0, 940.0))
+
+
 def is_input(e: dict) -> bool:
-    """FCC station class MO, MO3 … = mobile / portable units; on a repeater pair that is the input side."""
-    return str(e.get("class", "")).upper().startswith("MO")
+    """FCC station class MO, MO3 … = mobile / portable units; on a repeater pair that is the input side —
+    except on the output half of a band with a fixed plan (see OUTPUT_HALVES_MHZ)."""
+    if not str(e.get("class", "")).upper().startswith("MO"):
+        return False
+    try:
+        mhz = float(e.get("mhz"))
+    except (TypeError, ValueError):
+        return True
+    return not any(lo <= mhz < hi for lo, hi in OUTPUT_HALVES_MHZ)
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -2669,7 +2683,9 @@ LISTEN_MODES = {"fm": "-M fm -s 16k", "am": "-M am -s 16k", "wbfm": "-M wbfm"}
 # port the bridge listens on. TDMA modes (DMR, P25 phase 2) come out stereo, one slot per channel: mixed.
 # Encrypted traffic decodes to nothing; that is the law and the maths, not a setting.
 DIGITAL_MODES = {"dmr": ("-fs", 2), "p25": ("-f1", 1), "nxdn": ("-fi", 1), "dstar": ("-fd", 1),
-                 "auto": ("-fa", 1),       # auto: dsd-fme's own detection (DMR, P25 phase 1 and 2); see AUTO_* below
+                 # auto: dsd-fme's own detection (P25 phase 1 and 2, DMR, YSF, D-STAR); see AUTO_* below. -fa is
+                 # a stereo preset like -fs and -ft: read as mono, every call plays at half speed, an octave low.
+                 "auto": ("-fa", 2),
                  # Trunked systems: mhz is the control channel; dsd-fme follows the system's grants, retuning
                  # the dongle to each voice channel and back (P25 phase 1/2, DMR Tier III / Cap+ / Con+). -ft is
                  # its trunking preset (P25p1 + p2 + DMR, C4FM); "trunkq" adds -mq for QPSK/LSM simulcast sites.
@@ -2688,6 +2704,75 @@ DIGITAL_MODES = {"dmr": ("-fs", 2), "p25": ("-f1", 1), "nxdn": ("-fi", 1), "dsta
 TRUNK_MODES = ("trunk", "trunkq", "trunke", "trunkd", "trunkm")
 ENC_RE = re.compile(r"\b(ENC|Encrypted|ALG(?:ID)?\s*[:=]?\s*(?:0x)?[0-9A-Fa-f]+)\b", re.I)
 CALL_RE = re.compile(r"\bTG[:= ]\s*(\d+)")
+
+
+class DigiLayout:
+    """dsd-fme's audio datagrams to 8 kHz mono, with the channel layout checked against the audio itself.
+
+    DIGITAL_MODES says how many channels each decoder preset sends, and three times that has been wrong for
+    one mode or another: stereo read as mono plays at half speed an octave low, mono read as stereo plays
+    at double speed. So the table is only where this starts. dsd-fme sends one datagram per 20 ms voice
+    frame (160 samples), which gives two proofs that need no clock:
+      mono:   a datagram holding an odd number of 160-sample frames (320 bytes) cannot be stereo;
+      stereo: a datagram with sound in it whose every L/R pair is equal (a one-channel call, which dsd-fme
+              copies to both sides) or has one side silent (one TDMA slot talking) cannot be mono speech.
+    PROOFS datagrams in a row proving the other layout switch it, and the journal says so once."""
+    FRAME = 320                              # bytes: 160 samples, 16-bit, one channel
+    PROOFS = 3
+    QUIET = 200                              # below this peak a datagram proves nothing
+
+    def __init__(self, chans: int, what: str = "") -> None:
+        self.chans, self.what, self.against, self.corrected = (2 if chans == 2 else 1), what, 0, False
+
+    @staticmethod
+    def _split(data: bytes) -> "tuple[bytes, bytes]":
+        if audioop is not None:
+            return audioop.tomono(data, 2, 1, 0), audioop.tomono(data, 2, 0, 1)
+        n = len(data) // 4
+        lr = struct.unpack(f"<{2 * n}h", data)
+        return struct.pack(f"<{n}h", *lr[0::2]), struct.pack(f"<{n}h", *lr[1::2])
+
+    @staticmethod
+    def _peak(pcm: bytes) -> int:
+        if audioop is not None:
+            return audioop.max(pcm, 2)
+        return max((abs(v) for v in struct.unpack(f"<{len(pcm) // 2}h", pcm)), default=0)
+
+    def proves(self, data: bytes) -> int:
+        """1 or 2 when this datagram can only be that layout, 0 when it says nothing."""
+        n = len(data)
+        if n == 0 or n % self.FRAME:
+            return 0                         # not whole voice frames: no opinion
+        if (n // self.FRAME) % 2:
+            return 1
+        left, right = self._split(data)
+        pl, pr = self._peak(left), self._peak(right)
+        if max(pl, pr) < self.QUIET:
+            return 0
+        return 2 if left == right or pl == 0 or pr == 0 else 0
+
+    def feed(self, data: bytes) -> bytes:
+        data = data[:len(data) & ~1]
+        proof = self.proves(data)
+        if proof and proof != self.chans:
+            self.against += 1
+            if self.against >= self.PROOFS:
+                was = self.chans
+                self.chans, self.against, self.corrected = proof, 0, True
+                names = {1: "mono", 2: "stereo"}
+                print(f"bridge: dsd-fme audio{' for ' + self.what if self.what else ''} is {names[proof]}, not "
+                      f"{names[was]} as the bridge expected: corrected (it was playing at "
+                      f"{'half' if proof == 2 else 'double'} speed). DIGITAL_MODES needs fixing.", file=sys.stderr)
+        elif proof:
+            self.against = 0
+        if self.chans != 2:
+            return data
+        data = data[:len(data) & ~3]         # two TDMA slots, L and R: mix to mono
+        if audioop is not None:
+            return audioop.tomono(data, 2, 0.5, 0.5)
+        n = len(data) // 4
+        lr = struct.unpack(f"<{2 * n}h", data)
+        return struct.pack(f"<{n}h", *[(lr[2 * i] + lr[2 * i + 1]) // 2 for i in range(n)])
 # Mode "auto": start in dsd-fme's auto-detect; it says on stderr what sync it finds ("Sync: +P25p1"), which
 # also tells us the audio layout (TDMA is stereo). If the carrier is on and no digital sync shows within
 # AUTO_WAIT_S, it's analog: restart as narrow FM. Decided once per tune; the app's renewals keep "auto".
@@ -4372,7 +4457,9 @@ def _serve_listen(req: tuple, gen: int) -> None:
     # -ft / -fs / -fa are stereo (two TDMA slots, L and R — a phase 1 call just plays the same on both),
     # -f1 / -fi / -fd / -fE are mono. That is what DIGITAL_MODES records, and it never changes mid-listen.
     # (Switching it on the sync line — "P25p1, so mono" — while dsd-fme kept sending stereo played every
-    # call at half speed an octave down.)
+    # call at half speed an octave down.) DigiLayout starts from that and corrects itself from the audio
+    # if the table and the dsd-fme on this Pi ever disagree.
+    layout = DigiLayout(chans, f"{mode} ({DIGITAL_MODES[mode][0]})" if mode in DIGITAL_MODES else mode)
     def read_chunk():
         if sock is None:
             return p.stdout.read(need - len(buf))
@@ -4381,14 +4468,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 data = sock.recv(65536)
             except socket.timeout:
                 continue
-            if chans != 2:
-                return data[:len(data) & ~1]
-            data = data[:len(data) & ~3]     # two TDMA slots, L and R: mix to mono
-            if audioop is not None:
-                return audioop.tomono(data, 2, 0.5, 0.5)
-            n = len(data) // 4
-            lr = struct.unpack(f"<{2 * n}h", data)
-            return struct.pack(f"<{n}h", *[(lr[2 * i] + lr[2 * i + 1]) // 2 for i in range(n)])
+            return layout.feed(data)
 
     ended_itself = True
     afc = []                                 # offsets (Hz) from frames with signal, analog FM only
