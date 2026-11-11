@@ -30,6 +30,7 @@ Every external command is run with a list argv (never a shell) and a timeout.
 
 import base64
 import collections
+import csv
 import email.parser
 import email.policy
 import glob
@@ -93,6 +94,9 @@ SESSION_TTL = 12 * 3600          # seconds
 LOGIN_MAX_FAILS = 5              # per IP ...
 LOGIN_WINDOW = 10 * 60           # ... per 10 minutes
 MAX_FORM_BODY = 64 * 1024        # ordinary POST bodies
+MAX_RR_FILE = 16 * 1024 * 1024   # one RadioReference export (a nationwide one runs to a few MB)
+MAX_RR_FILES = 40                # exports kept in area/rr/
+MAX_RR_BODY = 2 * MAX_RR_FILE + 64 * 1024   # one upload of several files
 MAX_UPLOAD_BODY = 4 * 1024 * 1024 + 64 * 1024   # 4 MB .bin plus multipart overhead
 NOISY = ('"t":"rf"', '"t":"spec"')   # high-volume journal lines hidden by default
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
@@ -572,6 +576,118 @@ AREA_FILE = "/etc/wavelens/area.json"
 AREA_DIR = "/var/lib/wavelens/area"
 COUNTRY_RE = re.compile(r"^[A-Za-z]{2}$")
 POSTCODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 -]{0,11}$")
+RR_DIR = os.path.join(AREA_DIR, "rr")
+RR_KINDS = {0: "trunked sites / talkgroups", 1: "county frequencies", 2: "statewide frequencies", 3: "nationwide frequencies"}
+RR_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ ()-]{0,75}\.csv$", re.I)
+
+
+def rr_kind(data):
+    """What kind of RadioReference export these bytes are, by the header row: the same rules as area.rr_kind
+    (which decides what the bridge loads; a test holds the two together). 9 = not one the bridge reads."""
+    try:
+        first = data[:8192].decode("utf-8-sig").splitlines()[0]
+        head = [h.strip() for h in next(csv.reader([first]), [])]
+    except (UnicodeDecodeError, IndexError, csv.Error):
+        return 9
+    if ("Frequencies" in head and ("Site Dec" in head or "Site Hex" in head)) or ("Decimal" in head and "Alpha Tag" in head):
+        return 0
+    if "Frequency Output" not in head:
+        return 9
+    if "Nationwide Agency" in head:
+        return 3
+    return 2 if "County" in head else 1
+
+
+def rr_safe_name(name):
+    """The file name an upload is stored under: its last path part (a browser may send a whole path), with
+    anything but letters, digits, space and . _ ( ) - made an underscore. "" when no .csv name is left."""
+    base = re.split(r"[\\/]", name or "")[-1].strip()
+    base = re.sub(r"[^A-Za-z0-9._ ()-]", "_", base).lstrip(". ")
+    return base if RR_NAME_RE.match(base) else ""
+
+
+def rr_dir():
+    """RR_DIR, created if missing; refuses a symlink (the page runs as root and writes what it is sent)."""
+    os.makedirs(RR_DIR, mode=0o755, exist_ok=True)
+    if not stat.S_ISDIR(os.lstat(RR_DIR).st_mode):
+        raise OSError(f"{RR_DIR} is not a directory")
+    return RR_DIR
+
+
+def rr_list():
+    """[{name, kind, label, rows, size, mtime}] for the exports in RR_DIR, by name."""
+    out = []
+    try:
+        names = sorted(n for n in os.listdir(RR_DIR) if n.lower().endswith(".csv"))
+    except OSError:
+        return out
+    for n in names:
+        path = os.path.join(RR_DIR, n)
+        try:
+            st = os.lstat(path)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            with open(path, "rb") as f:
+                data = f.read(MAX_RR_FILE)
+        except OSError:
+            continue
+        k = rr_kind(data)
+        out.append({"name": n, "kind": k, "label": RR_KINDS.get(k, "not a RadioReference export: ignored"),
+                    "rows": max(0, len(data.splitlines()) - 1), "size": st.st_size, "mtime": st.st_mtime})
+    return out
+
+
+def rr_save(name, data):
+    """Check one uploaded export and store it in RR_DIR, whole or not at all. Returns (ok, message)."""
+    shown = re.split(r"[\\/]", name or "")[-1][:80] or "(no name)"
+    safe = rr_safe_name(name)
+    if not safe:
+        return False, f"{shown}: not a .csv file."
+    if not data.strip():
+        return False, f"{shown}: the file is empty."
+    if len(data) > MAX_RR_FILE:
+        return False, f"{shown}: larger than {MAX_RR_FILE // (1024 * 1024)} MB."
+    try:
+        data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False, f"{shown}: not a text file (RadioReference exports are UTF-8 CSV)."
+    k = rr_kind(data)
+    if k == 9:
+        return False, (f"{shown}: not a RadioReference export the Scanner reads. It takes the CSV downloads of a "
+                       "county's, state's or the nationwide frequencies, a trunked system's sites, and its talkgroups.")
+    d = rr_dir()
+    dest = os.path.join(d, safe)
+    replacing = os.path.lexists(dest)
+    if replacing and not stat.S_ISREG(os.lstat(dest).st_mode):
+        return False, f"{shown}: something that is not a file already has that name."
+    if not replacing and len([n for n in os.listdir(d) if n.lower().endswith(".csv")]) >= MAX_RR_FILES:
+        return False, f"{shown}: there are already {MAX_RR_FILES} exports here; delete one first."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".up-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return True, f"{safe}: {RR_KINDS[k]}{' (replaced)' if replacing else ''}."
+
+
+def rr_delete(name):
+    """Delete one export by the name the page listed. Returns (ok, message)."""
+    if name not in [e["name"] for e in rr_list()]:
+        return False, "No such export."
+    try:
+        os.unlink(os.path.join(RR_DIR, name))
+    except OSError as e:
+        return False, f"Could not delete {name}: {e.strerror}."
+    return True, f"{name} deleted."
 DOWNLOAD_LOCK = threading.Lock()
 
 
@@ -957,9 +1073,10 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(n).decode(errors="replace")
         return {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
 
-    def multipart(self):
-        """Parse a multipart/form-data POST: returns ({field: value}, {field: (filename, bytes)})."""
-        n = self.body_length(MAX_UPLOAD_BODY, "upload larger than 4 MB")
+    def multipart(self, limit=MAX_UPLOAD_BODY):
+        """Parse a multipart/form-data POST: returns ({field: value}, {field: (filename, bytes)}). A field
+        sent several files (<input multiple>) has them all under field + "[]", as a list."""
+        n = self.body_length(limit, f"upload larger than {limit // (1024 * 1024)} MB")
         raw = self.rfile.read(n)
         msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
             b"Content-Type: " + self.headers.get("Content-Type", "").encode() + b"\r\n\r\n" + raw)
@@ -970,7 +1087,8 @@ class Handler(BaseHTTPRequestHandler):
                 continue
             payload = part.get_payload(decode=True) or b""
             if part.get_filename():
-                files[name] = (part.get_filename(), payload)
+                files.setdefault(name, (part.get_filename(), payload))
+                files.setdefault(name + "[]", []).append((part.get_filename(), payload))
             else:
                 fields[name] = payload.decode(errors="replace")
         return fields, files
@@ -1027,7 +1145,7 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self.redirect("/login")
             if self.headers.get("Content-Type", "").startswith("multipart/form-data"):
-                form, files = self.multipart()
+                form, files = self.multipart(MAX_RR_BODY if path == "/area" else MAX_UPLOAD_BODY)
             else:
                 form, files = self.form(), {}
             if not csrf_ok(form.get("csrf"), sess["csrf"]):
@@ -1301,10 +1419,16 @@ your Wi-Fi and set up, you can turn off what you don't use. This page keeps work
         dis = "disabled" if snap["running"] else ""
         regions = a.get("regions") or {}
         districts = "; ".join(f"{r or '—'}: {', '.join(d) or '—'}" for r, d in regions.items()) or "—"
-        try:
-            rr = sorted(n for n in os.listdir(os.path.join(AREA_DIR, "rr")) if n.lower().endswith(".csv"))
-        except OSError:
-            rr = []
+        rr = rr_list()
+        if rr:
+            rr_rows = "".join(
+                f"""<tr><td><b>{esc(e['name'])}</b><br><span class="mut">{esc(e['label'])} · {e['rows']} rows · {fmt_ts(e['mtime'])}</span></td>
+<td style="text-align:right"><form method="post" action="/area" onsubmit="return confirm('Delete this export from the Scanner?')">{csrf_field(sess)}
+<input type="hidden" name="name" value="{esc(e['name'])}"><button class="btn sec" name="do" value="rr_delete">Delete</button></form></td></tr>"""
+                for e in rr)
+            rr_table = f"<table>{rr_rows}</table>"
+        else:
+            rr_table = '<p class="mut">None yet.</p>'
         if a:
             where = " ".join(x for x in (a.get("country", ""), a.get("postcode", "")) if x)
             place = ", ".join(x for x in (a.get("district", ""), a.get("region", "")) if x)
@@ -1328,14 +1452,21 @@ your Wi-Fi and set up, you can turn off what you don't use. This page keeps work
 records around that place and names what it hears from them. Licence records exist where a country publishes them, today the
 United States (FCC). Needs Wi-Fi; restarts the bridge for a few seconds. Postcode positions: GeoNames, CC BY 4.0.</p></div>
 <div class="card"><h2>Your own RadioReference exports</h2>
-<p>{esc(', '.join(rr)) if rr else '<span class="mut">none</span>'}</p>
-<p class="note">CSV exports you copy into <code>{esc(AREA_DIR)}/rr/</code> are loaded at the next bridge restart, with nothing to list
-in Settings: trunked sites, talkgroups, and county, statewide or nationwide frequencies are told apart by their headers.</p></div>
+{rr_table}
+<form method="post" action="/area" enctype="multipart/form-data">{csrf_field(sess)}<input type="hidden" name="do" value="rr_upload">
+<label>Add exports (.csv, several at once is fine)</label><input type="file" name="rr" accept=".csv,text/csv" multiple required>
+<div class="row"><button class="btn">Upload</button></div></form>
+<p class="note">The CSV downloads from your own RadioReference account: a county's, a state's or the nationwide frequencies, a trunked
+system's sites, and its talkgroups. The Scanner tells them apart by their headers, so the file names don't matter; a file with
+the same name replaces the old one. Uploading or deleting restarts the bridge for a few seconds so the change is used.
+The files stay on this Scanner (<code>{esc(RR_DIR)}</code>) and are never sent anywhere.</p></div>
 <div class="card"><h2>Progress <span id="st" class="mut"></span></h2><pre id="out" data-url="/api/area/log">{esc(chr(10).join(snap['lines']))}</pre></div>{POLL_JS}"""
         self.render(sess, "Area", body, "/area")
 
     def post_area(self, sess, form, files, tok):
         do = form.get("do", "")
+        if do in ("rr_upload", "rr_delete"):
+            return self.post_area_rr(sess, do, form, files)
         if not os.path.isfile(AREA_TOOL):
             self.flash(sess, "The area tool is not installed on this Pi: update the Scanner first.")
             return self.redirect("/area")
@@ -1361,6 +1492,28 @@ in Settings: trunked sites, talkgroups, and county, statewide or nationwide freq
             self.flash(sess, "Started. Watch the progress box; reload the page when it says done.")
         else:
             self.flash(sess, "An area task is already running.")
+        self.redirect("/area")
+
+    def post_area_rr(self, sess, do, form, files):
+        """Upload or delete the owner's RadioReference exports, then restart the bridge so it reads them."""
+        if do == "rr_upload":
+            sent = [(n, d) for n, d in files.get("rr[]", []) if n]
+            if not sent:
+                self.flash(sess, "Choose one or more .csv files first.")
+                return self.redirect("/area")
+            results = []
+            for name, data in sent:
+                try:
+                    results.append(rr_save(name, data))
+                except OSError as e:
+                    results.append((False, f"{name}: could not be saved ({e.strerror or e})."))
+        else:
+            results = [rr_delete(form.get("name", ""))]
+        msg = " ".join(m for _, m in results)
+        if any(ok for ok, _ in results):
+            rc, out = run(["systemctl", "restart", BRIDGE_UNIT], timeout=30)
+            msg += " Bridge restarted." if rc == 0 else f" The bridge did not restart ({out}); restart it from Power."
+        self.flash(sess, msg)
         self.redirect("/area")
 
     # ---- /update ---------------------------------------------------------------------------
