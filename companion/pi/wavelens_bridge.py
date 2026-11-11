@@ -1764,10 +1764,39 @@ def spec_pump() -> None:
             emit(fr)
 
 
+def bin_centre_hz(src: str, hz: float, step: float) -> float:
+    """Centre frequency of a sweep bin whose row gives it as hz_low + i * step.
+
+    The two tools mean different things by that number. hackrf_sweep's is the bin's lower edge, so the
+    centre is half a bin up. rtl_power's is the bin's centre already: a row from lo to hi has
+    (hi - lo) / step + 1 values, the first centred on lo and the last on hi. Adding half a bin to an
+    rtl_power reading (as this did until 2026.11.11.3) put every carrier 4.7 to 6.25 kHz high: measured on a
+    bench Scanner, a control channel on 856.9625 read 856.9655 and was tuned as 856.9688, where the decoder
+    got a quarter of the frames it gets on frequency, and none at all through a 12 kHz filter."""
+    return hz if src == "rtlpower" else hz + step / 2
+
+
+WX_BAND = (162.3875, 162.5625)   # NOAA / Environment Canada weather radio: a steady carrier, never a control channel
+
+
+def cc_place(mhz: float) -> "float | None":
+    """Where the control-channel hunt should tune for a steady carrier read at mhz: the RadioReference
+    control channel within half a channel when the owner's exports list one (exact, whatever the sweep's
+    bin said), else the band's channel raster. None for a carrier that cannot be a control channel."""
+    if WX_BAND[0] <= mhz <= WX_BAND[1]:
+        return None
+    cc = RR.control_at(mhz) if RR else None
+    if cc:
+        return round(cc[0], 5)
+    raster = 0.0025 if mhz < 300 else 0.00625
+    return round(round(mhz / raster) * raster, 5)
+
+
 class Sweep:
     """Parses hackrf_sweep / rtl_power CSV rows and reports bins that rise above a rolling floor.
 
     Row format (both tools): date, time, hz_low, hz_high, hz_bin_width, samples, dB, dB, dB, ...
+    (what hz_low + i * step means differs between them: see bin_centre_hz)
     """
 
     def __init__(self, src: str, threshold_db: float = 18.0, rate_s: float = 2.0, bucket_mhz: float = 1.0,
@@ -1869,7 +1898,7 @@ class Sweep:
                 if den < 0:
                     off = max(-0.5, min(0.5, 0.5 * (left - right) / den))
                     self.tol_hz = step / 4
-            mhz = (hz + step / 2 + off * step) / 1e6 * (1 + self.ppm / 1e6)   # hz is the bin's lower edge
+            mhz = (bin_centre_hz(self.src, hz, step) + off * step) / 1e6 * (1 + self.ppm / 1e6)
             if db - f < self.th:
                 run = self.runs.pop(hz, None)       # quiet on this pass: the run of hot passes is over
                 if run and run[0] < STEADY_N:
@@ -2704,6 +2733,21 @@ DIGITAL_MODES = {"dmr": ("-fs", 2), "p25": ("-f1", 1), "nxdn": ("-fi", 1), "dsta
 TRUNK_MODES = ("trunk", "trunkq", "trunke", "trunkd", "trunkm")
 ENC_RE = re.compile(r"\b(ENC|Encrypted|ALG(?:ID)?\s*[:=]?\s*(?:0x)?[0-9A-Fa-f]+)\b", re.I)
 CALL_RE = re.compile(r"\bTG[:= ]\s*(\d+)")
+# dsd-fme's own account of how a decode is going, counted for the "decode quality" journal line.
+VOICE_FRAME_RE = re.compile(r"\bLDU[12]\b|\bVC[1-6]\b|Voice Frame")
+BAD_FRAME_RE = re.compile(r"FEC ERR|CRC ERR|duid:EE|Ignoring LDU2|\(CRC\)")
+CTRL_FRAME_RE = re.compile(r"\bTSBK\b|\bCSBK\b|MAC_SIGNAL")
+
+
+def decode_quality(frames: dict) -> str:
+    """One journal line's worth on how well a digital listen decoded, or "" when too little was heard to say.
+    A bad frame is one dsd-fme could not repair (it plays as a gap or a burble)."""
+    voice, bad, ctrl = frames.get("voice", 0), frames.get("bad", 0), frames.get("ctrl", 0)
+    if voice + ctrl < 20:
+        return ""
+    pct = 100.0 * bad / max(1, voice + ctrl + bad)
+    word = "clean" if pct < 3 else "fair" if pct < 12 else "poor"
+    return f"{voice} voice and {ctrl} control frames, {bad} unrepairable ({pct:.0f} %: {word})"
 
 
 class DigiLayout:
@@ -3534,9 +3578,9 @@ def sweep_steady(lo_mhz: float, hi_mhz: float, now: float):
             den = l - 2 * mins[hz] + r
             if den < 0:
                 off = max(-0.5, min(0.5, 0.5 * (l - r) / den))
-        mhz = (hz + step / 2 + off * step) / 1e6
-        raster = 0.0025 if mhz < 300 else 0.00625
-        out.append((round(round(mhz / raster) * raster, 5), over))
+        at = cc_place((bin_centre_hz("rtlpower", hz, step) + off * step) / 1e6)
+        if at is not None:
+            out.append((at, over))
     return out, nread
 
 
@@ -3605,9 +3649,9 @@ def cc_steady(rows: list) -> list:
             den = l - 2 * mins[hz] + r
             if den < 0:
                 off = max(-0.5, min(0.5, 0.5 * (l - r) / den))
-        mhz = (hz + step / 2 + off * step) / 1e6
-        raster = 0.0025 if mhz < 300 else 0.00625
-        out.append((round(round(mhz / raster) * raster, 5), over))
+        at = cc_place((bin_centre_hz("rtlpower", hz, step) + off * step) / 1e6)
+        if at is not None:
+            out.append((at, over))
     return out
 
 
@@ -3668,6 +3712,13 @@ def trunk_next(why: str) -> None:
         listen_status("trunked: no control channel found nearby — none of the steady carriers synced as P25 or DMR")
 
 
+def data_channel(x: dict) -> bool:
+    """True when the RadioReference overlay says this channel carries data, not speech: its mode is Telm
+    (telemetry, paging, alarms, vehicle location) or its tag is Data. Played as FM it is a buzz or a stream
+    of tones, which is what "hearing digital" on Follow was."""
+    return str(x.get("rr_mode") or "").strip().lower() == "telm" or str(x.get("rr_tag") or "").strip().lower() == "data"
+
+
 def follow_hit(obj: dict) -> None:
     x = obj.get("x") or {}
     if "trunked_site" in x:
@@ -3692,6 +3743,8 @@ def follow_hit(obj: dict) -> None:
         return
     if any(lo <= mhz <= hi for lo, hi in FOLLOW_NAMED_ONLY) and not (x.get("lic_mhz") or x.get("rr_agency") or x.get("licensee")):
         return                               # an unnamed low-band carrier is almost always the receiver itself
+    if data_channel(x) and not (LISTEN["pages"] and pager_band_ok(mhz)):
+        return                               # data, not voice: nothing to hear (a client that reads pages still gets them)
     known = str(x.get("listen") or "")      # the RadioReference overlay's mode for this channel
     if known in ("fm", "am", "dmr", "p25", "nxdn"):
         mode = known                         # no 8 s probe: tune it as what it is
@@ -3970,6 +4023,7 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
         p.sync, p.sync_at = "", 0.0
         p.call, p.call_at = "", 0.0
         p.voice_at, p.enc_now, p.enc_at = 0.0, False, 0.0
+        p.frames = {"voice": 0, "bad": 0, "ctrl": 0}   # what dsd-fme decoded, for the quality line at the end
         tool = os.path.basename(cmd.split()[0])
 
         def drain(proc=p):                   # dsd-fme chatters on stderr; an undrained pipe would stall it
@@ -3998,6 +4052,10 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                     # streams LDUs for the rest of the call. ALG ID 0x80 / 0x00 = clear, anything else = encrypted.
                     if re.search(r"\bLDU[12]\b|Voice Frame|VC[12]|\bHDU\b", ln):
                         proc.voice_at = time.time()
+                    nbad = len(BAD_FRAME_RE.findall(ln))
+                    proc.frames["bad"] += nbad
+                    proc.frames["voice"] += 0 if nbad else len(VOICE_FRAME_RE.findall(ln))
+                    proc.frames["ctrl"] += 1 if CTRL_FRAME_RE.search(ln) else 0
                     if re.search(r"\bTSBK\b|\bTDULC\b|duid:EE|\bTSDU\b|MAC_SIGNAL|CSBK|C_ALOHA|SYS_ID|Site ID", ln):
                         proc.ctrl_at = time.time()           # control-channel traffic: what a CC and only a CC carries
                     ma = re.search(r"ALG(?: ID)?:\s*0x([0-9A-Fa-f]+)", ln)
@@ -4549,7 +4607,9 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 pcm, buf = buf[:need], buf[need:]
                 if sock is None and mode == "fm":
                     pcm = afc_frame(pcm)
-                    if LISTEN["asked"] == "auto" and LISTEN.get("reprobe") != mhz and digi_frame(pcm):
+                    # ... for AUTO, and for anything Follow tuned as FM on a listing's word: a channel listed FM
+                    # that has since gone digital would otherwise play its raw carrier for the whole dwell.
+                    if (LISTEN["asked"] == "auto" or LISTEN["follow"]) and LISTEN.get("reprobe") != mhz and digi_frame(pcm):
                         # the probe missed it (started late, or the repeater was idle): back to dsd-fme once
                         LISTEN["reprobe"] = mhz
                         LISTEN["detected"] = ""
@@ -4571,6 +4631,9 @@ def _serve_listen(req: tuple, gen: int) -> None:
     finally:
         stop_tools(procs)                    # the dongle stays "busy" until the tools are gone (listen_busy)
         LISTEN["proc"] = None
+        q = decode_quality(getattr(p, "frames", {})) if sock is not None else ""
+        if q:
+            print(f"bridge: listen: decode quality on {mhz:.4f} MHz {mode}: {q}", file=sys.stderr)
         if sock is not None:
             sock.close()
         if ended_itself and LISTEN["req"] is not None and LISTEN["gen"] == gen:
