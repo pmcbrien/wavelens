@@ -589,8 +589,12 @@ out). Later sweep readings of the same carrier refine it too. `--rtl-ppm` matter
 dongle's crystal error (often 20–50 ppm, 10–20 kHz at 450 MHz) looks like a channel offset.
 
 **Pager data.** With `multimon-ng` installed, every analog FM listen also feeds the audio (22.05 kHz,
-DC removed) to a POCSAG512/1200/2400 + FLEX decoder. The first page decoded sets `detected` to
-`POCSAG`/`FLEX`, mutes the audio frames, and pages go to the phone as
+DC removed) to a POCSAG512/1200/2400 + FLEX decoder — on paging bands only (the US list is `PAGER_BANDS_US`
+in the bridge; a country pack can give `"companion": {"pager_bands": [[lo, hi], …]}`; `--pager-any-band`
+lifts the limit). Off those bands the decoder reads telemetry and mobile data as "numeric pages", so it is
+not run there, and on them a decode still has to look like a page (a short call-back number, or readable
+text) or it is dropped. A FLEX page, or the second plausible POCSAG page on a listen, sets `detected` to
+`POCSAG`/`FLEX` and mutes the audio frames; pages go to the phone as
 `{"t":"page","f":460.6,"proto":"POCSAG1200","addr":"1234567","msg":"…"}`. The Lab app shows them
 under the companion line on the Live tab, on the Companion screen, and on More → Pages (a page-only
 view with per-address filtering), and reads them aloud (toggle on either screen). Lab only — the Play app never asks for it; nothing is stored.

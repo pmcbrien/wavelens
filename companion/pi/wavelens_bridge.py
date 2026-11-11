@@ -2317,6 +2317,65 @@ PAGER_CMD = "multimon-ng -t raw -a POCSAG512 -a POCSAG1200 -a POCSAG2400 -a FLEX
 PAGE_RE = re.compile(r"^(POCSAG\d+|FLEX)[:|]\s*(.*)$")
 PAGE_ADDR_RE = re.compile(r"Address:\s*(\d+)|\[(\d+)\]")
 PAGE_MSG_RE = re.compile(r"(?:Alpha|Numeric|ALN|NUM|TON|BIN):\s*(.*)$|(?:ALN|NUM)\s+(.*)$")
+PAGE_KIND_RE = re.compile(r"\b(Alpha|Numeric|ALN|NUM|TON|BIN)\b")
+# Where one-way paging lives in the US (MHz). Outside these the decoder is not run at all: multimon-ng,
+# POCSAG at 512 baud above all, locks onto telemetry and mobile data and prints it as "numeric pages"
+# (seen on a 460.600 MHz public-safety channel: a dozen junk pages, and the channel's audio muted as
+# "pager data"). A country pack can give its own list: "companion": {"pager_bands": [[lo, hi], ...]}.
+# Other countries without one are not gated by band; the plausibility test below still applies.
+PAGER_BANDS_US = [(35.0, 36.0), (43.0, 44.0), (152.0, 153.0), (157.7, 158.75), (163.2, 163.3),
+                  (454.0, 455.0), (462.7375, 462.9375), (464.99, 465.01), (929.0, 932.0)]
+PAGER_ANY_BAND = False       # --pager-any-band: decode on any analog channel (for finding an unlisted pager)
+PAGER_CONFIRM = 2            # plausible POCSAG pages on one listen before the channel counts as pager data
+
+
+def pager_band_ok(mhz: float) -> bool:
+    """May the pager decoder run on this frequency?"""
+    if PAGER_ANY_BAND:
+        return True
+    bands = None
+    pack = REGION.get("pack")
+    if pack:
+        try:
+            bands = [(float(lo), float(hi)) for lo, hi in (pack.get("companion") or {}).get("pager_bands") or []]
+        except (TypeError, ValueError):
+            bands = None
+    if not bands:
+        if REGION.get("code", "US") != "US":
+            return True
+        bands = PAGER_BANDS_US
+    return any(lo <= mhz <= hi for lo, hi in bands)
+
+
+def page_kind(rest: str) -> str:
+    """alpha | numeric | other, from the label multimon-ng put before the message."""
+    m = PAGE_KIND_RE.search(rest)
+    k = (m.group(1) if m else "").upper()
+    return "alpha" if k in ("ALPHA", "ALN") else "numeric" if k in ("NUMERIC", "NUM") else "other"
+
+
+def page_plausible(proto: str, kind: str, msg: str) -> bool:
+    """Is this decode a page somebody sent, rather than noise or another signal read as one?
+    FLEX has a long sync word and its own checks: text is enough. POCSAG is easy to false-lock, so:
+      numeric  a call-back number: short, nearly all digits, at most a couple of separators. The junk is
+               long and full of the filler symbols of the numeric alphabet (U, [, ], -, .).
+      alpha    readable: mostly letters, digits, spaces and ordinary punctuation, with at least one word
+               or a run of digits in it."""
+    msg = msg.strip()
+    if not msg:
+        return False
+    if proto == "FLEX":
+        return bool(re.search(r"[A-Za-z0-9]{2}", msg))
+    if kind == "numeric":
+        digits = sum(ch.isdigit() for ch in msg)
+        odd = sum(ch in "U[]." for ch in msg)
+        return 3 <= len(msg) <= 24 and digits >= 3 and digits / len(msg) >= 0.75 and odd <= 1
+    if len(msg) < 3:
+        return False
+    plain = sum(ch.isalnum() or ch in " .,:;/#-()'&+@!?" for ch in msg)
+    if plain / len(msg) < 0.85:
+        return False
+    return bool(re.search(r"[A-Za-z]{3}|\d{3}", msg))
 # multimon-ng prints control characters as named tokens (<NUL>, <ETX>, <EOT>, <ESC> …) and leaves others
 # raw; neither belongs on a screen or in a voice. Removed before the page leaves the Pi.
 PAGE_CTRL_RE = re.compile(r"<(?:NUL|SOH|STX|ETX|EOT|ENQ|ACK|BEL|BS|HT|LF|VT|FF|CR|SO|SI|DLE|DC[1-4]|NAK|SYN|ETB|CAN|EM|SUB|ESC|FS|GS|RS|US|DEL|SP|0x[0-9A-Fa-f]{2})>|[\x00-\x1f\x7f-\x9f]")
@@ -3512,6 +3571,8 @@ def start_pager(gen: int, mhz: float):
     except FileNotFoundError:
         return None
 
+    seen = {"good": 0, "junk": 0}
+
     def reader():
         for raw in pm.stdout:
             ln = raw.decode("utf-8", "replace").strip()
@@ -3524,8 +3585,17 @@ def start_pager(gen: int, mhz: float):
             msg = page_clean((mm.group(1) or mm.group(2)) if mm else rest)
             if not msg or not re.search(r"[A-Za-z0-9]", msg):
                 continue                     # a page that was only control bytes or tone codes
+            if not page_plausible(proto, page_kind(rest), msg):
+                seen["junk"] += 1
+                if seen["junk"] in (1, 20):  # said once, and once more if it keeps coming: not a line per decode
+                    print(f"bridge: pager: dropping implausible {proto} decodes on {mhz:.4f} MHz "
+                          f"(not a paging signal, or too weak to read)", file=sys.stderr)
+                continue
+            seen["good"] += 1
             kind = "FLEX" if proto == "FLEX" else "POCSAG"
-            if LISTEN["detected"] != kind:
+            # One readable POCSAG decode can still be luck: the channel is only called pager data (and its
+            # audio muted) once a second one arrives. The page itself is shown either way.
+            if LISTEN["detected"] != kind and (kind == "FLEX" or seen["good"] >= PAGER_CONFIRM):
                 LISTEN["detected"] = kind
                 listen_status(f"{kind} pager data on {mhz:.4f} MHz: pages shown, audio muted")
             emit({"t": "page", "f": round(mhz, 4), "proto": proto, "addr": (am.group(1) or am.group(2)) if am else "",
@@ -3735,7 +3805,8 @@ def _serve_listen(req: tuple, gen: int) -> None:
         # With a pager decoder available, narrow FM is demodulated at its rate and fed to both the
         # decoder and (resampled) the phone; without it, 16 kHz in and 8 kHz out as before.
         # The pager decoder runs only for a client that asked for it ({"c":"pages","v":true}: the Lab app).
-        pager = mode == "fm" and LISTEN["pages"] and shutil.which("multimon-ng") is not None
+        # … and only where paging is: on any other channel it reads telemetry as pages and mutes the audio.
+        pager = mode == "fm" and LISTEN["pages"] and pager_band_ok(mhz) and shutil.which("multimon-ng") is not None
         rate_in = PAGER_RATE if pager else int(AFC_RATE_IN)
         demod_rate = float(rate_in)
         demod = f"-M fm -s {rate_in}" if mode == "fm" else LISTEN_MODES[mode]
@@ -4867,6 +4938,9 @@ def main() -> None:
                          "Preferred over --fcc-pack where it has the frequency")
     ap.add_argument("--rr-county", metavar="NAME", action="append", default=[],
                     help="county (repeatable) whose rows in a statewide export rank ahead of other counties'")
+    ap.add_argument("--pager-any-band", action="store_true",
+                    help="run the pager decoder (Lab: POCSAG / FLEX) on any analog channel, not only the paging bands; "
+                         "implausible decodes are still dropped")
     ap.add_argument("--area-dir", metavar="DIR", default=os.environ.get("WAVELENS_AREA_DIR", "/var/lib/wavelens/area"),
                     help="the area folder, read at start with nothing to list: fcc-local.json (written by wavelens-area for "
                          "the postcode set on this companion) and RadioReference exports in rr/*.csv. --fcc-pack and "
@@ -4938,6 +5012,7 @@ def main() -> None:
     if a.hackrf_keep_sweeping:
         globals()["HACKRF_PAUSE_ON_LISTEN"] = False
     globals()["MOTO_BAND"] = a.moto_band
+    globals()["PAGER_ANY_BAND"] = a.pager_any_band
     globals()["TRUNK_IDLE_S"] = max(2.0, a.trunk_idle)
     globals()["TRUNK_HOLD_S"] = max(2.0, a.trunk_idle)
     globals()["TRUNK_MIN_DB"] = a.trunk_min_db

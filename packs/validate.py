@@ -95,6 +95,10 @@ def check(pack, fname: str, pack_ids) -> list:
             p.append(f"companion.bands[{i}]: needs lo < hi (MHz)")
         if b.get("kind", "") not in KINDS: p.append(f"companion.bands[{i}]: kind must be one of {sorted(KINDS)}")
         if b.get("cat", "UNKNOWN") not in CATEGORIES: p.append(f"companion.bands[{i}]: unknown cat")
+    if "pager_bands" in comp:
+        pb = comp["pager_bands"]
+        if not isinstance(pb, list) or not all(isinstance(x, list) and len(x) == 2 and all(isinstance(v, (int, float)) for v in x) and x[0] < x[1] for x in pb):
+            p.append("companion.pager_bands must be a list of [lo, hi] pairs in MHz, lo < hi")
     if "rtl433_args" in comp and not re.fullmatch(r"[A-Za-z0-9 .:=,_-]*", str(comp["rtl433_args"])):
         p.append("companion.rtl433_args: only plain rtl_433 flags (letters, digits, spaces, . : = , _ -)")
     return p
