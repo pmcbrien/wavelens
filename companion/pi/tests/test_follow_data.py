@@ -32,6 +32,8 @@ class FollowSkipsData(unittest.TestCase):
     def setUp(self):
         b = self.b
         self.saved = (b.listen_start, b.LISTEN["pages"], b.pager_band_ok, dict(b.LISTEN["recent"]))
+        self.trunk = (set(b.TRUNK["cats"]), b.TRUNK.get("unlisted", "mute"))
+        b.TRUNK["cats"] = set()              # no category chosen: every voice hit is a candidate
         self.tuned = []
         b.listen_start = lambda mhz, mode, sq, tol=0.0: self.tuned.append((round(mhz, 4), mode))
         b.LISTEN["recent"].clear()
@@ -42,6 +44,7 @@ class FollowSkipsData(unittest.TestCase):
     def tearDown(self):
         b = self.b
         b.listen_start, b.LISTEN["pages"], b.pager_band_ok, recent = self.saved
+        b.TRUNK["cats"], b.TRUNK["unlisted"] = self.trunk
         b.LISTEN["recent"].clear()
         b.LISTEN["recent"].update(recent)
 
@@ -49,6 +52,20 @@ class FollowSkipsData(unittest.TestCase):
         x.setdefault("exact_mhz", f"{mhz:.4f}")
         x.setdefault("lic_mhz", f"{mhz:.5f}")
         self.b.follow_hit({"f": int(mhz), "x": x})
+
+    def test_a_chosen_category_filters_conventional_hits_too(self):
+        b = self.b
+        b.TRUNK["cats"], b.TRUNK["unlisted"] = {"police"}, "mute"
+        self.hit(464.375, agency="Business", rr_mode="DMR")
+        self.hit(155.250, agency="Fire / rescue", rr_mode="FMN")
+        self.hit(461.300)                                    # nothing names it
+        self.assertEqual(self.tuned, [])
+        self.hit(453.725, agency="Law enforcement", rr_mode="FMN")
+        self.assertEqual([m for m, _ in self.tuned], [453.725])
+        b.TRUNK["unlisted"] = "play"                         # the option that lets unnamed things through
+        b.LISTEN["req"] = None
+        self.hit(461.300)
+        self.assertIn(461.3, [m for m, _ in self.tuned])
 
     def test_what_counts_as_data(self):
         d = self.b.data_channel

@@ -4100,6 +4100,21 @@ def data_channel(x: dict) -> bool:
     return str(x.get("rr_mode") or "").strip().lower() == "telm" or str(x.get("rr_tag") or "").strip().lower() == "data"
 
 
+def follow_hit_category(x: dict) -> str:
+    """police | fire | ems | other for a conventional hit, from who the licence lists say uses the channel
+    (several users in one bin: any of them counts); "" when nothing names it."""
+    a = str(x.get("agency") or "").lower()
+    if not a:
+        return ""
+    if any(k in a for k in ("law", "police", "sheriff", "public safety")):
+        return "police"
+    if "fire" in a:
+        return "fire"
+    if any(k in a for k in ("ems", "ambulance", "hospital", "medical")):
+        return "ems"
+    return "other"
+
+
 def follow_hit(obj: dict) -> None:
     x = obj.get("x") or {}
     if "trunked_site" in x:
@@ -4126,6 +4141,14 @@ def follow_hit(obj: dict) -> None:
         return                               # an unnamed low-band carrier is almost always the receiver itself
     if data_channel(x) and not (LISTEN["pages"] and pager_band_ok(mhz)):
         return                               # data, not voice: nothing to hear (a client that reads pages still gets them)
+    cats = TRUNK.get("cats")
+    if cats:
+        # POLICE / FIRE / EMS / OTHER chosen: the filter is for conventional channels too. A shop's or a
+        # hotel's repeater took the dongle from the police system for half a minute at a time. A carrier
+        # nothing names is left alone as well, unless unlisted talkgroups are set to play.
+        kind = follow_hit_category(x)
+        if (kind and kind not in cats) or (not kind and TRUNK.get("unlisted", "mute") == "mute"):
+            return
     known = str(x.get("listen") or "")      # the RadioReference overlay's mode for this channel
     if known in ("fm", "am", "dmr", "p25", "nxdn"):
         mode = known                         # no 8 s probe: tune it as what it is
