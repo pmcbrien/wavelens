@@ -2899,6 +2899,63 @@ CALL_RE = re.compile(r"\bTG[:= ]\s*(\d+)")
 # send one. It is shown beside the talkgroup as a number ("TG 1402 from 4512345"): there is no list of
 # names for unit IDs here.
 VOICE_GROUP_RE = re.compile(r"-\s*Group\s+(\d+)\s+Source\s+(\d+)")
+# A call on patched talkgroups (a dispatcher joins two or more into a Motorola "supergroup") names the
+# supergroup instead: "MFID90 (Moto) Group Regroup Channel User (LCGRGR) SG: 600; SRC: 706605;". The
+# supergroup's number is one of the patched talkgroups', so the list names it and the filter can judge it.
+# Every call the site has on the air, from its control channel: a grant ("SVC [04] CHAN [0485] Group [1400]
+# Source [706623]"; service-option bit 0x40 = encrypted) and the running grant updates ("Channel 1 [0369]
+# Group 1 [1402][057A]"). One dongle plays one call, but these say what else is talking, encrypted or not.
+GRANT_RE = re.compile(r"SVC \[([0-9A-Fa-f]{1,2})\]\s*CHAN \[[0-9A-Fa-f]+\]\s*Group \[(\d+)\]\s*Source \[(\d+)\]")
+GRANT_UPDATE_RE = re.compile(r"Channel [12] \[[0-9A-Fa-f]+\]\s*Group [12] \[(\d+)\]")
+ACTIVE_CALL_S = 8.0          # a call counts as on the air for this long after the site last named it
+ACTIVE_CALL_MAX = 6          # calls sent to the phone at once
+
+
+def active_note(proc, tg: int, unit: int = 0, enc=None) -> None:
+    """Remember that the site named this talkgroup just now (unit 0 / enc None: not said this time)."""
+    if not tg:
+        return
+    act = getattr(proc, "active", None)
+    if act is None:
+        act = proc.active = {}
+    _, unit0, enc0 = act.get(tg, (0.0, 0, False))
+    act[tg] = (time.time(), unit or unit0, enc0 if enc is None else bool(enc))
+    if len(act) > 64:                                   # a long listen on a busy site: drop what has gone quiet
+        cut = time.time() - 60.0
+        for k in [k for k, v in act.items() if v[0] < cut]:
+            del act[k]
+
+
+def trunk_active(now: float) -> list:
+    """The calls on the air on the followed site, newest first: talkgroup, its name and kind from the list,
+    the unit talking when the site said, and whether it is encrypted (the grant says so, or the list does)."""
+    p = LISTEN.get("proc")
+    out = []
+    for tg, (at, unit, enc) in sorted((getattr(p, "active", None) or {}).items(), key=lambda kv: -kv[1][0]):
+        if now - at > ACTIVE_CALL_S:
+            continue
+        row = RR.talkgroup_row(tg, TRUNK.get("system", ""), trunk_sid()) if RR else None
+        c = {"tg": tg, "name": (row[1] or row[2]) if row else "", "cat": tg_category(tg),
+             "enc": bool(enc or (row and "e" in row[3].lower()))}
+        if unit:
+            c["unit"] = unit
+        out.append(c)
+        if len(out) >= ACTIVE_CALL_MAX:
+            break
+    return out
+
+
+def calls_tick(now: float) -> None:
+    """Tell the phone when the set of calls on the air changes (at most every two seconds)."""
+    calls = trunk_active(now)
+    sig = tuple(sorted((c["tg"], c.get("unit", 0), c["enc"]) for c in calls))
+    if sig == LISTEN.get("calls_sig") or now - LISTEN.get("calls_at", 0.0) < 2.0:
+        return
+    LISTEN["calls_sig"], LISTEN["calls_at"] = sig, now
+    emit({"t": "calls", "system": TRUNK.get("system", ""), "list": calls})
+
+
+VOICE_REGROUP_RE = re.compile(r"Group Regroup Channel User \(LCGRGR\)\s*SG:\s*(\d+);\s*SRC:\s*(\d+)")
 # ... from its own status line only ("WACN: BEE00; SYS: 802; NAC/CC: 800; RFSS: 001; Site: 005;"): other lines
 # name adjacent sites in a different form, and those must not be taken for this one.
 SITE_ID_RES = (("wacn", re.compile(r"\bWACN:\s*([0-9A-Fa-f]{3,5});")), ("sysid", re.compile(r"\bSYS:\s*([0-9A-Fa-f]{1,4});")),
@@ -3297,6 +3354,14 @@ def tg_muted_by_category(tg: int, cat: str) -> bool:
     if cat:
         return cat not in cats
     return TRUNK.get("unlisted", "mute") == "mute" and tg_system_covered()
+
+
+def tg_unknown_muted() -> bool:
+    """A call whose talkgroup the decoder has not named yet (the first moment of a call, or a call form it
+    does not report): with a category chosen on a system the list covers, it stays silent until it is
+    known to be wanted — otherwise a fire or EMS call plays under POLICE for as long as it stays unnamed.
+    The "unlisted" option decides it, like any other talkgroup the filter cannot judge."""
+    return bool(TRUNK.get("cats")) and TRUNK.get("unlisted", "mute") == "mute" and tg_system_covered()
 
 
 def trunk_sid() -> str:
@@ -4394,7 +4459,14 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                         mi = rx.search(ln)
                         if mi:
                             proc.ids = dict(getattr(proc, "ids", {}), **{key: mi.group(1).upper()})
-                    mg = VOICE_GROUP_RE.search(ln)
+                    mg = VOICE_GROUP_RE.search(ln) or VOICE_REGROUP_RE.search(ln)
+                    ga = GRANT_RE.search(ln)
+                    if ga:
+                        active_note(proc, int(ga.group(2)), int(ga.group(3)), bool(int(ga.group(1), 16) & 0x40))
+                    for gu in GRANT_UPDATE_RE.finditer(ln):
+                        active_note(proc, int(gu.group(1)))
+                    if mg and int(mg.group(1)):
+                        active_note(proc, int(mg.group(1)), int(mg.group(2)))
                     if mg and int(mg.group(1)):
                         said = f"TG {mg.group(1)}" + (f" from {int(mg.group(2))}" if int(mg.group(2)) else "")
                         had = (proc.call or "").split(" ·")[0]
@@ -4754,6 +4826,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
                     listen_stop("timed out (5 min); tap Listen again to continue")
                     break
             if mode in TRUNK_MODES:
+                calls_tick(now)
                 raw = getattr(p, "call", "")
                 voice = bool(LISTEN["detected"]) and now - getattr(p, "voice_at", 0.0) < 4.5   # LDU frames in the last 4.5 s, once locked
                 active = (bool(raw) and now - p.call_at < 8.0) or voice   # dsd-fme's last grant, or voice right now
@@ -4768,7 +4841,8 @@ def _serve_listen(req: tuple, gen: int) -> None:
                     # the system; the mute is on the bridge's audio frames)
                     cat = tg_category(tg) if tg else ""
                     muted = (TRUNK.get("tg_lock") and tg and tg != TRUNK["tg_lock"]) or (tg in TRUNK.get("tg_avoid") or set()) \
-                        or tg_muted_by_category(tg, cat)
+                        or tg_muted_by_category(tg, cat) \
+                        or (not tg and tg_unknown_muted())
                     LISTEN["mute"] = bool(muted)
                     if muted and "· muted" not in call:
                         call += " · muted"

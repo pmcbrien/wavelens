@@ -94,17 +94,28 @@ do_fetch() {
     git -C "$SRC" rev-parse --verify -q origin/main >/dev/null || die "fetch failed (no network?)"
 }
 
+# newer WANT HAVE: is WANT a later version than HAVE? Versions are dotted numbers (2026.11.12.2). A unit
+# whose installed version is unknown takes whatever is published. An *older* published version is never
+# an update: a bench unit ahead of the release was once offered it, and one tap in the app put it back
+# to the release and lost what it had.
+newer() {
+    [ "$1" != "$2" ] || return 1
+    [ "$2" != "unknown" ] || return 0
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]
+}
+
 do_check() {
     do_fetch
     local have want
     have=$(installed); want=$(remote_version)
-    if [ "$want" != "unknown" ] && [ "$want" != "$have" ]; then
+    if [ "$want" != "unknown" ] && newer "$want" "$have"; then
         write_state "$want" "update available"
         log "installed $have, available $want"
         return 10
     fi
     write_state "" "up to date"
-    log "up to date ($have)"
+    if [ "$want" != "unknown" ] && [ "$want" != "$have" ]; then log "installed $have is ahead of the published $want; nothing to do"
+    else log "up to date ($have)"; fi
     return 0
 }
 
@@ -198,6 +209,10 @@ do_apply() {
     local have want t0 why
     have=$(installed); want=$(remote_version)
     if [ "$want" = "$have" ] && [ "${1:-}" != "--force" ]; then log "already on $have"; write_state "" "up to date"; return 0; fi
+    if [ "$want" != "unknown" ] && ! newer "$want" "$have" && [ "${1:-}" != "--force" ]; then
+        log "installed $have is ahead of the published $want; not going back (use: wavelens-update apply --force)"
+        write_state "" "up to date"; return 0
+    fi
     # Run the updater that ships with the new version, not the one installed now: an old updater installs
     # the new bridge with its old file list and old checks. Once per run (WAVELENS_UPDATE_REEXEC).
     if [ -z "${WAVELENS_UPDATE_REEXEC:-}" ]; then
