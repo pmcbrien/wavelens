@@ -3323,7 +3323,26 @@ TRUNK = {"auto": True, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc
                                  # covers: "mute" (it cannot be shown to be police / fire / EMS) or "play"
          "interop": "other",     # Interop and Emergency Ops talkgroups (shared by police, fire and EMS) count as
                                  # "other", or as "police" (the old behaviour)
+         "sys_fav": set(),       # systems the user starred: first in the ranking and the rotation (keys, see sys_key)
+         "sys_avoid": set(),     # systems the user ignores: listed, never tried by the hunt or the rotation
          "system": ""}
+
+
+def sys_key(r: dict) -> str:
+    """What a favourite or an ignore is kept by: the system's listed name, so every site and control
+    channel of it counts as one; a carrier the list does not name goes by its frequency."""
+    return (r.get("name") or "").strip().lower() or f"{r['mhz']:.4f}"
+
+
+def sys_avoided(r: dict) -> bool:
+    return sys_key(r) in TRUNK["sys_avoid"]
+
+
+def sys_order(ranked: list) -> list:
+    """Favourites first, each group still in its power order (the sort is stable)."""
+    return sorted(ranked, key=lambda r: sys_key(r) not in TRUNK["sys_fav"])
+
+
 # Category of a talkgroup from the RadioReference Tag column ("Law Dispatch", "Fire-Tac", "EMS Dispatch",
 # "Multi-Dispatch", "Public Works", "Schools", "Interop", "Hospital"…). The phone's POLICE / FIRE / EMS / OTHER
 # buttons map onto these.
@@ -3566,7 +3585,8 @@ def trunk_next_system(now: float, force: bool = False) -> bool:
         if r["mhz"] == cur:
             r["ok"] = True
     others = [r for r in ranked if abs(r["mhz"] - cur) > 0.001 and now - r["failed_at"] > TRUNK_FAIL_SKIP_S
-              and r["lvl"] >= TRUNK_MIN_DB]              # weak carriers are not worth leaving a system for
+              and r["lvl"] >= TRUNK_MIN_DB               # weak carriers are not worth leaving a system for
+              and not sys_avoided(r)]                    # nor is one the user ignores
     if TRUNK.get("cats") and any(r.get("public", True) for r in others):
         # POLICE / FIRE / EMS asked for: a utility, airport or business system has no such talkgroups —
         # don't spend 5 s on each of them every rotation
@@ -3896,15 +3916,18 @@ def cc_hunt(first: list) -> None:
             cc = RR.control_at(m) if RR else None
             return system_public(cc[2] if cc else (RR.site_at(m) if RR else None))
         tries = [t for t in tries if allowed(t[0])]          # last session's Duke Energy doesn't lead a POLICE scan
+    ranked = sys_order(ranked)               # the user's favourites lead, whatever their power
     if ranked:
         # the cached / listed candidates only go ahead of the ranking when the sweep actually heard them
-        heard = [t for t in tries if any(abs(t[0] - r["mhz"]) < 0.002 for r in ranked)]
+        # (and never a system the user ignores)
+        heard = [t for t in tries if any(abs(t[0] - r["mhz"]) < 0.002 and not sys_avoided(r) for r in ranked)]
         tries = heard
     # POLICE / FIRE / EMS asked for and a public-safety system was heard: a utility's or a business's
     # system is not tried at all (the rotation skips them the same way); with none heard, they still are.
     wanted = [r for r in ranked if r.get("public", True)] if TRUNK.get("cats") else ranked
     for r in (wanted or ranked):
-        tries += [(r["mhz"], md) for md in r["modes"]]
+        if not sys_avoided(r):               # ignored: stays in the list the phone shows, is not tried
+            tries += [(r["mhz"], md) for md in r["modes"]]
     TRUNK["ranked"], TRUNK["ranked_at"] = ranked, time.time()
     if ranked and RR and RR.sites and state.get("lat") is None and not TRUNK.get("pos_asked"):
         TRUNK["pos_asked"] = True            # once per run: the phone shows a Share button on the Scanner tab
@@ -4291,8 +4314,10 @@ def listen_status(msg: str) -> None:
                      "tgallow": sorted(TRUNK.get("tg_allow") or []),
                      "systems": [{"mhz": r["mhz"], "db": round(r["lvl"]),
                                   "name": r.get("name", "") or TRUNK.get("learned", {}).get(round(r["mhz"], 4), ""),
-                                  "skip": time.time() - r["failed_at"] < TRUNK_FAIL_SKIP_S}
+                                  "skip": time.time() - r["failed_at"] < TRUNK_FAIL_SKIP_S,
+                                  "key": sys_key(r), "fav": sys_key(r) in TRUNK["sys_fav"], "avoid": sys_avoided(r)}
                                  for r in (TRUNK.get("ranked") or [])[:12]],
+                     "sysfav": sorted(TRUNK["sys_fav"]), "sysavoid": sorted(TRUNK["sys_avoid"]),
                      "cats": sorted(TRUNK.get("cats") or []),
                      "unlisted": TRUNK.get("unlisted", "mute"), "interop": TRUNK.get("interop", "other"),
                      "gain": LISTEN.get("gain", 40), "ppm": LISTEN.get("ppm", 0),
@@ -5606,6 +5631,22 @@ def run_peripheral(name: str) -> None:
                 except (TypeError, ValueError):
                     TRUNK["tg_avoid"] = set()
                 listen_status(f"{len(TRUNK['tg_avoid'])} talkgroup(s) muted" if TRUNK["tg_avoid"] else "no talkgroups muted")
+            elif str(cmd.get("v") or "") == "syslist":
+                # the phone's favourite and ignored systems (it resends both on every connect)
+                def keys(v):
+                    return {str(k).strip().lower()[:120] for k in (v if isinstance(v, list) else [])[:200] if str(k).strip()}
+                avoid = keys(cmd.get("avoid"))
+                TRUNK["sys_avoid"], TRUNK["sys_fav"] = avoid, keys(cmd.get("fav")) - avoid
+                if TRUNK.get("ranked"):
+                    TRUNK["ranked"] = sys_order(TRUNK["ranked"])
+                print(f"bridge: systems from the app: {len(TRUNK['sys_fav'])} favourite, {len(avoid)} ignored", file=sys.stderr)
+                listen_status(f"systems: {len(TRUNK['sys_fav'])} favourite, {len(avoid)} ignored")
+                on_now = next((r for r in TRUNK.get("ranked") or [] if abs(r["mhz"] - LISTEN["mhz"]) <= 0.001), None)
+                if on_now and sys_avoided(on_now) and LISTEN["req"] is not None and LISTEN["mode"] in TRUNK_MODES:
+                    held, TRUNK["hold"] = TRUNK.get("hold"), False      # ignoring the held system releases it
+                    if not trunk_next_system(time.time(), force=True):
+                        TRUNK["hold"] = held
+                        listen_status("ignored, but no other system is in range right now: staying here")
             elif str(cmd.get("v") or "") == "tgallow":
                 # talkgroups to hear even though the category filter would mute them (Unmute on a muted call)
                 try:
