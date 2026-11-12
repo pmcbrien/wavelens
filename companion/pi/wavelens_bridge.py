@@ -40,6 +40,7 @@ import argparse
 import base64
 from collections import deque
 import bisect
+import fcntl
 import glob
 import json
 import math
@@ -921,10 +922,11 @@ class RrPack:
         # (alternate), or a column / description says "control". [(mhz, primary, row)]
         self.controls = []
         self.sites = []         # site-export rows: dicts with "_freqs" [(mhz, flag)] in RadioReference's order
-        self.talkgroups = {}    # decimal talkgroup → [(system, alpha, description, mode, tag, sid)]
+        self.talkgroups = {}    # decimal talkgroup → [(system, alpha, description, mode, tag, sid, agency)]
         self.tg_sids = set()    # RadioReference SIDs the talkgroup exports cover
         self.tg_systems = set() # ... and their system names, as exported
         want = {c.strip().lower() for c in counties if c.strip()}
+        self.want = want        # the counties this unit is set up for (lower case); empty = no preference
         for rank, path in enumerate(paths):
             with open(path, encoding="utf-8-sig", newline="") as f:
                 head = [h.strip() for h in next(csv.reader([f.readline()]), [])]
@@ -1012,7 +1014,8 @@ class RrPack:
             system, sid = (r.get("System") or "").strip(), (r.get("SID") or "").strip()
             self.talkgroups.setdefault(dec, []).append((system, (r.get("Alpha Tag") or "").strip(),
                                                         (r.get("Description") or "").strip(), (r.get("Mode") or "").strip(),
-                                                        (r.get("Tag") or "").strip(), sid))
+                                                        (r.get("Tag") or "").strip(), sid,
+                                                        (r.get("Category") or "").strip()))
             if sid:
                 self.tg_sids.add(sid)
             if system:
@@ -1026,22 +1029,28 @@ class RrPack:
         by name, where the followed system's name may carry a site ("County (Simulcast)") or be
         abbreviated ("PCSO"). When the export covers the followed system, a talkgroup it does not list
         there gets no name: it is never borrowed from another system that happens to use the number."""
+        row = self.talkgroup_row(dec, system, sid)
+        return row[1:5] if row else None
+
+    def talkgroup_row(self, dec: int, system: str = "", sid: str = ""):
+        """The export's whole row for a talkgroup on the followed system — (system, alpha, description, mode,
+        tag, sid, agency) — chosen as talkgroup() describes, or None."""
         hits = self.talkgroups.get(dec) or []
         if not hits:
             return None
         if sid:
             own = [h for h in hits if h[5] == sid]
             if own:
-                return own[0][1:5]
+                return own[0]
             if sid in self.tg_sids:
                 return None                  # this system's talkgroups are in the export, and this one isn't
         if system:
             named = sorted(((rr_same_system(h[0], system), h) for h in hits), key=lambda t: -t[0])
             if named[0][0]:
-                return named[0][1][1:5]      # the longest export name that fits: "X (P25)" over "X"
+                return named[0][1]           # the longest export name that fits: "X (P25)" over "X"
             if any(rr_same_system(n, system) for n in self.tg_systems):
                 return None
-        return hits[0][1:5] if len({h[0] for h in hits}) == 1 else None
+        return hits[0] if len({h[0] for h in hits}) == 1 else None
 
     def _near(self, row: dict) -> float:
         """Distance (km) from the phone's last position to a site row with Lat/Lon, else a large number.
@@ -1097,6 +1106,12 @@ class RrPack:
         lo = bisect.bisect_left(self.keys, mhz - half)
         hi = bisect.bisect_right(self.keys, mhz + half)
         hits = [(abs(f - mhz), side, row) for f, side, row in self.rows[lo:hi]]
+        if self.want and rr_at_home():
+            # At home, a carrier is not another county's channel. A statewide export lists every county's
+            # conventional frequencies, and they are reused across the state: without this a local carrier
+            # was named for a sheriff's office six hundred kilometres away. (Driven out of the area with a
+            # position shared, those rows name things again.)
+            hits = [h for h in hits if h[2].get("_site") or not rr_other_county(h[2], self.want)]
         # local first: sites near the phone's position, then the preferred counties, then by distance in MHz
         hits.sort(key=lambda h: self._order(h[2], h[0]))
         return hits
@@ -1247,6 +1262,27 @@ def rr_doubtful_site(row: dict) -> bool:
         return km > RR_NEAR_KM
     rank = row.get("_rank", 9)
     return rank >= 9 or rank % 2 == 1          # odd: the row's county is not one of --rr-county
+
+
+def rr_other_county(row: dict, want: set) -> bool:
+    """A conventional row that belongs to a county this unit is not set up for (not statewide, not blank)."""
+    county = (row.get("County") or "").strip().lower()
+    return bool(county) and county != "statewide" and county not in want
+
+
+def rr_at_home() -> bool:
+    """Is the unit in the area it was set up for? True with an area set and no phone position, or a phone
+    position within RR_NEAR_KM of the area's centre. False with no area set: nothing is known."""
+    c = area_center()
+    if not c:
+        return False
+    lat, lon = state.get("lat"), state.get("lon")
+    if lat is None or lon is None:
+        return True
+    try:
+        return haversine_km(float(lat), float(lon), c[0], c[1]) <= RR_NEAR_KM
+    except (TypeError, ValueError):
+        return True
 
 
 def rr_same_system(export: str, followed: str) -> int:
@@ -2313,6 +2349,27 @@ def run_once(cmd: str, handler, planned: bool = False, stop_when=None, stall_s: 
     return True
 
 
+USB_RESETS = {}             # sysfs device → (resets in a row, time of the last)
+USBDEVFS_RESET = 0x5514     # _IO('U', 20): reset the device's port
+
+
+def usb_port_reset(sysdir: str) -> bool:
+    """Reset a USB device's port (USBDEVFS_RESET on its /dev/bus/usb node). False if it could not be done."""
+    try:
+        with open(sysdir + "/busnum") as f:
+            bus = int(f.read())
+        with open(sysdir + "/devnum") as f:
+            dev = int(f.read())
+        fd = os.open(f"/dev/bus/usb/{bus:03d}/{dev:03d}", os.O_WRONLY)
+        try:
+            fcntl.ioctl(fd, USBDEVFS_RESET, 0)
+        finally:
+            os.close(fd)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def usb_reset(serial_or_index: str) -> bool:
     """Power-cycle a USB device from software: /sys/bus/usb/devices/<dev>/authorized 0 then 1 re-enumerates
     it, which is what unplugging does. Finds the RTL-SDR by its serial (or, for an index, the Nth RTL-SDR).
@@ -2344,14 +2401,34 @@ def usb_reset(serial_or_index: str) -> bool:
     if target is None:
         print(f"bridge: usb reset: no RTL-SDR {serial_or_index!r} under /sys/bus/usb", file=sys.stderr)
         return False
+    # How many resets in a row this dongle has needed (a stall more than two minutes after the last one
+    # starts the count again).
+    n, last = USB_RESETS.get(target, (0, 0.0))
+    n = n + 1 if time.time() - last < 120.0 else 1
+    USB_RESETS[target] = (n, time.time())
+    if n > 6:
+        # Nothing software can do is working: stop hammering the bus every 25 s, say so once a minute.
+        if n % 3 == 1:
+            print(f"bridge: RTL-SDR {serial_or_index} ({os.path.basename(target)}) is still hung after {n - 1} resets: "
+                  f"unplug it and plug it back in", file=sys.stderr)
+        time.sleep(30.0)
     try:
-        with open(target + "/authorized", "w") as f:
-            f.write("0")
-        time.sleep(1.5)
-        with open(target + "/authorized", "w") as f:
-            f.write("1")
+        # A port reset first: the hub resets the device and it enumerates again, which is what clears an
+        # RTL2832U that answers but no longer streams. (Taking away its authorization and giving it back
+        # only unconfigures it; on a bench unit eighty of those in a row left the dongle hung.)
+        port = usb_port_reset(target)
+        if not port or n > 2:
+            with open(target + "/authorized", "w") as f:
+                f.write("0")
+            time.sleep(1.5)
+            with open(target + "/authorized", "w") as f:
+                f.write("1")
+            if n > 2:
+                time.sleep(1.0)
+                usb_port_reset(target)
         time.sleep(2.5)                          # re-enumeration
-        print(f"bridge: usb reset of RTL-SDR {serial_or_index} ({os.path.basename(target)}) done", file=sys.stderr)
+        print(f"bridge: usb {'port ' if port else ''}reset of RTL-SDR {serial_or_index} ({os.path.basename(target)}) done"
+              + (f" (attempt {n})" if n > 1 else ""), file=sys.stderr)
         return True
     except OSError as e:
         print(f"bridge: usb reset of RTL-SDR {serial_or_index} failed: {e} (not root?) — replug it", file=sys.stderr)
@@ -2816,6 +2893,16 @@ DIGITAL_MODES = {"dmr": ("-fs", 2), "p25": ("-f1", 1), "nxdn": ("-fi", 1), "dsta
 TRUNK_MODES = ("trunk", "trunkq", "trunke", "trunkd", "trunkm")
 ENC_RE = re.compile(r"\b(ENC|Encrypted|ALG(?:ID)?\s*[:=]?\s*(?:0x)?[0-9A-Fa-f]+)\b", re.I)
 CALL_RE = re.compile(r"\bTG[:= ]\s*(\d+)")
+# The link control word of the voice channel being decoded: " - Group 1402 Source 0". This is the call
+# that is playing. (Grant updates on the control channel list other channels' groups as "Group 1 [1402]";
+# those are not matched.) The source is the unit ID of the radio that is talking; 0 means the site did not
+# send one. It is shown beside the talkgroup as a number ("TG 1402 from 4512345"): there is no list of
+# names for unit IDs here.
+VOICE_GROUP_RE = re.compile(r"-\s*Group\s+(\d+)\s+Source\s+(\d+)")
+# ... from its own status line only ("WACN: BEE00; SYS: 802; NAC/CC: 800; RFSS: 001; Site: 005;"): other lines
+# name adjacent sites in a different form, and those must not be taken for this one.
+SITE_ID_RES = (("wacn", re.compile(r"\bWACN:\s*([0-9A-Fa-f]{3,5});")), ("sysid", re.compile(r"\bSYS:\s*([0-9A-Fa-f]{1,4});")),
+               ("rfss", re.compile(r"\bRFSS:\s*(\d{1,3});")), ("site", re.compile(r"\bSite:\s*(\d{1,3});")))
 # dsd-fme's own account of how a decode is going, counted for the "decode quality" journal line.
 VOICE_FRAME_RE = re.compile(r"\bLDU[12]\b|\bVC[1-6]\b|Voice Frame")
 BAD_FRAME_RE = re.compile(r"FEC ERR|CRC ERR|duid:EE|Ignoring LDU2|\(CRC\)")
@@ -3231,6 +3318,41 @@ def trunk_sid() -> str:
     return sid
 
 
+def trunk_call_info():
+    """What the export says about the talkgroup on the readout: number, name, description, kind and agency.
+    None between calls or when the call names no talkgroup."""
+    m = re.match(r"TG (\d+)", LISTEN.get("call") or "")
+    if not m:
+        return None
+    tg = int(m.group(1))
+    info = {"n": tg}
+    ms = re.search(r" (?:from|· unit) (\d+)", LISTEN.get("call") or "")
+    if ms:
+        info["unit"] = int(ms.group(1))      # the radio that is talking, as the site sent it
+    row = RR.talkgroup_row(tg, TRUNK.get("system", ""), trunk_sid()) if RR else None
+    if row:
+        _, alpha, desc, mode, tag, _, agency = row
+        info.update(name=alpha, desc=desc, tag=tag, agency=abbrev(agency) if agency else "", enc="e" in mode.lower())
+    return info
+
+
+def trunk_site_info():
+    """The site being followed: its name and county from the list, and the identifiers the site itself
+    broadcasts (WACN, system ID, RFSS, site number, NAC)."""
+    info = {}
+    if RR and LISTEN.get("mhz"):
+        row = (RR.control_at(LISTEN["mhz"]) or (None, None, None))[2] or RR.site_at(LISTEN["mhz"])
+        if row is not None and rr_same_system(row.get("Agency/Category") or "", TRUNK.get("system", "")):
+            info.update(system=row.get("System Name") or row.get("Agency/Category") or "", name=row.get("Description") or "",
+                        county=row.get("County") or "")
+    p = LISTEN.get("proc")
+    for k, v in (getattr(p, "ids", None) or {}).items():
+        info[k] = v
+    if getattr(p, "nac", ""):
+        info["nac"] = p.nac
+    return info or None
+
+
 def tg_category(tg: int) -> str:
     """police | fire | ems | other for a talkgroup, from its Tag (then its description) in the talkgroups export."""
     if not RR or not tg:
@@ -3311,6 +3433,9 @@ def cc_save(mhz: float, mode: str, system: str) -> None:
         cc = RR.control_at(mhz)
         if not system_public(cc[2] if cc else RR.site_at(mhz)):
             return
+    best = next((r for r in (TRUNK.get("ranked") or []) if r.get("public", True) or not TRUNK.get("cats")), None)
+    if best is not None and abs(best["mhz"] - mhz) > 0.001 and cc_load():
+        return                               # a weaker system in the rotation does not replace the strongest
     try:
         os.makedirs(os.path.dirname(CC_CACHE), exist_ok=True)
         with open(CC_CACHE, "w") as f:
@@ -3351,6 +3476,7 @@ TRUNK_IDLE_S = 5.0          # a locked system with no call for this long: on to 
 TRUNK_MIN_DB = 18.0         # a system is only rotated to when its control channel was this far over the band's floor
 TRUNK_RANK_TTL_S = 15 * 60.0  # the hunt's ranking of nearby systems is re-done after this
 TRUNK_FAIL_SKIP_S = 10 * 60.0 # a carrier that gave no sync is not retried for this long
+TRUNK_PROBE_QUIET_S = 45.0    # a system that has never locked here is only tried after this long without a call
 
 
 def trunk_next_system(now: float, force: bool = False) -> bool:
@@ -3381,6 +3507,15 @@ def trunk_next_system(now: float, force: bool = False) -> bool:
         others = [r for r in others if r.get("public", True)]
     if not others:
         return False
+    quiet = now - max(LISTEN.get("chan_at", 0.0), LISTEN.get("call_at", 0.0))
+    if not force and quiet < TRUNK_PROBE_QUIET_S:
+        # Leaving costs seconds, and trying a carrier that turns out to have no control channel costs
+        # many more: between calls on a working system, only systems that have locked here before are
+        # worth the trip. The untried ones wait for a longer silence.
+        known = [r for r in others if r.get("ok")]
+        if not known:
+            return True                          # nothing proven to go to: stay where the calls are
+        others = known
     # the next one down the power ranking after the current; wrap to the top
     idx = next((i for i, r in enumerate(ranked) if abs(r["mhz"] - cur) <= 0.001), -1)
     order = [r for r in ranked[idx + 1:] + ranked[:idx + 1] if r in others]
@@ -3396,7 +3531,9 @@ def trunk_next_system(now: float, force: bool = False) -> bool:
 
 def tg_named(call: str) -> str:
     """'TG 1234 …' → 'TG 1234 · PCSO Disp (Law Dispatch) …' from the RadioReference talkgroup export, and
-    'encrypted' when the export says so (Mode DE / TE). Talkgroups only: there are no radio IDs to name."""
+    'encrypted' when the export says so (Mode DE / TE). A source ("TG 1234 from 5678") is shown as
+    "· unit 5678": the talking radio's ID as a number, there being no list of names for those."""
+    call = re.sub(r" from (\d+)", r" · unit \1", call)
     m = re.match(r"TG (\d+)(.*)$", call)
     if not m or not RR or not RR.talkgroups:
         return call
@@ -3674,9 +3811,9 @@ def cc_hunt(first: list) -> None:
         public = system_public(row)
         local = row is not None and not rr_doubtful_site(row)
         if local and row.get("_sid"):
-            # One site per system, the strongest heard: a scanner sits on the site it receives best rather
-            # than touring every site of the same system, which here costs seconds a hop and carries
-            # mostly the same talkgroups.
+            # One site per system, the strongest heard. A wide-area site carries the system's dispatch
+            # talkgroups (a bench unit heard a city's police on the countywide simulcast), and every extra
+            # site in the rotation is seconds away from the one the calls are on.
             if row["_sid"] in systems_seen:
                 continue
             systems_seen.add(row["_sid"])
@@ -4060,11 +4197,13 @@ def listen_status(msg: str) -> None:
                      "system": (TRUNK.get("system") or "") if on and LISTEN["mode"] in TRUNK_MODES else "",
                      "hold": bool(TRUNK.get("hold")), "tglock": int(TRUNK.get("tg_lock") or 0), "idle": TRUNK_IDLE_S,
                      "tgavoid": sorted(TRUNK.get("tg_avoid") or []),
+                     "tg": trunk_call_info() if on and LISTEN["mode"] in TRUNK_MODES else None,
+                     "site": trunk_site_info() if on and LISTEN["mode"] in TRUNK_MODES else None,
                      "tgallow": sorted(TRUNK.get("tg_allow") or []),
                      "systems": [{"mhz": r["mhz"], "db": round(r["lvl"]),
                                   "name": r.get("name", "") or TRUNK.get("learned", {}).get(round(r["mhz"], 4), ""),
                                   "skip": time.time() - r["failed_at"] < TRUNK_FAIL_SKIP_S}
-                                 for r in (TRUNK.get("ranked") or [])[:8]],
+                                 for r in (TRUNK.get("ranked") or [])[:12]],
                      "cats": sorted(TRUNK.get("cats") or []),
                      "unlisted": TRUNK.get("unlisted", "mute"), "interop": TRUNK.get("interop", "other"),
                      "gain": LISTEN.get("gain", 40), "ppm": LISTEN.get("ppm", 0),
@@ -4251,6 +4390,18 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                             proc.enc_now, proc.enc_at = True, time.time()
                         elif proc.clr_run >= 2:
                             proc.enc_now, proc.enc_at = False, time.time()
+                    for key, rx in SITE_ID_RES:              # what the site says it is: WACN, system, RFSS, site
+                        mi = rx.search(ln)
+                        if mi:
+                            proc.ids = dict(getattr(proc, "ids", {}), **{key: mi.group(1).upper()})
+                    mg = VOICE_GROUP_RE.search(ln)
+                    if mg and int(mg.group(1)):
+                        said = f"TG {mg.group(1)}" + (f" from {int(mg.group(2))}" if int(mg.group(2)) else "")
+                        had = (proc.call or "").split(" ·")[0]
+                        # a later word of the same call without a source does not take the unit ID away
+                        if said != had and not (had.startswith(said + " from ")):
+                            proc.call = said
+                        proc.call_at = time.time()
                     m = CALL_RE.search(ln)
                     if m and "Channel Update" in ln and proc.call and f"TG {m.group(1)}" not in proc.call:
                         # an update LCW naming other calls on the system: activity, not a change of call
@@ -4261,7 +4412,8 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                         enc = ENC_RE.search(ln)
                         tok = enc.group(1).strip() if enc else ""
                         clear = bool(re.search(r"(?i)alg(?:id)?\s*[:=]?\s*(?:0x80|0x0|0|128)$", tok))   # P25 ALGID 0x80 = clear
-                        # Talkgroup only: the source radio's unit ID is never read or shown (public build policy).
+                        # This line form carries the talkgroup only; the unit ID comes from the voice channel's
+                        # "Group n Source m" line above.
                         proc.call = f"TG {m.group(1)}" + (f" · encrypted ({tok})" if tok and not clear else "")
                         proc.call_at = time.time()
         threading.Thread(target=drain, daemon=True).start()
@@ -4415,8 +4567,13 @@ def serve_smartnet(cc_mhz: float, sq: int, gen: int) -> None:
         while LISTEN["gen"] == gen:
             now = time.time()
             if now > LISTEN["until"]:
-                listen_stop("timed out (5 min); tap Listen again to continue")
-                break
+                if LISTEN["follow"] and now <= LISTEN["follow_until"]:
+                    # Follow is on and the app is still renewing it: a system that stays busy (or is held)
+                    # keeps the dongle. The 5 min limit is for a single Listen nobody is renewing.
+                    LISTEN["until"] = now + LISTEN_MAX_S
+                else:
+                    listen_stop("timed out (5 min); tap Listen again to continue")
+                    break
             if cur["voice"] is not None:
                 r, _, _ = select.select([cur["voice"].stdout], [], [], 0.5)
                 chunk = cur["voice"].stdout.read(LISTEN_FRAME * 2) if r else b""
@@ -4589,8 +4746,13 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 break                        # retuned or stopped
             now = time.time()
             if now > LISTEN["until"]:
-                listen_stop("timed out (5 min); tap Listen again to continue")
-                break
+                if LISTEN["follow"] and now <= LISTEN["follow_until"]:
+                    # Follow is on and the app is still renewing it: a system that stays busy (or is held)
+                    # keeps the dongle. The 5 min limit is for a single Listen nobody is renewing.
+                    LISTEN["until"] = now + LISTEN_MAX_S
+                else:
+                    listen_stop("timed out (5 min); tap Listen again to continue")
+                    break
             if mode in TRUNK_MODES:
                 raw = getattr(p, "call", "")
                 voice = bool(LISTEN["detected"]) and now - getattr(p, "voice_at", 0.0) < 4.5   # LDU frames in the last 4.5 s, once locked
@@ -5395,7 +5557,19 @@ def run_peripheral(name: str) -> None:
                     # system (its control channel is found by the sweep, the RadioReference list, or a hunt),
                     # and conventional hits take turns with it as they come.
                     if TRUNK["auto"] and not HUNT["on"] and (LISTEN["req"] is None or LISTEN["mode"] not in TRUNK_MODES):
-                        trunk_start(None)
+                        # The system that worked last time first: it is playing in seconds. (A hunt reads
+                        # the sweep for over a minute before the first call can be heard; it still runs
+                        # when that system goes quiet, or at once if its control channel is not there.)
+                        if not trunk_resume():
+                            trunk_start(None)
+                else:
+                    # The app's once-a-minute renewal: what is playing keeps going, and a scanner that has
+                    # fallen silent (its listen ended, and no hit has come to restart it) starts again.
+                    if LISTEN["req"] is not None:
+                        LISTEN["until"] = time.time() + LISTEN_MAX_S
+                    elif TRUNK["auto"] and not HUNT["on"] and not TRUNK["cc_at"]:
+                        if not trunk_resume():
+                            trunk_start(None)
             else:
                 try:
                     mhz = float(cmd.get("mhz"))
