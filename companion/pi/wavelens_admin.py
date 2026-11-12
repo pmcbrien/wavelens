@@ -404,6 +404,66 @@ def args_set_name(args, name):
     return shlex.join(out)
 
 
+# Scanner settings the Settings page edits as form fields; each is one flag inside WAVELENS_ARGS.
+# flag → (default as the bridge has it, validator returning the cleaned value or None)
+def _int_in(lo, hi):
+    def check(v):
+        try:
+            n = int(str(v).strip())
+        except ValueError:
+            return None
+        return str(n) if lo <= n <= hi else None
+    return check
+
+
+def _one_of(*choices):
+    return lambda v: v if v in choices else None
+
+
+SCANNER_FLAGS = {
+    "--listen-gain": ("40", _int_in(0, 50)),
+    "--listen-ppm": ("", _int_in(-200, 200)),          # "" = not set: the bridge uses --rtl-ppm
+    "--tg-unlisted": ("mute", _one_of("mute", "play")),
+    "--tg-interop": ("other", _one_of("other", "police")),
+}
+
+
+def args_get_flag(args, flag):
+    """The value of '--flag X' (or --flag=X) inside WAVELENS_ARGS, or None when it is not there."""
+    try:
+        parts = shlex.split(args)
+    except ValueError:
+        return None
+    for i, p in enumerate(parts):
+        if p == flag and i + 1 < len(parts):
+            return parts[i + 1]
+        if p.startswith(flag + "="):
+            return p[len(flag) + 1:]
+    return None
+
+
+def args_set_flag(args, flag, value):
+    """WAVELENS_ARGS with any '--flag …' removed and '--flag value' appended; value None or '' removes it."""
+    try:
+        parts = shlex.split(args)
+    except ValueError:
+        parts = args.split()
+    out, skip = [], False
+    for p in parts:
+        if skip:
+            skip = False
+            continue
+        if p == flag:
+            skip = True
+            continue
+        if p.startswith(flag + "="):
+            continue
+        out.append(p)
+    if value not in (None, ""):
+        out += [flag, str(value)]
+    return shlex.join(out)
+
+
 def defaults_help():
     """Comment lines from the shipped example, for the 'what these mean' block."""
     for path in (DEFAULTS_FILE, os.path.join(LIB_DIR, "wavelens-bridge.default"),
@@ -1346,13 +1406,27 @@ Support: wavelensapp@gmail.com — attach the downloaded log.</p></div>"""
     def page_settings(self, sess):
         d = defaults_read()
         args = d.get("WAVELENS_ARGS", "")
+        sc = {flag: (args_get_flag(args, flag) if args_get_flag(args, flag) is not None else default)
+              for flag, (default, _) in SCANNER_FLAGS.items()}
         body = f"""<div class="card"><form method="post" action="/settings">{csrf_field(sess)}
 <label>Radio name (what the app lists under Find; letters, digits, - and _; up to 20)</label>
 <input type="text" name="name" value="{esc(args_get_name(args))}" placeholder="Wavelens-Car" maxlength="20">
+<h2>Scanner</h2>
+<label>Listening radio gain, dB (0 = automatic; default 40). Lower it if digital voice breaks up near strong transmitters</label>
+<input type="number" name="listen_gain" min="0" max="50" step="1" value="{esc(sc['--listen-gain'])}">
+<label>Listening radio frequency correction, ppm (empty = same as the sweep's; a TCXO dongle needs 0)</label>
+<input type="number" name="listen_ppm" min="-200" max="200" step="1" value="{esc(sc['--listen-ppm'])}" placeholder="0">
+<label>With POLICE, FIRE or EMS chosen in the app: talkgroups your list does not name</label>
+<select name="tg_unlisted"><option value="mute" {"selected" if sc['--tg-unlisted'] != "play" else ""}>Muted (default)</option>
+<option value="play" {"selected" if sc['--tg-unlisted'] == "play" else ""}>Played</option></select>
+<label>Interop and Emergency Ops talkgroups (police, fire and EMS all use them)</label>
+<select name="tg_interop"><option value="other" {"selected" if sc['--tg-interop'] != "police" else ""}>Count as OTHER (default)</option>
+<option value="police" {"selected" if sc['--tg-interop'] == "police" else ""}>Count as POLICE</option></select>
+<h2>Advanced</h2>
 <label>WAVELENS_AUTO</label><select name="auto"><option value="0" {"selected" if d.get("WAVELENS_AUTO", "0") != "1" else ""}>0 — the bridge assigns radios itself (default, hot-plug)</option>
 <option value="1" {"selected" if d.get("WAVELENS_AUTO") == "1" else ""}>1 — plan in the shell at each start (older way)</option></select>
 <label>WAVELENS_RTL433 (rtl_433 arguments; usually empty)</label><input type="text" name="rtl433" value="{esc(d.get('WAVELENS_RTL433', ''))}">
-<label>WAVELENS_ARGS (extra bridge flags; the radio name above is kept in sync)</label>
+<label>WAVELENS_ARGS (extra bridge flags; the radio name and the Scanner fields above are kept in sync)</label>
 <textarea name="args" rows="4">{esc(args)}</textarea>
 <button class="btn" type="submit">Save and restart bridge</button></form></div>
 {self.security_card(sess)}
@@ -1403,6 +1477,19 @@ your Wi-Fi and set up, you can turn off what you don't use. This page keeps work
             self.flash(sess, f"Unbalanced quotes: {e}")
             return self.redirect("/settings")
         args = args_set_name(args, name)
+        # The Scanner fields: each is one flag in the same line. A value equal to the bridge's default
+        # is left out, so the line stays short and a later change of default still applies.
+        for flag, field in (("--listen-gain", "listen_gain"), ("--listen-ppm", "listen_ppm"),
+                            ("--tg-unlisted", "tg_unlisted"), ("--tg-interop", "tg_interop")):
+            if field not in form:
+                continue                         # an older form (or a script) that does not send it: leave the flag alone
+            default, check = SCANNER_FLAGS[flag]
+            raw = form.get(field, "").strip()
+            val = check(raw) if raw else ""
+            if val is None:
+                self.flash(sess, f"{flag[2:]}: {raw!r} is not a value the scanner accepts.")
+                return self.redirect("/settings")
+            args = args_set_flag(args, flag, "" if val == default else val)
         defaults_write({"WAVELENS_AUTO": "1" if form.get("auto") == "1" else "0",
                         "WAVELENS_RTL433": " ".join(form.get("rtl433", "").split()),   # one shell line, like args
                         "WAVELENS_ARGS": args})

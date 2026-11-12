@@ -168,6 +168,21 @@ AREA_COUNTRY_RE = re.compile(r"^[A-Za-z]{2}$")
 AREA_POSTCODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 -]{0,11}$")
 
 
+def area_center():
+    """(lat, lon) of the area this unit was set up for (wavelens-area), or () when none is set. Stands in
+    for the phone's position until it shares one, so "local" means something from the first second."""
+    c = AREA.get("center")
+    if c is None or time.time() - AREA.get("center_at", 0.0) > 300.0:
+        try:
+            import area as area_mod
+            a = area_mod.read_area()
+            c = (float(a["lat"]), float(a["lon"]))
+        except Exception:  # noqa: BLE001 - no area, or an unreadable one: no centre
+            c = ()
+        AREA["center"], AREA["center_at"] = c, time.time()
+    return c
+
+
 def area_info() -> dict:
     """What the phone is told about the area in every hello: set or not, a label, and the last attempt."""
     info = {"set": False, "busy": AREA["busy"]}
@@ -809,6 +824,8 @@ def hello() -> None:
     # the RTL-SDR sweeps cover (24–1766 MHz is the dongle's limit; the configured ranges are what is drawn)
     if hw["hackrf"] == "ok" and HACKRF_ON:
         spec = [1, 6000]
+    elif SWEEP_RANGES and SPEC["dyn"]:
+        spec = [round(RTL_TUNE[0]), round(RTL_TUNE[1])]      # the sweep adds whatever window the phone looks at
     elif SWEEP_RANGES:
         spec = [round(min(lo for lo, _ in SWEEP_RANGES)), round(max(hi for _, hi in SWEEP_RANGES))]
     else:
@@ -904,7 +921,9 @@ class RrPack:
         # (alternate), or a column / description says "control". [(mhz, primary, row)]
         self.controls = []
         self.sites = []         # site-export rows: dicts with "_freqs" [(mhz, flag)] in RadioReference's order
-        self.talkgroups = {}    # decimal talkgroup → [(system, alpha, description, mode, tag)]
+        self.talkgroups = {}    # decimal talkgroup → [(system, alpha, description, mode, tag, sid)]
+        self.tg_sids = set()    # RadioReference SIDs the talkgroup exports cover
+        self.tg_systems = set() # ... and their system names, as exported
         want = {c.strip().lower() for c in counties if c.strip()}
         for rank, path in enumerate(paths):
             with open(path, encoding="utf-8-sig", newline="") as f:
@@ -990,28 +1009,52 @@ class RrPack:
                 dec = int((r.get("Decimal") or "").strip())
             except ValueError:
                 continue
-            self.talkgroups.setdefault(dec, []).append(((r.get("System") or "").strip(), (r.get("Alpha Tag") or "").strip(),
+            system, sid = (r.get("System") or "").strip(), (r.get("SID") or "").strip()
+            self.talkgroups.setdefault(dec, []).append((system, (r.get("Alpha Tag") or "").strip(),
                                                         (r.get("Description") or "").strip(), (r.get("Mode") or "").strip(),
-                                                        (r.get("Tag") or "").strip()))
+                                                        (r.get("Tag") or "").strip(), sid))
+            if sid:
+                self.tg_sids.add(sid)
+            if system:
+                self.tg_systems.add(system)
 
-    def talkgroup(self, dec: int, system: str = ""):
-        """(alpha, description, mode, tag) for a talkgroup, preferring the system being followed."""
+    def talkgroup(self, dec: int, system: str = "", sid: str = ""):
+        """(alpha, description, mode, tag) for a talkgroup on the system being followed.
+        Talkgroup numbers are only unique inside one system: the same decimal is a sheriff's dispatch on
+        one system and a bus garage on another. So the system is identified first — by its RadioReference
+        SID when the site export gave one (the same in every export, whatever the system is called), else
+        by name, where the followed system's name may carry a site ("County (Simulcast)") or be
+        abbreviated ("PCSO"). When the export covers the followed system, a talkgroup it does not list
+        there gets no name: it is never borrowed from another system that happens to use the number."""
         hits = self.talkgroups.get(dec) or []
         if not hits:
             return None
-        sysl = system.lower()
-        own = [h for h in hits if sysl and h[0].lower() == sysl]
-        if own:
-            return own[0][1:]
-        return hits[0][1:] if len({h[0] for h in hits}) == 1 else None
+        if sid:
+            own = [h for h in hits if h[5] == sid]
+            if own:
+                return own[0][1:5]
+            if sid in self.tg_sids:
+                return None                  # this system's talkgroups are in the export, and this one isn't
+        if system:
+            named = sorted(((rr_same_system(h[0], system), h) for h in hits), key=lambda t: -t[0])
+            if named[0][0]:
+                return named[0][1][1:5]      # the longest export name that fits: "X (P25)" over "X"
+            if any(rr_same_system(n, system) for n in self.tg_systems):
+                return None
+        return hits[0][1:5] if len({h[0] for h in hits}) == 1 else None
 
     def _near(self, row: dict) -> float:
         """Distance (km) from the phone's last position to a site row with Lat/Lon, else a large number.
         Sites within RR_NEAR_KM rank as local; a 'West Palm' or 'Fortville' site sharing a frequency does not."""
         try:
-            if state.get("lat") is None or not row.get("Lat"):
+            lat, lon = state.get("lat"), state.get("lon")
+            if lat is None:
+                c = area_center()
+                if c:
+                    lat, lon = c
+            if lat is None or not row.get("Lat"):
                 return 9e9
-            return haversine_km(float(state["lat"]), float(state["lon"]), float(row["Lat"]), float(row["Lon"]))
+            return haversine_km(float(lat), float(lon), float(row["Lat"]), float(row["Lon"]))
         except (TypeError, ValueError):
             return 9e9
 
@@ -1204,6 +1247,19 @@ def rr_doubtful_site(row: dict) -> bool:
         return km > RR_NEAR_KM
     rank = row.get("_rank", 9)
     return rank >= 9 or rank % 2 == 1          # odd: the row's county is not one of --rr-county
+
+
+def rr_same_system(export: str, followed: str) -> int:
+    """Whether a system name from a talkgroup export is the system the bridge is following, whose name
+    was built from a site row: abbreviated the way hit names are, and often with the site after it in
+    brackets. Returns the length of the name that matched (0 = different systems), so the most specific wins."""
+    b = " ".join((followed or "").lower().split())
+    best = 0
+    for a in {(export or ""), abbrev(export or "")}:
+        a = " ".join(a.lower().split())
+        if a and (b == a or b.startswith(a + " (")):
+            best = max(best, len(a))
+    return best
 
 
 def rr_site(row: dict):
@@ -1702,7 +1758,13 @@ def gnss_window(hz: float):
 # 0.5 dB steps from SPEC_DB0. Nothing is sent unless a screen is looking, and it stops by itself
 # SPEC_TTL_S after the phone's last request (the app renews while the screen is open).
 SWEEPS = []                   # every Sweep in this process (hackrf_sweep, rtl_power)
-SPEC = {"on": False, "lo": 1.0, "hi": 6000.0, "until": 0.0, "src": ""}
+SPEC = {"on": False, "lo": 1.0, "hi": 6000.0, "until": 0.0, "src": "",
+        "extra": None,        # (lo, hi) MHz the phone is looking at that no configured sweep range covers:
+                              # an rtl_power sweep that takes turns over several ranges adds it while asked
+        "dyn": False}         # such a sweep is running, so any window an RTL-SDR tunes can be drawn
+SPEC_EXTRA_MAX_MHZ = 40.0     # widest window swept on request (wider ones need a HackRF)
+SPEC_EXTRA_DWELL_S = 4        # seconds on the requested window, between the configured ranges
+RTL_TUNE = (24.0, 1766.0)     # what an RTL-SDR tunes
 SPEC_BINS = 200
 SPEC_DB0 = -120.0             # byte 0; byte 255 = +7.5 dB
 SPEC_RATE_S = 1.0
@@ -2498,8 +2560,12 @@ def spec_route(on: bool, lo: float = 1.0, hi: float = 6000.0) -> None:
         hackrf_ctl({"spec": {"on": False}})
         return
     if sweep_covers(lo, hi) and any(sw.src == "rtlpower" for sw in SWEEPS):
-        SPEC.update(on=True, lo=lo, hi=hi, until=time.time() + SPEC_TTL_S)
+        SPEC.update(on=True, lo=lo, hi=hi, until=time.time() + SPEC_TTL_S, extra=None)
         hackrf_ctl({"spec": {"on": False}})
+    elif SPEC["dyn"] and not HACKRF_ON and RTL_TUNE[0] <= lo and hi <= RTL_TUNE[1] and hi - lo <= SPEC_EXTRA_MAX_MHZ:
+        # No configured range covers this window (the Scanner tab asks for the band around the tuned
+        # channel, e.g. 857 MHz when the sweep watches 806-824): the sweep visits it while the screen looks.
+        SPEC.update(on=True, lo=lo, hi=hi, until=time.time() + SPEC_TTL_S, extra=(lo, hi))
     else:
         SPEC["on"] = False
         hackrf_ctl({"spec": {"on": True, "lo": lo, "hi": hi}})
@@ -2618,8 +2684,25 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm:
         except (ValueError, IndexError):
             return False
         return any(lo <= b_hi and hi >= b_lo for _, b_lo, b_hi, _ in CC_BANDS)
+    SPEC["dyn"] = True
+
+    def spectrum_window() -> None:
+        """The window a Scanner / Spectrum screen is looking at, when no configured range covers it: a short
+        pass between the configured ranges, so the picture is of the band that is on the screen."""
+        ex = SPEC.get("extra")
+        if not ex or not SPEC["on"] or time.time() > SPEC["until"] or HUNT.get("sweeping"):
+            return
+        if SPEC.setdefault("extra_dev", device) != device:
+            return                       # another dongle's sweep has this job
+        wait_free()
+        sw.settle_until = time.time() + SETTLE_S + 1
+        run_once(f"rtl_power -f {ex[0]:.4f}M:{ex[1]:.4f}M:12.5k{dev} -i 1 {(' -g ' + str(gain)) if gain else ''}{(' -p ' + str(ppm)) if ppm else ''} "
+                 f"-e {int(SETTLE_S) + SPEC_EXTRA_DWELL_S}s -",
+                 sw.row, planned=True, stop_when=busy, stall_s=RTL_STALL_S, on_stall=lambda: usb_reset(device))
+        time.sleep(0.5)
     while True:
         for spec in specs:
+            spectrum_window()
             wait_free()
             hunting = HUNT.get("sweeping") and any(in_cc_band(sp) for sp in specs)
             if hunting and not in_cc_band(spec):
@@ -2963,7 +3046,7 @@ AUTO_NO_CARRIER_WAIT_S = 8.0   # no sweep running to tell us the carrier is on: 
 TDMA_SYNCS = ("DMR", "P25p2", "X2")
 DSD_UDP_PORT = 23470
 RTL_TCP_PORT = 23471
-LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "mhz": 0.0, "mode": "", "asked": "", "sq": 0,
+LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "gain": 40, "mhz": 0.0, "mode": "", "asked": "", "sq": 0,
           "raw_mhz": 0.0, "tol": 0.05, "readings": [], "honed_at": 0.0,   # the sweep's placing, and later readings
           "until": 0.0, "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0,
           "chan_at": 0.0,                   # when this channel was first asked for (tuned_at restarts on AUTO → FM)
@@ -3088,25 +3171,77 @@ TRUNK = {"auto": True, "qpsk": False, "seen": {}, "tries": [], "site": None, "cc
          "hold": False,          # system lock: stay on this system, no rotation
          "tg_lock": 0,           # talkgroup lock: only this TG is heard (others on the system are muted)
          "tg_avoid": set(),      # talkgroups muted (the app's TG lockout; resent on connect)
+         "tg_allow": set(),      # talkgroups heard whatever the category filter says (the app's Unmute)
          "tg_seen": [],          # recent (ts, tg, name, encrypted) on this system, for the app's call list
          "cats": {"police"},     # category filter: only these kinds of talkgroup are heard (empty = all); police by default
+         "unlisted": "mute",     # with a category chosen, a talkgroup the export does not list on a system it
+                                 # covers: "mute" (it cannot be shown to be police / fire / EMS) or "play"
+         "interop": "other",     # Interop and Emergency Ops talkgroups (shared by police, fire and EMS) count as
+                                 # "other", or as "police" (the old behaviour)
          "system": ""}
 # Category of a talkgroup from the RadioReference Tag column ("Law Dispatch", "Fire-Tac", "EMS Dispatch",
 # "Multi-Dispatch", "Public Works", "Schools", "Interop", "Hospital"…). The phone's POLICE / FIRE / EMS / OTHER
 # buttons map onto these.
 TG_CATS = [(("law", "corrections", "police", "sheriff"), "police"), (("fire",), "fire"), (("ems", "medical", "hospital"), "ems"),
-           (("multi", "interop", "emergency ops", "public safety"), "police"), ]
+           (("multi", "public safety"), "police"), ]
+TG_SHARED = ("interop", "emergency ops")     # every service talks on these: "other" unless TRUNK["interop"] says police
+
+
+def tg_system_covered() -> bool:
+    """Does the talkgroup export list the system being followed? Only then does "not in the export" say
+    anything about a talkgroup: on a system the export does not cover, every talkgroup is unlisted."""
+    if not RR or not RR.talkgroups:
+        return False
+    sid = trunk_sid()
+    if sid:
+        return sid in RR.tg_sids
+    name = TRUNK.get("system", "")
+    return bool(name) and any(rr_same_system(n, name) for n in RR.tg_systems)
+
+
+def tg_muted_by_category(tg: int, cat: str) -> bool:
+    """The POLICE / FIRE / EMS / OTHER filter's verdict on a call. A listed talkgroup is muted when its
+    category is not one chosen. An unlisted one is muted too when the export covers this system (it then
+    cannot be shown to be what was asked for) unless TRUNK["unlisted"] is "play"; on a system the export
+    does not cover it always plays, or that system would be silent."""
+    cats = TRUNK.get("cats")
+    if not cats or not tg or tg in (TRUNK.get("tg_allow") or set()):
+        return False
+    if cat:
+        return cat not in cats
+    return TRUNK.get("unlisted", "mute") == "mute" and tg_system_covered()
+
+
+def trunk_sid() -> str:
+    """RadioReference SID of the system being followed, from the site row its control channel belongs
+    to — only when that row is the system the lock was named after, so a frequency two systems share
+    cannot hand over the other one's talkgroups. "" when the export has no site row for it."""
+    if not RR:
+        return ""
+    mhz, name = LISTEN.get("mhz") or 0.0, TRUNK.get("system", "")
+    c = TRUNK.get("sid_at")
+    if c and c[0] == mhz and c[1] == name:
+        return c[2]
+    sid = ""
+    if mhz and name:
+        row = (RR.control_at(mhz) or (None, None, None))[2] or RR.site_at(mhz)
+        if row is not None and row.get("_sid") and rr_same_system(row.get("Agency/Category") or "", name):
+            sid = row["_sid"]
+    TRUNK["sid_at"] = (mhz, name, sid)
+    return sid
 
 
 def tg_category(tg: int) -> str:
     """police | fire | ems | other for a talkgroup, from its Tag (then its description) in the talkgroups export."""
     if not RR or not tg:
         return ""                            # unknown: the filter lets it through (an unlisted system would otherwise be silent)
-    hit = RR.talkgroup(tg, TRUNK.get("system", ""))
+    hit = RR.talkgroup(tg, TRUNK.get("system", ""), trunk_sid())
     if not hit:
         return ""
     alpha, desc, mode, tag = hit
     text = f"{tag} {desc} {alpha}".lower()
+    if any(w in tag.lower() for w in TG_SHARED):
+        return "police" if TRUNK.get("interop") == "police" else "other"
     for words, cat in TG_CATS:
         if any(w in text for w in words):
             return cat
@@ -3170,6 +3305,12 @@ def cc_load():
 
 
 def cc_save(mhz: float, mode: str, system: str) -> None:
+    if TRUNK.get("cats") and RR:
+        # POLICE / FIRE / EMS asked for: a utility's or business's system that happened to lock is not
+        # the one to come back to first next time
+        cc = RR.control_at(mhz)
+        if not system_public(cc[2] if cc else RR.site_at(mhz)):
+            return
     try:
         os.makedirs(os.path.dirname(CC_CACHE), exist_ok=True)
         with open(CC_CACHE, "w") as f:
@@ -3205,7 +3346,7 @@ def cc_forget(mhz: float) -> None:
 
 
 TRUNK_SEEN_S = 180.0        # a site frequency counts as a candidate for this long after its last hit
-TRUNK_CC_WAIT_S = 18.0      # dsd-fme must show a sync on a candidate within this, else the next is tried (rtl_tcp start + sync)
+TRUNK_CC_WAIT_S = 10.0      # dsd-fme must show a sync on a candidate within this, else the next is tried (rtl_tcp start + sync)
 TRUNK_IDLE_S = 5.0          # a locked system with no call for this long: on to the next strongest system (scanner-style)
 TRUNK_MIN_DB = 18.0         # a system is only rotated to when its control channel was this far over the band's floor
 TRUNK_RANK_TTL_S = 15 * 60.0  # the hunt's ranking of nearby systems is re-done after this
@@ -3259,7 +3400,7 @@ def tg_named(call: str) -> str:
     m = re.match(r"TG (\d+)(.*)$", call)
     if not m or not RR or not RR.talkgroups:
         return call
-    tg = RR.talkgroup(int(m.group(1)), TRUNK.get("system", ""))
+    tg = RR.talkgroup(int(m.group(1)), TRUNK.get("system", ""), trunk_sid())
     if not tg:
         return call
     alpha, desc, mode, tag = tg
@@ -3435,16 +3576,23 @@ def cc_hunt(first: list) -> None:
         probe = [(spec, lo, hi, label) for spec, lo, hi, label in CC_BANDS if not sweep_covers(lo, hi)]
         if covered:
             probe = probe_extra + probe
-        if probe and not found and not cancelled():
-            # Bands no sweep covers, and nothing steady yet: probe them with rtl_power. This is the path
-            # that has to take the dongle from the sweep, so it is the last resort.
+        if found and probe and RR and RR.controls:
+            # Something steady in the swept bands (a business repeater, say) says nothing about the bands
+            # the sweep never visits. Where the list has a local control channel, that band is still
+            # measured — else one UHF carrier kept the scan off the 800 MHz public-safety systems entirely.
+            probe = [b for b in probe if any(b[1] <= f < b[2] and not rr_doubtful_site(row) for f, _, row in RR.controls)]
+        elif found:
+            probe = []
+        if probe and not cancelled():
+            # Bands no sweep covers: probe them with rtl_power. This takes the dongle from listening for a
+            # few seconds per band.
             free_dongle(LISTEN["dev"])
         else:
             probe = []
         dev = f" -d {shlex.quote(LISTEN['dev'])}" if LISTEN["dev"] else ""
         ppm = f" -p {LISTEN['ppm']}" if LISTEN["ppm"] else ""
         for spec, lo, hi, label in probe:
-            if cancelled() or len(found) >= CC_MAX_TRIES:
+            if cancelled() or (len(found) >= CC_MAX_TRIES and not (RR and RR.controls)):
                 break
             listen_status(f"trunked: looking for a control channel, {label} ({lo:g}–{hi:g} MHz)…")
             rows, err = [], ""
@@ -3454,7 +3602,7 @@ def cc_hunt(first: list) -> None:
             # first, and skipping it is skipping the control channel.
             for attempt in range(12):
                 try:
-                    r = subprocess.run(shlex.split(f"rtl_power{dev}{ppm} -f {spec} -i 1 -e 6 -g 40 -"),
+                    r = subprocess.run(shlex.split(f"rtl_power{dev}{ppm} -f {spec} -i 1 -e 6 -g {LISTEN['gain'] or 40} -"),
                                        capture_output=True, text=True, timeout=30)
                     rows, err = r.stdout.splitlines(), r.stderr
                 except FileNotFoundError:
@@ -3486,12 +3634,29 @@ def cc_hunt(first: list) -> None:
     # Like a scanner: the strongest steady carrier first, then the next. The RadioReference list only
     # decides how to decode a carrier (P25 / DMR / EDACS) and which ones to skip (LTR can't be followed).
     found.sort(key=lambda c: -c[1])
-    ranked, sites_seen = [], set()
-    for m, lvl in found[:CC_MAX_TRIES * 2]:
+    ranked, others, sites_seen, systems_seen = [], [], set(), set()
+    for m, lvl in found:
         cc = RR.control_at(m) if RR else None
-        row = cc[2] if cc else (RR.site_at(m) if RR else None)
+        row = cc[2] if cc else None
+        if RR and (row is None or rr_doubtful_site(row)):
+            # No control channel listed here, or only a far-away site's (a statewide system reuses its
+            # frequencies county to county): a local site that lists this frequency as one of its own
+            # channels is the better reading — this carrier is that site's voice channel.
+            alt = RR.site_at(m)
+            if alt is not None and (row is None or not rr_doubtful_site(alt)):
+                cc, row = None, alt
         if cc:
             m = cc[0]                        # the listed frequency is exact; the scan's is within a channel
+        elif row is not None and row.get("_freqs"):
+            # A steady carrier of a listed site that is not its control channel: one of its voice channels
+            # (a busy simulcast keeps several up, often stronger than the control channel). The site is
+            # followed on its control channel — the one the scan heard best, else the list's primary —
+            # never on this carrier, which would show no control sync and get the whole site skipped.
+            ctrl = [fq for fq, fl in row["_freqs"] if fl]
+            if ctrl:
+                heard = [fq for f2, _ in found for fq in ctrl if abs(fq - f2) <= 0.0065]
+                prim = [fq for fq, fl in row["_freqs"] if fl and fl != "a"]
+                m = (heard or prim or ctrl)[0]
         if row is not None and row.get("Mode") == "ltr":
             continue
         # One entry per site: a site's voice channels are steady carriers too (busy systems keep several
@@ -3507,9 +3672,20 @@ def cc_hunt(first: list) -> None:
         if key and key[0] and row is not None and rr_doubtful_site(row):
             name = key[0]                    # the system is right (it owns the frequency); the site is a guess
         public = system_public(row)
-        ranked.append({"mhz": m, "lvl": lvl, "modes": modes, "failed_at": 0.0, "ok": False, "name": name, "public": public})
-        if len(ranked) >= CC_MAX_TRIES:
-            break
+        local = row is not None and not rr_doubtful_site(row)
+        if local and row.get("_sid"):
+            # One site per system, the strongest heard: a scanner sits on the site it receives best rather
+            # than touring every site of the same system, which here costs seconds a hop and carries
+            # mostly the same talkgroups.
+            if row["_sid"] in systems_seen:
+                continue
+            systems_seen.add(row["_sid"])
+        (ranked if local else others).append({"mhz": m, "lvl": lvl, "modes": modes, "failed_at": 0.0, "ok": False,
+                                              "name": name, "public": public})
+    # Like a scanner with its sites programmed: when systems the list places in this area were heard,
+    # those are the scan list — carriers the list does not know, and other areas' sites, are not tried.
+    # Somewhere the list covers nothing that was heard, the strongest carriers are still tried as before.
+    ranked = (ranked or others[:CC_MAX_TRIES * 2])[:CC_MAX_TRIES]
     if TRUNK.get("cats"):
         ranked.sort(key=lambda r: not r.get("public", True))   # POLICE/FIRE/EMS asked for: public-safety systems first
 
@@ -3521,7 +3697,10 @@ def cc_hunt(first: list) -> None:
         # the cached / listed candidates only go ahead of the ranking when the sweep actually heard them
         heard = [t for t in tries if any(abs(t[0] - r["mhz"]) < 0.002 for r in ranked)]
         tries = heard
-    for r in ranked:
+    # POLICE / FIRE / EMS asked for and a public-safety system was heard: a utility's or a business's
+    # system is not tried at all (the rotation skips them the same way); with none heard, they still are.
+    wanted = [r for r in ranked if r.get("public", True)] if TRUNK.get("cats") else ranked
+    for r in (wanted or ranked):
         tries += [(r["mhz"], md) for md in r["modes"]]
     TRUNK["ranked"], TRUNK["ranked_at"] = ranked, time.time()
     if ranked and RR and RR.sites and state.get("lat") is None and not TRUNK.get("pos_asked"):
@@ -3529,8 +3708,8 @@ def cc_hunt(first: list) -> None:
         listen_status("scanner: share your position (Scanner tab → Share) so the nearest sites are named and far ones skipped")
     if ranked:
         print("bridge: systems ranked: " + "; ".join(f"{r['mhz']:.4f} (+{r['lvl']:.0f} dB){' ' + r['name'] if r['name'] else ''}" for r in ranked), file=sys.stderr)
-    if RR and RR.controls:
-        # After what was heard: the list's control channels in its own order, in case the hunt's floor
+    if RR and RR.controls and not ranked:
+        # Nothing heard: the list's control channels in its own order, in case the hunt's floor
         # judgement missed a weak one.
         for f, _, row in rr_controls_ranked(CC_MAX_TRIES):
             tries += [(f, md) for md in trunk_modes(rr_site(row)[2], row)]
@@ -3881,11 +4060,14 @@ def listen_status(msg: str) -> None:
                      "system": (TRUNK.get("system") or "") if on and LISTEN["mode"] in TRUNK_MODES else "",
                      "hold": bool(TRUNK.get("hold")), "tglock": int(TRUNK.get("tg_lock") or 0), "idle": TRUNK_IDLE_S,
                      "tgavoid": sorted(TRUNK.get("tg_avoid") or []),
+                     "tgallow": sorted(TRUNK.get("tg_allow") or []),
                      "systems": [{"mhz": r["mhz"], "db": round(r["lvl"]),
                                   "name": r.get("name", "") or TRUNK.get("learned", {}).get(round(r["mhz"], 4), ""),
                                   "skip": time.time() - r["failed_at"] < TRUNK_FAIL_SKIP_S}
                                  for r in (TRUNK.get("ranked") or [])[:8]],
                      "cats": sorted(TRUNK.get("cats") or []),
+                     "unlisted": TRUNK.get("unlisted", "mute"), "interop": TRUNK.get("interop", "other"),
+                     "gain": LISTEN.get("gain", 40), "ppm": LISTEN.get("ppm", 0),
                      "tgs": [{"ts": int(ts), "tg": tg, "name": nm, "enc": e, "cat": c} for ts, tg, nm, e, c in TRUNK.get("tg_seen") or []][-12:]
                      } if (on or LISTEN["follow"]) else "off"})
 
@@ -4188,7 +4370,7 @@ def serve_smartnet(cc_mhz: float, sq: int, gen: int) -> None:
     dec_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smartnet.py")
     if not os.path.exists(dec_path):
         listen_stop("smartnet.py missing"); listen_status("Motorola Type II needs companion/pi/smartnet.py next to the bridge"); return
-    cc_cmd = f"rtl_fm -f {cc_mhz:.4f}M -M fm -s {SMARTNET_RATE} -l 0 -g 40{ppm}{dev} -"
+    cc_cmd = f"rtl_fm -f {cc_mhz:.4f}M -M fm -s {SMARTNET_RATE} -l 0 -g {LISTEN['gain']}{ppm}{dev} -"
 
     class Holder:                           # what the status loop reads (p.sync / p.call like a dsd-fme process)
         sync, sync_at, call, call_at = "", 0.0, "", 0.0
@@ -4216,7 +4398,7 @@ def serve_smartnet(cc_mhz: float, sq: int, gen: int) -> None:
         cur["cc"] = cur["dec"] = None
 
     def start_voice(mhz: float) -> bool:
-        cmd = f"rtl_fm -f {mhz:.4f}M -M fm -s 16000 -r {LISTEN_RATE} -l {sq} -E dc -g 40{ppm}{dev} -"
+        cmd = f"rtl_fm -f {mhz:.4f}M -M fm -s 16000 -r {LISTEN_RATE} -l {sq} -E dc -g {LISTEN['gain']}{ppm}{dev} -"
         v = start_tool(cmd, gen, stdout=subprocess.PIPE, attempts=6)
         cur["voice"] = v if v else None
         return cur["voice"] is not None
@@ -4350,7 +4532,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
         # -v D: dsd-fme's digital high-pass, low-pass and pass-band filters on (default leaves the low-pass off;
         # it takes the vocoder's high-frequency hash out). -g 0: automatic digital output gain, so a quiet
         # talkgroup and a loud one come out at the same level. The :vol field is the analog monitor, not this.
-        d = start_tool(f"dsd-fme {flag}{cmap} -v D -g 0 -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:40:{LISTEN['ppm']}:{bw}:0:2 "
+        d = start_tool(f"dsd-fme {flag}{cmap} -v D -g 0 -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:{LISTEN['gain']}:{LISTEN['ppm']}:{bw}:0:2 "
                        f"-o udp:127.0.0.1:{DSD_UDP_PORT}", gen, attempts=4, watch_sync=True)
         if d is False or d is None:
             stop_tools(procs)
@@ -4376,7 +4558,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
         demod_rate = float(rate_in)
         demod = f"-M fm -s {rate_in}" if mode == "fm" else LISTEN_MODES[mode]
         out_rate = rate_in if pager else LISTEN_RATE
-        cmd = f"rtl_fm -f {mhz:.4f}M {demod} -r {out_rate} -l {sq}{dc} -g 40{ppm}{dev} -"
+        cmd = f"rtl_fm -f {mhz:.4f}M {demod} -r {out_rate} -l {sq}{dc} -g {LISTEN['gain']}{ppm}{dev} -"
         p = start_tool(cmd, gen, stdout=subprocess.PIPE)
         if p is False:
             listen_stop("rtl_fm missing"); listen_status("rtl_fm not found on the Pi (apt install rtl-sdr)"); return
@@ -4424,7 +4606,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
                     # the system; the mute is on the bridge's audio frames)
                     cat = tg_category(tg) if tg else ""
                     muted = (TRUNK.get("tg_lock") and tg and tg != TRUNK["tg_lock"]) or (tg in TRUNK.get("tg_avoid") or set()) \
-                        or (TRUNK.get("cats") and tg and cat and cat not in TRUNK["cats"])
+                        or tg_muted_by_category(tg, cat)
                     LISTEN["mute"] = bool(muted)
                     if muted and "· muted" not in call:
                         call += " · muted"
@@ -4436,6 +4618,8 @@ def _serve_listen(req: tuple, gen: int) -> None:
                                 seen.append((now, tg, tg_named(f"TG {tg}").replace(f"TG {tg} · ", "").replace(f"TG {tg}", ""), enc, cat))
                                 del seen[:-40]
                         listen_status(f"trunked call: {call}")
+                        # one journal line per call: which talkgroup, and whether it was heard or muted
+                        print(f"bridge: listen: call on {mhz:.4f} MHz: {call}", file=sys.stderr)
                     LISTEN["call_at"] = now                     # the system is busy: the idle timer restarts
                 elif LISTEN["call"]:                            # the call ended
                     LISTEN["call"] = ""
@@ -5115,13 +5299,41 @@ def run_peripheral(name: str) -> None:
                 # category filter from the phone's POLICE / FIRE / EMS / OTHER buttons; [] = everything
                 cats = {str(c).lower() for c in (cmd.get("cats") or []) if str(c).lower() in ("police", "fire", "ems", "other")}
                 TRUNK["cats"] = cats
+                # optional, alongside the buttons: what to do with unlisted talkgroups, and where Interop counts
+                if str(cmd.get("unlisted") or "").lower() in ("mute", "play"):
+                    TRUNK["unlisted"] = str(cmd["unlisted"]).lower()
+                if str(cmd.get("interop") or "").lower() in ("other", "police"):
+                    TRUNK["interop"] = str(cmd["interop"]).lower()
+                print("bridge: category filter from the app: " + (" + ".join(sorted(cats)) if cats else "every talkgroup")
+                      + f" (unlisted talkgroups: {TRUNK['unlisted']}, interop counts as {TRUNK['interop']})", file=sys.stderr)
                 listen_status(("hearing " + " + ".join(sorted(cats))) if cats else "hearing every talkgroup")
+            elif str(cmd.get("v") or "") == "radio":
+                # the listening dongle's gain (dB, 0 = automatic) and frequency correction (ppm), live:
+                # the current channel is retuned with the new values
+                try:
+                    if cmd.get("gain") is not None:
+                        LISTEN["gain"] = max(0, min(50, int(cmd["gain"])))
+                    if cmd.get("ppm") is not None:
+                        LISTEN["ppm"] = max(-200, min(200, int(cmd["ppm"])))
+                except (TypeError, ValueError):
+                    pass
+                print(f"bridge: listening dongle: gain {LISTEN['gain'] or 'auto'} dB, correction {LISTEN['ppm']} ppm", file=sys.stderr)
+                listen_status(f"listening radio: gain {LISTEN['gain'] or 'auto'} dB, correction {LISTEN['ppm']} ppm")
+                if LISTEN["req"] is not None and LISTEN["proc"] is not None:
+                    listen_start(LISTEN["mhz"], LISTEN["mode"], LISTEN["sq"], 0.0)
             elif str(cmd.get("v") or "") == "tgavoid":
                 try:
                     TRUNK["tg_avoid"] = {int(t) for t in (cmd.get("tgs") or [])}
                 except (TypeError, ValueError):
                     TRUNK["tg_avoid"] = set()
                 listen_status(f"{len(TRUNK['tg_avoid'])} talkgroup(s) muted" if TRUNK["tg_avoid"] else "no talkgroups muted")
+            elif str(cmd.get("v") or "") == "tgallow":
+                # talkgroups to hear even though the category filter would mute them (Unmute on a muted call)
+                try:
+                    TRUNK["tg_allow"] = {int(t) for t in (cmd.get("tgs") or [])}
+                except (TypeError, ValueError):
+                    TRUNK["tg_allow"] = set()
+                listen_status(f"{len(TRUNK['tg_allow'])} talkgroup(s) always heard" if TRUNK["tg_allow"] else "no talkgroups always heard")
             elif str(cmd.get("v") or "") == "system":
                 # the phone tapped a system in the ranking: lock onto it now
                 try:
@@ -5549,6 +5761,11 @@ def main() -> None:
                          "frequency, read exact_mhz, then ppm = (known - read) / read * 1e6 (typically -20..20)")
     ap.add_argument("--trunk-idle", type=float, default=5.0, metavar="SECONDS",
                     help="Follow leaves a locked trunked system after this long without a call, for the next strongest (default 5)")
+    ap.add_argument("--tg-unlisted", choices=("mute", "play"), default="mute",
+                    help="with POLICE / FIRE / EMS chosen: a talkgroup your export does not list, on a system it covers, "
+                         "is muted (default) or played")
+    ap.add_argument("--tg-interop", choices=("other", "police"), default="other",
+                    help="Interop and Emergency Ops talkgroups count as OTHER (default) or as POLICE")
     ap.add_argument("--trunk-min-db", type=float, default=18.0, metavar="DB",
                     help="only rotate to a system whose control channel is at least this far over the band floor (default 18)")
     ap.add_argument("--moto-band", default="800",
@@ -5568,6 +5785,12 @@ def main() -> None:
                     help="RTL-SDR the phone can listen with (rtl_fm); default: the first --rtl-power dongle pinned with @SERIAL")
     ap.add_argument("--listen-squelch", type=int, default=30,
                     help="rtl_fm squelch while listening (default 30; 0 = never mute, static between transmissions)")
+    ap.add_argument("--listen-gain", type=int, default=40, metavar="DB",
+                    help="tuner gain of the listening dongle, dB (default 40; 0 = automatic). Lower it when strong "
+                         "local signals overload the receiver and digital voice breaks up")
+    ap.add_argument("--listen-ppm", type=int, default=None, metavar="PPM",
+                    help="frequency correction of the listening dongle, parts per million (default: --rtl-ppm). "
+                         "Each dongle has its own error; a TCXO one needs 0")
     ap.add_argument("--rtl-gain", type=int, default=30,
                     help="RTL-SDR tuner gain for rtl_power in dB (default 30; 0 = the dongle's own AGC, which rides out a "
                          "handheld keyed beside it instead of smearing it over 10 MHz)")
@@ -5650,6 +5873,7 @@ def main() -> None:
     globals()["MOTO_BAND"] = a.moto_band
     globals()["PAGER_ANY_BAND"] = a.pager_any_band
     globals()["TRUNK_IDLE_S"] = max(2.0, a.trunk_idle)
+    TRUNK["unlisted"], TRUNK["interop"] = a.tg_unlisted, a.tg_interop
     globals()["TRUNK_HOLD_S"] = max(2.0, a.trunk_idle)
     globals()["TRUNK_MIN_DB"] = a.trunk_min_db
     AUTO["args"] = a
@@ -5708,7 +5932,8 @@ def main() -> None:
             threading.Thread(target=feed_rtl_power, args=(specs, dev, max(3, a.rtl_power_dwell), a.rtl_ppm, a.rtl_gain), daemon=True).start()
         if not a.listen_device:
             a.listen_device = next((d for d in groups if d), "")
-    LISTEN["sq"], LISTEN["ppm"] = a.listen_squelch, a.rtl_ppm
+    LISTEN["sq"], LISTEN["ppm"] = a.listen_squelch, (a.rtl_ppm if a.listen_ppm is None else a.listen_ppm)
+    LISTEN["gain"] = max(0, min(50, a.listen_gain))
     if a.listen_device:
         LISTEN["dev"] = a.listen_device
         CAPS.append("listen")

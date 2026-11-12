@@ -50,6 +50,12 @@ WAVELENS_RTL433=""
 #                                           a plain R820T dongle, not an RTL-SDR Blog V4 unless its own driver is installed
 #   --trunk-idle 5 --trunk-min-db 18        scanner: leave a locked trunked system after 5 s without a call for the
 #                                           next strongest; only systems ≥ 18 dB over the band floor are candidates
+#   --listen-gain 40 --listen-ppm 0         scanner: tuner gain of the listening dongle in dB (0 = automatic; lower it when
+#                                           digital voice breaks up near strong transmitters) and its own frequency
+#                                           correction in ppm (default: --rtl-ppm). Both are on the admin's Settings page
+#   --tg-unlisted mute --tg-interop other   scanner, with POLICE / FIRE / EMS chosen: talkgroups your export does not list on
+#                                           a system it covers are muted (or: play); Interop and Emergency Ops talkgroups
+#                                           count as OTHER (or: police)
 #   --moto-band 800                         Motorola Type II channel plan: 800 | 800r | 800s | 900 | obt:BASE:SPACING:OFFSET
 #   --hackrf-keep-sweeping                  keep the HackRF sweeping during digital voice (default: paused — it costs audio)
 #   --echo                                  every line sent to the phone also in the journal (verbose)
