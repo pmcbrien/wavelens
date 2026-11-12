@@ -3200,6 +3200,7 @@ LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "gain": 40, 
           "pages": False,                   # decode POCSAG/FLEX on analog listens: only when the client asks (Lab)
           "recent": {}, "played": {},      # follow: candidate hits (key → (seen, mhz, mode)); key → when it was left
           "lockout": []}                   # MHz the phone told us never to follow (a pager, a busy repeater)
+RESTART_MIN_S = 10                         # a tool that ran at least this long before quitting is restarted in place
 LOCKOUT_TOL = 0.02                         # a hit within this of a locked-out frequency is the same channel
 
 
@@ -4429,6 +4430,7 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
         except FileNotFoundError:
             return False
         p.err_tail = deque(maxlen=3)
+        p.err_log = deque(maxlen=15)         # more of the same, for the journal when the tool stops by itself
         p.sync, p.sync_at = "", 0.0
         p.call, p.call_at = "", 0.0
         p.voice_at, p.enc_now, p.enc_at = 0.0, False, 0.0
@@ -4442,6 +4444,7 @@ def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
                     continue
                 ln = ANSI_RE.sub("", ln)
                 proc.err_tail.append(ln)
+                proc.err_log.append(ln)
                 if "Explicit Encryption Command" in ln or "ENC LO" in ln:
                     proc.enc_cmds = getattr(proc, "enc_cmds", 0) + 1
                 if re.search(r"(?i)sync:|\bTG\b|ENC|ALG|error|fail|cannot|unable|exit|frequency|ll\+|dropped", ln) \
@@ -5084,9 +5087,24 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 listen_status("listening timed out after 5 min; tap Listen again to continue")
             else:
                 time.sleep(0.2)
-                err = list(getattr(p, "err_tail", []))[-2:]
-                listen_stop(f"{procs[-1].args[0]} exited")
-                listen_status("listening ended: " + (" | ".join(err) or "the decoder exited"))
+                tool = os.path.basename(str(procs[-1].args[0])) if procs else "the tool"
+                ran = time.time() - (LISTEN.get("tuned_at") or time.time())
+                # Why it stopped goes to the journal in full; the phone gets one plain line.
+                log = list(getattr(p, "err_log", None) or getattr(p, "err_tail", []))
+                print(f"bridge: listen: {tool} stopped by itself after {ran:.0f} s on {mhz:.4f} MHz {mode}"
+                      + (" (exit code %s)" % procs[-1].poll() if procs else "")
+                      + "; its last lines: " + (" | ".join(log) or "none"), file=sys.stderr)
+                # A decoder that ran for a while and then quit is restarted where it was: going back to find
+                # the system again costs about 25 s of silence. One that cannot stay up at all (three starts in
+                # a row under RESTART_MIN_S) is stopped, as before, so a broken setup does not spin.
+                LISTEN["quick_exits"] = 0 if ran >= RESTART_MIN_S else LISTEN.get("quick_exits", 0) + 1
+                if LISTEN["quick_exits"] < 3:
+                    listen_status(f"the decoder stopped; restarting on {mhz:.4f} MHz")
+                    listen_resolve(mode, f"{tool} stopped by itself, restarting")
+                else:
+                    LISTEN["quick_exits"] = 0
+                    listen_stop(f"{tool} exited")
+                    listen_status(f"listening ended: the decoder would not stay running on {mhz:.4f} MHz")
         elif LISTEN["req"] is None:
             listen_status("listening stopped; sweep resumes")
 
@@ -5579,7 +5597,9 @@ def run_peripheral(name: str) -> None:
                 print(f"bridge: listening dongle: gain {LISTEN['gain'] or 'auto'} dB, correction {LISTEN['ppm']} ppm", file=sys.stderr)
                 listen_status(f"listening radio: gain {LISTEN['gain'] or 'auto'} dB, correction {LISTEN['ppm']} ppm")
                 if LISTEN["req"] is not None and LISTEN["proc"] is not None:
-                    listen_start(LISTEN["mhz"], LISTEN["mode"], LISTEN["sq"], 0.0)
+                    # listen_resolve, not listen_start: the same channel asked again is only a renewal there,
+                    # and the new gain or correction would wait for the next retune
+                    listen_resolve(LISTEN["mode"], "radio settings changed")
             elif str(cmd.get("v") or "") == "tgavoid":
                 try:
                     TRUNK["tg_avoid"] = {int(t) for t in (cmd.get("tgs") or [])}
