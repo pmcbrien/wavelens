@@ -4506,6 +4506,15 @@ def stop_tools(procs: list) -> None:
     client is gone), and kill what hasn't exited within a second and a half. A tool that lingers keeps the
     dongle, and then neither the sweep nor the next listen can open it (usb_claim_interface -6)."""
     for q in reversed(procs):
+        # A tool fed through a pipe (the pager decoder): close its input first, quietly. Left open, the
+        # pipe's buffer is flushed when Python discards it, after the tool is gone, and every retune put a
+        # "BrokenPipeError ... Exception ignored" traceback in the journal.
+        w = getattr(q, "stdin", None)
+        if w is not None:
+            try:
+                w.close()
+            except Exception:
+                pass
         try:
             q.terminate()
         except Exception:
