@@ -50,9 +50,14 @@ case "${1:-}" in apply|rollback)
         done
         exit "$(cat "$STATE_DIR/update.rc" 2>/dev/null || echo 1)"
     fi
-    exec 9>"$LOCKF"
-    flock -n 9 || die "an update is already running"
-    [ -n "${WAVELENS_UPDATE_REEXEC:-}" ] || exec > >(tee -a "$LOGF") 2>&1   # a re-exec already writes the log
+    # A re-exec (the updater replaced itself and carries on as the new one) already holds the lock on the
+    # inherited fd 9 and already writes the log. Taking the lock again failed: the first run's tee still
+    # has fd 9 open, so the first update after any change to this script died "already running".
+    if [ -z "${WAVELENS_UPDATE_REEXEC:-}" ]; then
+        exec 9>"$LOCKF"
+        flock -n 9 || die "an update is already running"
+        exec > >(tee -a "$LOGF") 2>&1
+    fi
     trap 'echo $? > "$STATE_DIR/update.rc"' EXIT ;;
 esac
 

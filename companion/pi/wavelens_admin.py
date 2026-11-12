@@ -1061,7 +1061,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- plumbing --------------------------------------------------------------------------
     def log_message(self, fmt, *args):   # keep the journal quiet; errors still go through log_error
-        if self.command == "POST":
+        if getattr(self, "command", None) == "POST":   # a request that timed out before it was read has no command
             sys.stderr.write("%s %s\n" % (self.client_address[0], fmt % args))
 
     def send_html(self, body, status=200, cookie=None):
