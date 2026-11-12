@@ -24,6 +24,7 @@ ROWS = (
     '"Home County",22,"A",1536,600,"Home SO 1","D","Patrol 1","Law Dispatch","x"\n'
     '"Home County",22,"A",536,218,"Home FD","D","Fire Dispatch","Fire Dispatch","x"\n'
     '"Home County",22,"A",1040,410,"SE-1","D","Special Events 1","Interop","x"\n'
+    '"Home County",22,"A",1600,640,"Home Tac","DE","Tac","Law Tac","x"\n'
     '"Air Base",33,"A",1700,6a4,"Flight Ops","D","Ops","Military","x"\n'
     '"Metro",55,"A",9,9,"Metro plain","D","d","Law Dispatch","x"\n'
     '"Metro (P25)",56,"A",9,9,"Metro P25","D","d","Law Dispatch","x"\n'
@@ -113,6 +114,22 @@ class TalkgroupSystem(unittest.TestCase):
         b = self.b
         self.follow("unlisted P25 system (NAC 123)")
         self.assertFalse(b.tg_muted_by_category(99999, b.tg_category(99999)))
+
+    def test_calls_outside_the_filter_are_not_followed(self):
+        b = self.b
+        self.follow("Home County (Countywide Simulcast)", "22")
+        self.assertEqual(b.trunk_blocked(851.0125), (536, 1040, 1600))  # fire, interop, always encrypted; never another system's 1700
+        b.TRUNK["tg_allow"], b.TRUNK["tg_avoid"] = {536}, {1538}
+        self.assertEqual(b.trunk_blocked(851.0125), (1538, 1040, 1600))  # Unmute is followed; Ignore is not
+        b.TRUNK["cats"] = set()
+        self.assertEqual(b.trunk_blocked(851.0125), (1538, 1600))       # no filter: what is ignored, and what cannot be heard
+        b.TRUNK.update(cats={"police"}, tg_avoid=set(), tg_lock=1536)
+        self.assertEqual(b.trunk_blocked(851.0125), ())               # Hold decides on its own
+        b.TRUNK["tg_lock"] = 0
+        self.follow("unlisted P25 system (NAC 123)")
+        self.assertEqual(b.trunk_blocked(851.0125), ())               # a system the export does not cover
+        self.assertTrue(b.GRANT_RE.search("SVC [04] CHAN [0485] Group [1400] [skip] Source [706623]"))
+        self.assertTrue(b.GRANT_RE.search("SVC [04] CHAN [0485] Group [1400] Source [706623]"))
 
 
 if __name__ == "__main__":

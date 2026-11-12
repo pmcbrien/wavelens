@@ -2905,7 +2905,7 @@ VOICE_GROUP_RE = re.compile(r"-\s*Group\s+(\d+)\s+Source\s+(\d+)")
 # Every call the site has on the air, from its control channel: a grant ("SVC [04] CHAN [0485] Group [1400]
 # Source [706623]"; service-option bit 0x40 = encrypted) and the running grant updates ("Channel 1 [0369]
 # Group 1 [1402][057A]"). One dongle plays one call, but these say what else is talking, encrypted or not.
-GRANT_RE = re.compile(r"SVC \[([0-9A-Fa-f]{1,2})\]\s*CHAN \[[0-9A-Fa-f]+\]\s*Group \[(\d+)\]\s*Source \[(\d+)\]")
+GRANT_RE = re.compile(r"SVC \[([0-9A-Fa-f]{1,2})\]\s*CHAN \[[0-9A-Fa-f]+\]\s*Group \[(\d+)\][^\n]{0,40}?Source \[(\d+)\]")
 GRANT_UPDATE_RE = re.compile(r"Channel [12] \[[0-9A-Fa-f]+\]\s*Group [12] \[(\d+)\]")
 ACTIVE_CALL_S = 8.0          # a call counts as on the air for this long after the site last named it
 ACTIVE_CALL_MAX = 6          # calls sent to the phone at once
@@ -3376,6 +3376,58 @@ def tg_muted_by_category(tg: int, cat: str) -> bool:
     return TRUNK.get("unlisted", "mute") == "mute" and tg_system_covered()
 
 
+TRUNK_GROUPS_FILE = "/run/wavelens/trunk-groups.csv"
+TRUNK_GROUPS_MAX = 1000     # dsd-fme's group table holds 1023 rows
+TRUNK_GROUPS_MODES = ("trunk", "trunkq")   # P25: the decoder's group numbers are the export's decimals
+
+
+def trunk_blocked(mhz: float) -> tuple:
+    """Talkgroups the decoder is told not to follow on the system whose control channel is mhz: the ones
+    the app ignores, the listed ones the POLICE / FIRE / EMS / OTHER filter mutes, and the ones listed as
+    always encrypted. A receiver follows
+    one call at a time, so a muted call that is followed anyway keeps it off the control channel — and a
+    wanted call that starts meanwhile is missed, or joined late. A scanner skips those calls; so does
+    this. Unlisted talkgroups cannot be listed, so they are still followed and muted by the bridge.
+    Sorted, so the same filter always gives the same tuple (it is compared to decide on a restart)."""
+    out = sorted(int(t) for t in (TRUNK.get("tg_avoid") or set()) if t)
+    cats, allow = TRUNK.get("cats"), TRUNK.get("tg_allow") or set()
+    if RR and RR.talkgroups and not TRUNK.get("tg_lock"):
+        row = (RR.control_at(mhz) or (None, None, None))[2] or RR.site_at(mhz)
+        sid = (row.get("_sid") or "") if row is not None and not rr_doubtful_site(row) else ""
+        system = TRUNK.get("system", "") if abs((LISTEN.get("mhz") or 0.0) - mhz) < 0.001 else ""
+        sid = sid or (trunk_sid() if system else "")
+        if sid in RR.tg_sids or (system and any(rr_same_system(n, system) for n in RR.tg_systems)):
+            have = set(out)
+            for dec in sorted(RR.talkgroups):
+                row = None if dec in have else RR.talkgroup_row(dec, system, sid)
+                if not row:
+                    continue
+                cat = tg_category(dec, system, sid)
+                # Listed as always encrypted (mode "DE" / "TE"; "De" is only sometimes): there is nothing
+                # to hear, and following it holds the receiver for the length of the call. The control
+                # channel still names it and its unit, so it stays in the list of calls on the air.
+                if row[3].strip().endswith("E") or (cats and cat and cat not in cats and dec not in allow):
+                    out.append(dec)
+    return tuple(out[:TRUNK_GROUPS_MAX])
+
+
+def trunk_groups_arg(blocked: tuple) -> str:
+    """dsd-fme's -G option for a block list ("" for none, or when the file cannot be written: the calls
+    are then followed and muted, as before)."""
+    if not blocked:
+        return ""
+    try:
+        os.makedirs(os.path.dirname(TRUNK_GROUPS_FILE), exist_ok=True)
+        with open(TRUNK_GROUPS_FILE + ".tmp", "w") as f:
+            f.write("DEC,Mode(A- Allow; B - Block; DE - Digital Enc),Name of Group,Tag\n")
+            f.writelines(f"{tg},B,skip,x\n" for tg in blocked)
+        os.replace(TRUNK_GROUPS_FILE + ".tmp", TRUNK_GROUPS_FILE)
+    except OSError as e:
+        print(f"bridge: listen: talkgroup skip list not written ({e}); muted calls are followed", file=sys.stderr)
+        return ""
+    return f" -G {shlex.quote(TRUNK_GROUPS_FILE)}"
+
+
 def tg_unknown_muted() -> bool:
     """A call whose talkgroup the decoder has not named yet (the first moment of a call, or a call form it
     does not report): with a category chosen on a system the list covers, it stays silent until it is
@@ -3438,11 +3490,12 @@ def trunk_site_info():
     return info or None
 
 
-def tg_category(tg: int) -> str:
-    """police | fire | ems | other for a talkgroup, from its Tag (then its description) in the talkgroups export."""
+def tg_category(tg: int, system: "str | None" = None, sid: "str | None" = None) -> str:
+    """police | fire | ems | other for a talkgroup, from its Tag (then its description) in the talkgroups export.
+    The system is the one being followed unless one is given."""
     if not RR or not tg:
         return ""                            # unknown: the filter lets it through (an unlisted system would otherwise be silent)
-    hit = RR.talkgroup(tg, TRUNK.get("system", ""), trunk_sid())
+    hit = RR.talkgroup(tg, TRUNK.get("system", "") if system is None else system, trunk_sid() if sid is None else sid)
     if not hit:
         return ""
     alpha, desc, mode, tag = hit
@@ -3806,6 +3859,24 @@ def cc_hunt(first: list) -> None:
             probe = [b for b in probe if any(b[1] <= f < b[2] and not rr_doubtful_site(row) for f, _, row in RR.controls)]
         elif found:
             probe = []
+        now = time.time()
+        if probe and not cancelled() and LISTEN["proc"] is not None and LISTEN["mode"] in TRUNK_MODES and LISTEN["detected"] \
+                and now - LISTEN.get("call_at", 0.0) < TRUNK_PROBE_QUIET_S:
+            # A system is locked and carrying calls. Measuring these bands means taking its dongle: the
+            # decoder dies, half a minute of calls is lost, and a measurement made while the decoder is
+            # being restarted reads as an empty band — which sent the scan off to carriers it had no
+            # reason to try. A scanner does not leave a busy system to look for another one. The system
+            # being followed and what the last hunt heard stand in for the measurement; the bands are
+            # probed when the system has gone quiet, or when there is no lock.
+            for _, lo, hi, label in probe:
+                old = [(r["mhz"], r["lvl"]) for r in (TRUNK.get("ranked") or [])
+                       if lo <= r["mhz"] < hi and now - TRUNK.get("ranked_at", 0.0) < 3 * TRUNK_RANK_TTL_S]
+                if lo <= LISTEN["mhz"] < hi and all(abs(LISTEN["mhz"] - m) > 0.02 for m, _ in old):
+                    old.append((LISTEN["mhz"], 99.0))
+                found += [(m, lvl) for m, lvl in old if all(abs(m - f) > 0.02 for f, _ in found)]
+            print("bridge: control-channel hunt: " + ", ".join(b[3] for b in probe) + f" not measured: {LISTEN['mhz']:.4f} MHz is locked and busy",
+                  file=sys.stderr)
+            probe = []
         if probe and not cancelled():
             # Bands no sweep covers: probe them with rtl_power. This takes the dongle from listening for a
             # few seconds per band.
@@ -3837,8 +3908,20 @@ def cc_hunt(first: list) -> None:
                     break
                 time.sleep(1.0)
             if not rows:
+                # Not measured (the dongle was busy: a decoder restart took it back, or it would not
+                # open). That is not silence: what the last hunt heard here, and the system being
+                # followed now, stay in the ranking — else the scan left a working public-safety lock
+                # to tour whatever steady carriers the other bands had.
+                old = [(r["mhz"], r["lvl"]) for r in (TRUNK.get("ranked") or [])
+                       if lo <= r["mhz"] < hi and time.time() - TRUNK.get("ranked_at", 0.0) < 3 * TRUNK_RANK_TTL_S]
+                if LISTEN["mode"] in TRUNK_MODES and lo <= LISTEN["mhz"] < hi \
+                        and all(abs(LISTEN["mhz"] - m) > 0.02 for m, _ in old):
+                    old.append((LISTEN["mhz"], 99.0))
+                old = [(m, lvl) for m, lvl in old if all(abs(m - f) > 0.02 for f, _ in found)]
+                found += old
                 print(f"bridge: control-channel hunt: {label}: rtl_power gave nothing"
-                      + (": " + err.strip().splitlines()[-1] if err.strip() else ""), file=sys.stderr)
+                      + (": " + err.strip().splitlines()[-1] if err.strip() else "")
+                      + (f"; kept {len(old)} from before" if old else ""), file=sys.stderr)
                 continue
             here = [(m, lvl) for m, lvl in cc_steady(rows) if all(abs(m - f) > 0.02 for f, _ in found)]
             print(f"bridge: control-channel hunt: {label}: {len(rows)} rows, {len(here)} steady"
@@ -4352,9 +4435,10 @@ def listen_start(mhz: float, mode: str, sq: int, tol: float = 0.05) -> None:
         same = (LISTEN["req"] is not None and abs(LISTEN["raw_mhz"] - raw) < 0.0005 and LISTEN["asked"] == mode
                 and LISTEN["sq"] == sq)
         LISTEN["until"] = time.time() + LISTEN_MAX_S
-        if same:
+        dead = LISTEN.get("dead_gen") == LISTEN["gen"]   # its decoder was stopped for a search: asking again starts it
+        if same and not dead:
             return                           # a renewal: just push the deadline out
-        if LISTEN["req"] is not None and abs(LISTEN["mhz"] - mhz) < 0.0005 and LISTEN["asked"] == mode and LISTEN["sq"] == sq:
+        if not dead and LISTEN["req"] is not None and abs(LISTEN["mhz"] - mhz) < 0.0005 and LISTEN["asked"] == mode and LISTEN["sq"] == sq:
             LISTEN["raw_mhz"] = raw          # another reading of the same channel: nothing to retune
             return
         LISTEN["req"] = (mhz, mode, sq)
@@ -4812,7 +4896,12 @@ def _serve_listen(req: tuple, gen: int) -> None:
         # -v D: dsd-fme's digital high-pass, low-pass and pass-band filters on (default leaves the low-pass off;
         # it takes the vocoder's high-frequency hash out). -g 0: automatic digital output gain, so a quiet
         # talkgroup and a loud one come out at the same level. The :vol field is the analog monitor, not this.
-        d = start_tool(f"dsd-fme {flag}{cmap} -v D -g 0 -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:{LISTEN['gain']}:{LISTEN['ppm']}:{bw}:0:2 "
+        blocked = trunk_blocked(mhz) if mode in TRUNK_GROUPS_MODES else ()
+        groups = trunk_groups_arg(blocked)
+        LISTEN["blocked"], LISTEN["blocked_at"] = (blocked if groups else ()), time.time()
+        if groups:
+            print(f"bridge: listen: {len(blocked)} talkgroup(s) outside the filter or always encrypted are not followed", file=sys.stderr)
+        d = start_tool(f"dsd-fme {flag}{cmap}{groups} -v D -g 0 -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:{LISTEN['gain']}:{LISTEN['ppm']}:{bw}:0:2 "
                        f"-o udp:127.0.0.1:{DSD_UDP_PORT}", gen, attempts=4, watch_sync=True)
         if d is False or d is None:
             stop_tools(procs)
@@ -4912,6 +5001,22 @@ def _serve_listen(req: tuple, gen: int) -> None:
                     LISTEN["call"] = ""
                     LISTEN["mute"] = False
                     listen_status(f"on the control channel {mhz:.4f} MHz, waiting for a call")
+                if not active and LISTEN.get("blocked") and LISTEN["detected"] \
+                        and any(now - at < 8.0 for at, _, _ in (getattr(p, "active", None) or {}).values()):
+                    # Calls outside the filter are on the air and are not being followed. The system is
+                    # alive, not idle: the scanner stays on its control channel, where the next wanted
+                    # call is taken the moment it is granted, rather than leaving for another system or
+                    # a conventional channel and paying the seconds it takes to come back.
+                    LISTEN["call_at"] = now
+                if mode in TRUNK_GROUPS_MODES and LISTEN["detected"] and (not active or LISTEN["mute"]) \
+                        and now - LISTEN.get("blocked_at", now) > 20.0:
+                    # The filter (or the system's name, and with it its talkgroup list) changed since the
+                    # decoder started: it is restarted with the new skip list, between wanted calls, and
+                    # at most every 20 s so a filter being tapped through does not restart it each time.
+                    LISTEN["blocked_at"] = now
+                    if trunk_blocked(mhz) != LISTEN.get("blocked", ()):
+                        listen_resolve(mode, "talkgroup filter changed")
+                        break
                 if not LISTEN["detected"] and not active and now - LISTEN["tuned_at"] >= TRUNK_CC_WAIT_S and TRUNK["cc_at"]:
                     TRUNK["cc_at"] = 0.0         # once per candidate
                     cc_forget(mhz)
@@ -5107,7 +5212,13 @@ def _serve_listen(req: tuple, gen: int) -> None:
             print(f"bridge: listen: decode quality on {mhz:.4f} MHz {mode}: {q}", file=sys.stderr)
         if sock is not None:
             sock.close()
-        if ended_itself and LISTEN["req"] is not None and LISTEN["gen"] == gen:
+        if ended_itself and HUNT["on"] and not HUNT["sweeping"] and LISTEN["mode"] in TRUNK_MODES:
+            # The control-channel search took the dongle to measure a band (its rtl_tcp was stopped, so the
+            # decoder quit). Not a fault, and not restarted here: a restart would take the dongle back in
+            # the middle of the measurement. The search tunes the scanner again when it is done.
+            print(f"bridge: listen: decoder on {mhz:.4f} MHz stopped for the control-channel search", file=sys.stderr)
+            LISTEN["dead_gen"] = gen
+        elif ended_itself and LISTEN["req"] is not None and LISTEN["gen"] == gen:
             if time.time() > LISTEN["until"]:
                 listen_status("listening timed out after 5 min; tap Listen again to continue")
             else:
