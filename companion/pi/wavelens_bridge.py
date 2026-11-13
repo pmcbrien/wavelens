@@ -2902,6 +2902,29 @@ def usb_rtl_serials() -> "list[str]":
     return out
 
 
+def usb_rtl_addresses() -> "dict[str, str]":
+    """Serial -> "bus-device" of each RTL-SDR on the bus (sysfs). The device number changes every time the
+    kernel enumerates the dongle, so a dongle that drops off and comes straight back — faster than the
+    10 s hot-plug look can see it leave — shows up here as a new address."""
+    out = {}
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        try:
+            with open(d + "/idVendor") as a, open(d + "/idProduct") as b:
+                if (a.read().strip(), b.read().strip()) not in (("0bda", "2838"), ("0bda", "2832")):
+                    continue
+            with open(d + "/serial") as f, open(d + "/busnum") as bn, open(d + "/devnum") as dn:
+                out[f.read().strip()] = f"{bn.read().strip()}-{dn.read().strip()}"
+        except OSError:
+            continue
+    return out
+
+
+def listen_dongle_reenumerated(before: "dict[str, str]", now: "dict[str, str]", dev: str) -> bool:
+    """True when the listening dongle is on the bus at a different address than a moment ago: it dropped
+    and came back. Whatever had it open (OP25, rtl_tcp) still holds the old handle and gets no samples."""
+    return bool(dev) and dev in before and dev in now and before[dev] != now[dev]
+
+
 def adapt_radios(groups: "dict[str, list[str]]", listen_dev: str, hackrf_wanted: bool) -> "tuple[dict, str]":
     """Fit the configured plan to the radios actually present. The config names dongles by serial; when one
     is missing (unplugged, swapped, a V4 that fell off the bus) its job moves to a dongle that is here —
@@ -4703,13 +4726,32 @@ def op25_files(mhz: float, mode: str, blocked: tuple) -> str:
     return tsv
 
 
+OP25_STALL_S = 20.0
+
+
+def op25_stalled(heard_at: float, call_at: float, now: float) -> bool:
+    """OP25 had been decoding (heard_at set) and has shown nothing — no new control-channel message and no
+    call — for OP25_STALL_S. Never true before it first decoded: start-up has its own timeout."""
+    return heard_at > 0.0 and now - max(heard_at, call_at or 0.0) > OP25_STALL_S
+
+
 def op25_poll(proc, gen: int) -> None:
     """Ask OP25's HTTP terminal twice a second what is on the air; keep the fields the trunk loop reads."""
     url = f"http://127.0.0.1:{OP25_HTTP_PORT}/"
     body = json.dumps([{"command": "update", "arg1": 0, "arg2": 0}]).encode()
     tsbks0 = None
+    heard_at = 0.0                            # last time OP25 showed life: control messages counting up, or a call
     while proc.poll() is None and LISTEN["gen"] == gen:
         time.sleep(0.5)
+        if op25_stalled(heard_at, getattr(proc, "call_at", 0.0), time.time()):
+            # It was decoding, and now nothing: no control-channel messages and no call for OP25_STALL_S.
+            # A live P25 control channel sends several messages a second, so this is a dongle that stopped
+            # delivering samples (a USB drop OP25 does not notice), not a quiet system. Restart it.
+            print(f"bridge: listen: OP25 silent for {OP25_STALL_S:.0f} s on {LISTEN['mhz']:.4f} MHz "
+                  f"(no control channel, no call); restarting it", file=sys.stderr)
+            heard_at = 0.0
+            listen_resolve(LISTEN["mode"], "OP25 stopped decoding")
+            return
         try:
             req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=2) as r:       # noqa: S310 - localhost
@@ -4732,6 +4774,7 @@ def op25_poll(proc, gen: int) -> None:
                 tgid, freq = m.get("tgid"), float(m.get("freq") or 0.0)
         if tsbks is not None:
             if tsbks0 is not None and tsbks > tsbks0:
+                heard_at = now
                 proc.sync, proc.sync_at, proc.ctrl_at = "P25p1", now, now
                 proc.alive_at = getattr(proc, "alive_at", 0.0) or now
             tsbks0 = tsbks
@@ -5801,11 +5844,25 @@ def hotplug_watch() -> None:
     is listening becomes the listening/sweep dongle; a HackRF that appears starts sweeping; something that
     vanishes is said once (the hardware line on the phone shows it too). Serials never matter: the plan
     is redone from what is present."""
+    addr = usb_rtl_addresses()
+    tick = 0
     while True:
-        time.sleep(10)
+        time.sleep(2)
+        tick += 1
         try:
-            hotplug_step(set(usb_rtl_serials()), hackrf_on_usb())
-            usb_rescue(time.time())
+            # Every 2 s: did the listening dongle drop and come back? (A brief USB drop re-enumerates it in
+            # about a second; the decoder keeps the dead handle and the scanner goes silent until restarted.)
+            now = usb_rtl_addresses()
+            dev = LISTEN.get("dev") or ""
+            if listen_dongle_reenumerated(addr, now, dev):
+                print(f"bridge: hotplug: listening dongle {dev} dropped off USB and came back "
+                      f"({addr[dev]} -> {now[dev]}); restarting the decoder on it", file=sys.stderr)
+                if LISTEN["req"] is not None:
+                    listen_resolve(LISTEN["mode"], "the listening dongle reconnected")
+            addr = now
+            if tick % 5 == 0:
+                hotplug_step(set(now), hackrf_on_usb())
+                usb_rescue(time.time())
         except Exception as e:
             print(f"bridge: hotplug: {e}", file=sys.stderr)
 
