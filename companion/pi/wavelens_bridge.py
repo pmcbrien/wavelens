@@ -3528,21 +3528,34 @@ def trunk_blocked(mhz: float) -> tuple:
     return tuple(out[:TRUNK_GROUPS_MAX])
 
 
-def trunk_groups_arg(blocked: tuple) -> str:
-    """dsd-fme's -G option for a block list ("" for none, or when the file cannot be written: the calls
-    are then followed and muted, as before)."""
-    if not blocked:
+def trunk_groups_arg(blocked: tuple, held: int = 0) -> str:
+    """dsd-fme's -G option: a block list, or — with a talkgroup held — an allow list of that one talkgroup
+    used as a whitelist (-W), so the decoder only ever tunes to the held talkgroup's calls and is on the
+    control channel the moment it is granted. "" for none, or when the file cannot be written: the calls
+    are then followed and muted, as before."""
+    if not blocked and not held:
         return ""
     try:
         os.makedirs(os.path.dirname(TRUNK_GROUPS_FILE), exist_ok=True)
         with open(TRUNK_GROUPS_FILE + ".tmp", "w") as f:
             f.write("DEC,Mode(A- Allow; B - Block; DE - Digital Enc),Name of Group,Tag\n")
-            f.writelines(f"{tg},B,skip,x\n" for tg in blocked)
+            if held:
+                f.write(f"{held},A,hold,x\n")
+            else:
+                f.writelines(f"{tg},B,skip,x\n" for tg in blocked)
         os.replace(TRUNK_GROUPS_FILE + ".tmp", TRUNK_GROUPS_FILE)
     except OSError as e:
-        print(f"bridge: listen: talkgroup skip list not written ({e}); muted calls are followed", file=sys.stderr)
+        print(f"bridge: listen: talkgroup list not written ({e}); muted calls are followed", file=sys.stderr)
         return ""
-    return f" -G {shlex.quote(TRUNK_GROUPS_FILE)}"
+    return f" -G {shlex.quote(TRUNK_GROUPS_FILE)}" + (" -W" if held else "")
+
+
+def trunk_held() -> int:
+    """The talkgroup the app holds (HOLD TG), or 0."""
+    try:
+        return int(TRUNK.get("tg_lock") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def tg_unknown_muted() -> bool:
@@ -4709,17 +4722,22 @@ def op25_wanted(mode: str) -> bool:
     return time.time() >= OP25["benched_until"]
 
 
-def op25_files(mhz: float, mode: str, blocked: tuple) -> str:
-    """trunk.tsv for this control channel (and the skip list as OP25's blacklist); returns its path."""
+def op25_files(mhz: float, mode: str, blocked: tuple, held: int = 0) -> str:
+    """trunk.tsv for this control channel (the skip list as OP25's blacklist, or a held talkgroup as its
+    whitelist, so OP25 follows only that talkgroup's calls); returns its path."""
     os.makedirs(OP25_DIR, exist_ok=True)
     black = os.path.join(OP25_DIR, "blacklist.tsv")
     with open(black + ".tmp", "w") as f:
         f.writelines(f"{tg}\n" for tg in blocked)
     os.replace(black + ".tmp", black)
+    white = os.path.join(OP25_DIR, "whitelist.tsv")
+    with open(white + ".tmp", "w") as f:
+        f.write(f"{held}\n" if held else "")
+    os.replace(white + ".tmp", white)
     tsv = os.path.join(OP25_DIR, "trunk.tsv")
     cols = ["Sysname", "Control Channel List", "Offset", "NAC", "Modulation", "TGID Tags File", "Whitelist", "Blacklist",
             "Center Frequency"]
-    vals = ["Wavelens", f"{mhz:.5f}", "0", "0", OP25_MODES[mode], "", "", black if blocked else "", ""]
+    vals = ["Wavelens", f"{mhz:.5f}", "0", "0", OP25_MODES[mode], "", white if held else "", black if blocked and not held else "", ""]
     with open(tsv + ".tmp", "w") as f:
         f.write("\t".join(f'"{c}"' for c in cols) + "\n" + "\t".join(f'"{v}"' for v in vals) + "\n")
     os.replace(tsv + ".tmp", tsv)
@@ -4802,11 +4820,11 @@ def op25_poll(proc, gen: int) -> None:
             proc.voice_mhz = freq / 1e6 if freq > 1e6 else freq
 
 
-def start_op25(mhz: float, mode: str, gen: int, blocked: tuple):
+def start_op25(mhz: float, mode: str, gen: int, blocked: tuple, held: int = 0):
     """OP25's rx.py on the listening dongle, following the system on this control channel. The process (with
     the same fields start_tool gives dsd-fme), or None when it does not come up (the caller uses dsd-fme)."""
     try:
-        tsv = op25_files(mhz, mode, blocked)
+        tsv = op25_files(mhz, mode, blocked, held)
     except OSError as e:
         print(f"bridge: listen: OP25 files not written ({e}); using dsd-fme", file=sys.stderr)
         return None
@@ -5197,6 +5215,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
     if mode in DIGITAL_MODES and op25_wanted(mode):
         kill_strays()
         blocked = trunk_blocked(mhz) if mode in TRUNK_GROUPS_MODES else ()
+        held = trunk_held() if mode in TRUNK_GROUPS_MODES else 0
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
@@ -5204,14 +5223,16 @@ def _serve_listen(req: tuple, gen: int) -> None:
             pass
         sock.bind(("127.0.0.1", OP25_UDP_PORT))
         sock.settimeout(0.5)
-        op25 = start_op25(mhz, mode, gen, blocked)
+        op25 = start_op25(mhz, mode, gen, blocked, held)
         if op25 is None:
             sock.close()
             sock = None
             if LISTEN["gen"] != gen:
                 return
         else:
-            LISTEN["blocked"], LISTEN["blocked_at"] = blocked, time.time()
+            LISTEN["blocked"], LISTEN["held"], LISTEN["blocked_at"] = blocked, held, time.time()
+            if held:
+                print(f"bridge: listen: holding TG {held}: OP25 follows only its calls", file=sys.stderr)
             if blocked:
                 print(f"bridge: listen: {len(blocked)} talkgroup(s) outside the filter or always encrypted are not followed", file=sys.stderr)
             procs.append(op25)
@@ -5253,9 +5274,12 @@ def _serve_listen(req: tuple, gen: int) -> None:
         # it takes the vocoder's high-frequency hash out). -g 0: automatic digital output gain, so a quiet
         # talkgroup and a loud one come out at the same level. The :vol field is the analog monitor, not this.
         blocked = trunk_blocked(mhz) if mode in TRUNK_GROUPS_MODES else ()
-        groups = trunk_groups_arg(blocked)
-        LISTEN["blocked"], LISTEN["blocked_at"] = (blocked if groups else ()), time.time()
-        if groups:
+        held = trunk_held() if mode in TRUNK_GROUPS_MODES else 0
+        groups = trunk_groups_arg(blocked, held)
+        LISTEN["blocked"], LISTEN["held"], LISTEN["blocked_at"] = (blocked if groups else ()), (held if groups else 0), time.time()
+        if groups and held:
+            print(f"bridge: listen: holding TG {held}: dsd-fme follows only its calls", file=sys.stderr)
+        elif groups:
             print(f"bridge: listen: {len(blocked)} talkgroup(s) outside the filter or always encrypted are not followed", file=sys.stderr)
         d = start_tool(f"dsd-fme {flag}{cmap}{groups} -v D -g 0 -i rtltcp:127.0.0.1:{RTL_TCP_PORT}:{mhz:.4f}M:{LISTEN['gain']}:{LISTEN['ppm']}:{bw}:0:2 "
                        f"-o udp:127.0.0.1:{DSD_UDP_PORT}", gen, attempts=4, watch_sync=True)
@@ -5370,7 +5394,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
                     # decoder started: it is restarted with the new skip list, between wanted calls, and
                     # at most every 20 s so a filter being tapped through does not restart it each time.
                     LISTEN["blocked_at"] = now
-                    if trunk_blocked(mhz) != LISTEN.get("blocked", ()):
+                    if trunk_blocked(mhz) != LISTEN.get("blocked", ()) or trunk_held() != LISTEN.get("held", 0):
                         listen_resolve(mode, "talkgroup filter changed")
                         break
                 if not LISTEN["detected"] and not active and now - LISTEN["tuned_at"] >= TRUNK_CC_WAIT_S and TRUNK["cc_at"]:
@@ -6164,6 +6188,11 @@ def run_peripheral(name: str) -> None:
                 except (TypeError, ValueError):
                     TRUNK["tg_lock"] = 0
                 listen_status(f"talkgroup lock: {tg_named('TG %d' % TRUNK['tg_lock'])} only" if TRUNK["tg_lock"] else "talkgroup lock off")
+                # The decoder is told which talkgroups to follow when it starts: restart it now, so a hold
+                # takes effect at once (it used to wait for the 20 s filter check, and meanwhile followed —
+                # and sat on — other talkgroups' calls).
+                if LISTEN["req"] is not None and LISTEN["mode"] in TRUNK_GROUPS_MODES and trunk_held() != LISTEN.get("held", 0):
+                    listen_resolve(LISTEN["mode"], "talkgroup hold " + ("on" if TRUNK["tg_lock"] else "off"))
             elif str(cmd.get("v") or "") == "cats":
                 # category filter from the phone's POLICE / FIRE / EMS / OTHER buttons; [] = everything
                 cats = {str(c).lower() for c in (cmd.get("cats") or []) if str(c).lower() in ("police", "fire", "ems", "other")}

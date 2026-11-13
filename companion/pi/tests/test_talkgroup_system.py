@@ -131,6 +131,27 @@ class TalkgroupSystem(unittest.TestCase):
         self.assertTrue(b.GRANT_RE.search("SVC [04] CHAN [0485] Group [1400] [skip] Source [706623]"))
         self.assertTrue(b.GRANT_RE.search("SVC [04] CHAN [0485] Group [1400] Source [706623]"))
 
+    def test_hold_tells_the_decoder(self):
+        b = self.b
+        import tempfile
+        d = tempfile.mkdtemp()
+        b.TRUNK_GROUPS_FILE = os.path.join(d, "groups.csv")
+        arg = b.trunk_groups_arg((536, 1040), 1536)
+        self.assertTrue(arg.endswith(" -W"))
+        self.assertIn("1536,A,hold", open(b.TRUNK_GROUPS_FILE).read())
+        self.assertNotIn("536,B", open(b.TRUNK_GROUPS_FILE).read())
+        arg = b.trunk_groups_arg((536,), 0)
+        self.assertFalse(arg.endswith(" -W"))
+        self.assertIn("536,B,skip", open(b.TRUNK_GROUPS_FILE).read())
+        b.OP25_DIR = d
+        tsv = open(b.op25_files(851.0125, "trunk", (536,), 1536)).read()
+        self.assertIn("whitelist.tsv", tsv)
+        self.assertNotIn("blacklist.tsv", tsv)
+        self.assertEqual(open(os.path.join(d, "whitelist.tsv")).read().strip(), "1536")
+        tsv = open(b.op25_files(851.0125, "trunk", (536,), 0)).read()
+        self.assertIn("blacklist.tsv", tsv)
+        self.assertNotIn("whitelist.tsv", tsv)
+
 
 if __name__ == "__main__":
     unittest.main()
