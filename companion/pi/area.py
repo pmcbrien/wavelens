@@ -392,6 +392,14 @@ def apply(area: dict, index: dict, base: str = "", area_dir: str = "", area_file
         log(f"  wrote {fcc}: {area['licences']} licensed frequencies")
     area["data_built"] = index.get("built") or ""
     area["updated"] = time.strftime("%Y-%m-%d %H:%M")
+    old = read_area(area_file)
+    for k in ("follow",):                 # owner switches survive a new area
+        if k in old and k not in area:
+            area[k] = old[k]
+    try:
+        area["fcc_bytes"] = os.path.getsize(fcc) if os.path.exists(fcc) else 0
+    except OSError:
+        area["fcc_bytes"] = 0
     write_json_atomic(area_file or AREA_FILE, area)
     return area
 
@@ -459,6 +467,20 @@ def cmd_status(a) -> int:
     return 0
 
 
+def cmd_follow(a) -> int:
+    """Follow me: the bridge moves the area to where the phone is (it must share its position) when it has
+    travelled out of the middle of the current one. The switch is kept in the area file."""
+    area = read_area()
+    if not area:
+        log("no area set: set one first (wavelens-area set US 49749), then turn follow on")
+        return 1
+    if a.state in ("on", "off"):
+        area["follow"] = a.state == "on"
+        write_json_atomic(AREA_FILE, area)
+    log(f"follow me is {'on' if area.get('follow') else 'off'}")
+    return 0
+
+
 def cmd_clear(a) -> int:
     for p in (AREA_FILE, os.path.join(AREA_DIR, "fcc-local.json")):
         if os.path.exists(p):
@@ -488,6 +510,9 @@ def main(argv=None) -> int:
     t = sub.add_parser("status", help="what is set and what the bridge will load")
     t.add_argument("--json", action="store_true")
     t.set_defaults(fn=cmd_status)
+    fl = sub.add_parser("follow", help="move the area with the phone's position: on, off, or no word to show")
+    fl.add_argument("state", nargs="?", choices=["on", "off"])
+    fl.set_defaults(fn=cmd_follow)
     c = sub.add_parser("clear", help="forget the area")
     c.add_argument("--no-restart", action="store_true")
     c.set_defaults(fn=cmd_clear)

@@ -237,12 +237,27 @@ def admin_check_password(password):
         return False
 
 
-class Sessions:
-    """In-memory session table: token -> {expires, csrf, flash}. Lost on restart (fine: log in again)."""
+SESSIONS_FILE = "/run/wavelens/admin-sessions.json"   # root-only, tmpfs: survives an admin restart, not a reboot
 
-    def __init__(self):
+
+class Sessions:
+    """Session table: token -> {expires, csrf, flash}. Kept in a root-only file on tmpfs as well, so the restart
+    an update does part-way through doesn't log the owner out of the page that is showing its progress."""
+
+    def __init__(self, path=None):
         self.lock = threading.Lock()
+        self.path = path
         self.table = {}
+        if path:
+            try:
+                st = os.lstat(path)
+                if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077:
+                    with open(path) as f:
+                        now = time.time()
+                        self.table = {k: {"expires": float(v["expires"]), "csrf": str(v["csrf"]), "flash": None}
+                                      for k, v in json.load(f).items() if float(v["expires"]) > now}
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                self.table = {}
         self.fails = collections.defaultdict(list)   # ip -> [timestamps of failed logins]
         self.setup = {}   # first-run setup form: cookie token -> {expires, csrf}; never a login session
 
@@ -251,7 +266,22 @@ class Sessions:
         with self.lock:
             self.table[tok] = {"expires": time.time() + SESSION_TTL,
                                "csrf": secrets.token_urlsafe(24), "flash": None}
+            self._save()
         return tok
+
+    def _save(self):
+        """Under self.lock. Best effort: a failed write only means a log-in after the next restart."""
+        if not self.path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            tmp = self.path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump({k: {"expires": v["expires"], "csrf": v["csrf"]} for k, v in self.table.items()}, f)
+            os.replace(tmp, self.path)
+        except OSError:
+            pass
 
     def get(self, tok):
         if not tok:
@@ -284,10 +314,12 @@ class Sessions:
     def drop(self, tok):
         with self.lock:
             self.table.pop(tok, None)
+            self._save()
 
     def drop_all(self):
         with self.lock:
             self.table.clear()
+            self._save()
 
     def login_begin(self, ip):
         """Check the rate limit and count this attempt as a failure in one step, under the lock: checking first
@@ -312,7 +344,7 @@ class Sessions:
                 pass
 
 
-SESSIONS = Sessions()
+SESSIONS = Sessions(SESSIONS_FILE if os.geteuid() == 0 else None)
 
 
 # --------------------------------------------------------------------------------------------
@@ -573,6 +605,7 @@ class Job:
         self.title = ""
         self.exit = None
         self.seq = 0   # bumps on every start so pollers can tell a new run from the old
+        self.started = 0.0
 
     def start(self, title, argv, timeout=1800, on_kill=None):
         """on_kill: called after the job had to be killed for running too long (e.g. undo what its own
@@ -581,6 +614,7 @@ class Job:
             if self.running:
                 return False
             self.running, self.title, self.exit = True, title, None
+            self.started = time.time()
             self.seq += 1
             self.lines.clear()
             self.lines.append(f"$ {shlex.join(argv)}")
@@ -632,7 +666,7 @@ class Job:
     def snapshot(self):
         with self.lock:
             return {"running": self.running, "title": self.title, "exit": self.exit,
-                    "seq": self.seq, "lines": list(self.lines)}
+                    "seq": self.seq, "started": self.started, "lines": list(self.lines)}
 
 
 UPDATE_JOB = Job("update")
@@ -912,8 +946,502 @@ def update_log_snapshot():
     running = update_running()
     result = (read_json(UPDATE_JSON) or {}).get("last_result") or ""
     failed = any(w in result for w in ("failed", "did not start", "would not start", "could not", "not running"))
-    return {"running": running, "title": "update", "seq": snap["seq"],
+    started = 0.0
+    m = re.match(r"update: (apply|rollback) started (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", lines[0])
+    if m:
+        try:
+            started = time.mktime(time.strptime(m.group(2), "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            pass
+    return {"running": running, "title": m.group(1) if m else "update", "seq": snap["seq"], "started": started,
             "exit": None if running else (1 if failed else 0), "lines": lines}
+
+
+def update_status_json():
+    """/api/update/log: the progress lines plus what the Update page's header shows."""
+    snap = update_log_snapshot()
+    u = read_json(UPDATE_JSON) or {}
+    snap.update(now=time.time(), installed=u.get("installed") or installed_version(), available=u.get("available"),
+                last_result=u.get("last_result") or "", checked_at=u.get("checked_at"),
+                can_rollback=os.path.isdir(PREV_DIR), prev=read_text(os.path.join(PREV_DIR, "VERSION")).strip())
+    return snap
+
+
+# --------------------------------------------------------------------------------------------
+# What is plugged in and how the Pi itself is doing: the Status page's diagram, the Diagnostics page
+# and the support report. Read from sysfs, /proc and vcgencmd; nothing here opens a radio, so the
+# bridge is never disturbed.
+# --------------------------------------------------------------------------------------------
+USB_KINDS = {   # (vendor, product or "*") -> (kind, label)
+    ("0bda", "2838"): ("rtl", "RTL-SDR"), ("0bda", "2832"): ("rtl", "RTL-SDR"),
+    ("1d50", "6089"): ("hackrf", "HackRF One"), ("1d50", "cc15"): ("hackrf", "HackRF (rad1o)"),
+    ("10c4", "ea60"): ("esp32", "ESP32 (CP210x serial)"), ("1a86", "7523"): ("esp32", "ESP32 (CH340 serial)"),
+    ("1a86", "55d4"): ("esp32", "ESP32 (CH9102 serial)"), ("303a", "*"): ("esp32", "ESP32 (native USB)"),
+    ("0403", "6001"): ("serial", "FTDI serial"), ("0403", "6015"): ("serial", "FTDI serial"),
+    ("1546", "*"): ("gps", "u-blox GPS"), ("067b", "2303"): ("gps", "PL2303 serial / GPS"),
+    ("0bda", "8179"): ("wifi", "Realtek Wi-Fi"), ("0bda", "8812"): ("wifi", "Realtek Wi-Fi"),
+    ("0e8d", "7961"): ("wifi", "MediaTek Wi-Fi"), ("148f", "*"): ("wifi", "Ralink / MediaTek Wi-Fi"),
+}
+_CACHE = {}
+
+
+def cached(key, ttl, fn):
+    """fn() at most once every ttl seconds (the Status page polls; nmcli and vcgencmd are not free)."""
+    hit = _CACHE.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    _CACHE[key] = (time.time(), val)
+    return val
+
+
+def _sys(path, default=""):
+    return read_text(path, default).strip()
+
+
+def vcgencmd(*args):
+    if not shutil.which("vcgencmd"):
+        return None
+    rc, out = run(["vcgencmd", *args], timeout=5)
+    return out if rc == 0 else None
+
+
+THROTTLE_BITS = [(0, "under-voltage now"), (1, "CPU speed capped now"), (2, "throttled now"), (3, "temperature limit now"),
+                 (16, "under-voltage since boot"), (17, "speed capped since boot"), (18, "throttled since boot"),
+                 (19, "temperature limit since boot")]
+
+
+def throttled():
+    """{'raw', 'flags': [...], 'now': bool, 'ever': bool} or None when vcgencmd is not there."""
+    out = vcgencmd("get_throttled")
+    if not out or "=" not in out:
+        return None
+    try:
+        v = int(out.split("=", 1)[1], 16)
+    except ValueError:
+        return None
+    flags = [t for b, t in THROTTLE_BITS if v >> b & 1]
+    return {"raw": f"0x{v:x}", "flags": flags, "now": bool(v & 0xF), "ever": bool(v & 0xF0000),
+            "undervolt": bool(v & 0x10001)}
+
+
+def power_rails():
+    """Voltages and currents. A Pi 5 reports every rail of its PMIC (pmic_read_adc); older Pis only the core."""
+    rails = {}
+    out = vcgencmd("pmic_read_adc") or ""
+    for line in out.splitlines():
+        m = re.match(r"\s*(\S+)\s+(volt|current)\(\d+\)=([\d.]+)", line)
+        if m:
+            rails.setdefault(m.group(1).rsplit("_", 1)[0], {})["V" if m.group(2) == "volt" else "A"] = float(m.group(3))
+    if not rails:
+        for part in ("core", "sdram_c", "sdram_i", "sdram_p"):
+            o = vcgencmd("measure_volts", part) or ""
+            m = re.search(r"([\d.]+)V", o)
+            if m:
+                rails[part.upper()] = {"V": float(m.group(1))}
+    return rails
+
+
+def psu_max_ma():
+    """The supply's current limit a Pi 5 negotiated (5000 with the official 27 W supply), or None."""
+    try:
+        with open("/proc/device-tree/chosen/power/max_current", "rb") as f:
+            b = f.read(4)
+        return int.from_bytes(b, "big") if len(b) == 4 else None
+    except OSError:
+        return None
+
+
+def meminfo():
+    d = {}
+    for line in read_text("/proc/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        try:
+            d[k] = int(v.split()[0]) * 1024
+        except (ValueError, IndexError):
+            pass
+    return d
+
+
+def cpu_percent():
+    """Whole-CPU busy % over ~0.2 s."""
+    def snap():
+        try:
+            f = [int(x) for x in read_text("/proc/stat").splitlines()[0].split()[1:]]
+            return sum(f), f[3] + (f[4] if len(f) > 4 else 0)
+        except (ValueError, IndexError):
+            return 0, 0
+    t0, i0 = snap()
+    time.sleep(0.2)
+    t1, i1 = snap()
+    return round(100.0 * (1 - (i1 - i0) / (t1 - t0)), 1) if t1 > t0 else None
+
+
+def top_processes(n=6):
+    rc, out = run(["ps", "-eo", "pid,pcpu,pmem,rss,comm", "--sort=-pcpu", "--no-headers"], timeout=5)
+    rows = []
+    for line in out.splitlines()[:n]:
+        p = line.split(None, 4)
+        if len(p) == 5:
+            rows.append({"pid": p[0], "cpu": p[1], "mem": p[2], "rss_mb": round(int(p[3]) / 1024, 1) if p[3].isdigit() else 0,
+                         "name": p[4]})
+    return rows
+
+
+def system_facts():
+    m = meminfo()
+    try:
+        temp = int(_sys("/sys/class/thermal/thermal_zone0/temp")) / 1000
+    except ValueError:
+        temp = None
+    fan = None
+    for f in glob.glob("/sys/devices/platform/cooling_fan/hwmon/*/fan1_input"):
+        try:
+            fan = int(_sys(f, "0"))
+        except ValueError:
+            pass
+    try:
+        cur = int(_sys("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq", "0")) // 1000
+        mx = int(_sys("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", "0")) // 1000
+    except ValueError:
+        cur = mx = 0
+    try:
+        du = shutil.disk_usage("/")
+        disk = {"free": du.free, "total": du.total}
+    except OSError:
+        disk = {}
+    _, root = run(["findmnt", "-n", "-o", "SOURCE,OPTIONS", "/"], timeout=5)
+    try:
+        load = os.getloadavg()
+    except OSError:
+        load = (0, 0, 0)
+    return {"model": _sys("/proc/device-tree/model").rstrip("\x00") or "Linux computer",
+            "cores": os.cpu_count() or 1, "load": [round(x, 2) for x in load], "cpu_pct": cpu_percent(),
+            "mhz": cur, "mhz_max": mx, "temp": temp, "fan_rpm": fan,
+            "mem_total": m.get("MemTotal", 0), "mem_avail": m.get("MemAvailable", 0),
+            "swap_total": m.get("SwapTotal", 0), "swap_free": m.get("SwapFree", 0),
+            "disk": disk, "root": root.split()[0] if root else "", "root_ro": bool(root) and "ro" in root.split()[-1].split(","),
+            "uptime": float((read_text("/proc/uptime", "0").split() or ["0"])[0]),
+            "os": next((l.split("=", 1)[1].strip('"') for l in read_text("/etc/os-release").splitlines()
+                        if l.startswith("PRETTY_NAME=")), ""),
+            "kernel": os.uname().release, "python": sys.version.split()[0],
+            "throttled": throttled(), "rails": power_rails(), "psu_ma": psu_max_ma()}
+
+
+def usb_devices():
+    """Every USB device but the root hubs: bus/port address, ids, names, speed, the power it asked for, its tty."""
+    out = []
+    for d in sorted(glob.glob("/sys/bus/usb/devices/*")):
+        name = os.path.basename(d)
+        if not re.match(r"^\d+-[\d.]+$", name):
+            continue                                   # root hubs (usb1) and interfaces (1-1:1.0)
+        vid, pid = _sys(d + "/idVendor"), _sys(d + "/idProduct")
+        if not vid:
+            continue
+        kind, label = USB_KINDS.get((vid, pid)) or USB_KINDS.get((vid, "*")) or (
+            ("hub", "USB hub") if _sys(d + "/bDeviceClass") == "09" else ("other", ""))
+        ttys = sorted({os.path.basename(t) for t in glob.glob(d + "/*/tty*") + glob.glob(d + "/*/tty/tty*")
+                       if os.path.basename(t).startswith("tty") and os.path.basename(t) != "tty"})
+        try:
+            ma = int(re.sub(r"\D", "", _sys(d + "/bMaxPower", "0")) or 0)
+        except ValueError:
+            ma = 0
+        drv = ""
+        for i in glob.glob(d + f"/{name}:*/driver"):
+            drv = os.path.basename(os.path.realpath(i))
+            break
+        out.append({"port": name, "bus": _sys(d + "/busnum"), "dev": _sys(d + "/devnum"), "id": f"{vid}:{pid}",
+                    "kind": kind, "label": label, "maker": _sys(d + "/manufacturer"), "product": _sys(d + "/product"),
+                    "serial": _sys(d + "/serial"), "speed": _sys(d + "/speed"), "ma": ma, "tty": ttys, "driver": drv})
+    return out
+
+
+def bluetooth_info():
+    out = {"present": bool(glob.glob("/sys/class/bluetooth/hci*")), "addr": "", "powered": None, "name": ""}
+    if not out["present"] or not shutil.which("bluetoothctl"):
+        return out
+    _, txt = run(["bluetoothctl", "show"], timeout=5)
+    m = re.search(r"Controller ([0-9A-F:]{17})", txt)
+    out["addr"] = m.group(1) if m else ""
+    m = re.search(r"Powered: (yes|no)", txt)
+    out["powered"] = (m.group(1) == "yes") if m else None
+    m = re.search(r"\n\s*Alias: (.+)", txt)
+    out["name"] = m.group(1).strip() if m else ""
+    return out
+
+
+def network_info():
+    nets = []
+    _, js = run(["ip", "-j", "addr"], timeout=5)
+    try:
+        addrs = json.loads(js or "[]")
+    except ValueError:
+        addrs = []
+    for a in addrs:
+        n = a.get("ifname", "")
+        if n == "lo" or n.startswith(("docker", "veth", "br-")):
+            continue
+        nets.append({"name": n, "mac": a.get("address", ""), "up": a.get("operstate") == "UP",
+                     "ipv4": [x["local"] for x in a.get("addr_info", []) if x.get("family") == "inet"],
+                     "wifi": os.path.isdir(f"/sys/class/net/{n}/wireless")})
+    _, w = run(["nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL,FREQ,DEVICE", "dev", "wifi"], timeout=8)
+    for line in w.splitlines():
+        p = line.replace("\\:", "\x00").split(":")
+        if len(p) >= 5 and p[0] == "yes":
+            for n in nets:
+                if n["name"] == p[4]:
+                    n.update(ssid=p[1].replace("\x00", ":"), signal=int(p[2]) if p[2].isdigit() else None, freq=p[3])
+    return nets
+
+
+def radio_roles(st):
+    """serial -> role, from the bridge's status file (newer bridges), else parsed from its hardware line."""
+    roles = {}
+    for r in ((st.get("hw") or {}).get("rtl") or []):
+        roles[r.get("serial") or ""] = r.get("role") or ""
+    if not roles:
+        m = re.search(r"RTL-SDR \(([^)]*)\)", st.get("hw_line") or "")
+        for part in (m.group(1).split(", ") if m else []):
+            sn, _, role = part.rpartition(": ")
+            roles[sn] = role
+    return roles
+
+
+ROLE_WORDS = {"sweep": "scanning the bands", "listen": "listening (audio)", "sensors": "sensor decoder (rtl_433)",
+              "free": "idle", "busy": "in use", "dump1090": "ADS-B (dump1090)", "readsb": "ADS-B (readsb)"}
+
+
+def devices_snapshot():
+    """Everything the Status diagram draws, in one JSON-able dict."""
+    st = read_json(STATUS_JSON) or {}
+    sysf = cached("sys", 4, system_facts)
+    usb = cached("usb", 4, usb_devices)
+    roles = radio_roles(st)
+    spot = {s.get("id") or "": s for s in (st.get("spotters") or [])}
+    spot_list = list(spot.values())
+    for u in usb:
+        if u["kind"] == "rtl":
+            r = roles.get(u["serial"], "")
+            u["role"] = ROLE_WORDS.get(r, r) or "not used by the scanner"
+        elif u["kind"] == "esp32":
+            s = spot.get(u["serial"]) or spot.get(u["port"]) or next(
+                (x for x in spot_list if x.get("u") and (x["u"] == u["port"] or x["u"] in u["tty"])), None)
+            if s:
+                u["role"] = f"Spotter {s.get('name') or ''} · {s.get('role_label') or s.get('msg') or ''}".strip()
+                u["ok"] = bool(s.get("ok"))
+                u["ver"] = s.get("ver") or ""
+    psu = sysf.get("psu_ma")
+    # a Pi 5 gives its USB ports 600 mA in all unless the supply said it can do 5 A (or usb_max_current_enable=1)
+    usb_limit = None
+    if psu is not None:
+        usb_limit = 1600 if psu >= 5000 or "usb_max_current_enable=1" in (vcgencmd("get_config", "usb_max_current_enable") or "") else 600
+    return {"at": int(time.time()), "host": hostname(), "version": installed_version(), "sys": sysf, "usb": usb,
+            "usb_ma": sum(u["ma"] for u in usb if u["kind"] != "hub"), "usb_limit_ma": usb_limit,
+            "bt": cached("bt", 15, bluetooth_info), "net": cached("net", 10, network_info),
+            "bridge": {"state": unit_state(BRIDGE_UNIT)[0], "linked": status_linked(st) if st else False,
+                       "name": st.get("name") or "", "code": st.get("code") or "", "fw": st.get("fw") or "",
+                       "missing": st.get("hw_missing") or [], "at": st.get("at")}}
+
+
+# ---- diagnostics: each check is (id, title, level ok|warn|bad|info, what it found, what to do)
+def _check(cid, title, level, found, fix=""):
+    return {"id": cid, "title": title, "level": level, "found": found, "fix": fix}
+
+
+def gb(n):
+    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB"
+
+
+def bridge_rtl_opened():
+    """How many RTL-SDRs the bridge said it found at its last start (its "auto: … N RTL-SDR(s)" line)."""
+    _, out = run(["journalctl", "-u", BRIDGE_UNIT, "-b", "--no-pager", "-o", "cat", "-n", "20000"], timeout=15)
+    found = re.findall(r"auto: HackRF .*?(\d+) RTL-SDR\(s\)", out)
+    return int(found[-1]) if found else None
+
+
+def kernel_events():
+    """Problems the kernel logged this boot: USB devices dropping off, SD card errors, out-of-memory kills."""
+    _, out = run(["journalctl", "-k", "-b", "--no-pager", "-o", "short-monotonic", "-n", "4000"], timeout=15)
+    ev = {"usb_drop": [], "mmc": [], "oom": [], "voltage": []}
+    for l in out.splitlines():
+        if "USB disconnect" in l:
+            ev["usb_drop"].append(l)
+        elif re.search(r"mmc\d.*(error|timeout)|I/O error|EXT4-fs error", l):
+            ev["mmc"].append(l)
+        elif "Out of memory" in l or "oom-kill" in l:
+            ev["oom"].append(l)
+        elif "Undervoltage" in l or "under-voltage" in l.lower():
+            ev["voltage"].append(l)
+    return ev
+
+
+def internet_ok():
+    try:
+        req = urllib.request.Request("https://github.com/", method="HEAD", headers={"User-Agent": "wavelens-admin"})
+        with urllib.request.urlopen(req, timeout=8):   # noqa: S310 - fixed https URL
+            return True, ""
+    except Exception as e:  # noqa: BLE001
+        return False, str(getattr(e, "reason", e))[:120]
+
+
+def run_diagnostics(deep=False):
+    """The Diagnostics page's checks, worst first. deep=True adds the slow ones (internet reachability)."""
+    snap = devices_snapshot()
+    s, st = snap["sys"], read_json(STATUS_JSON) or {}
+    checks = []
+    h = bridge_health()
+    checks.append(_check("bridge", "Scanner software", "ok" if h["ok"] else "bad",
+                         f"running ({unit_state(BRIDGE_UNIT)[1] or 'just started'})" if h["ok"] else h["title"],
+                         "" if h["ok"] else re.sub(r"<[^>]+>", "", h["fix"])))
+    t = s.get("throttled")
+    if t is None:
+        checks.append(_check("power", "Power supply", "info", "this computer doesn't report its power"))
+    elif t["undervolt"]:
+        checks.append(_check("power", "Power supply", "bad", "under-voltage " + ("right now" if t["now"] else "since boot")
+                             + f" ({t['raw']})", "Use a stronger supply and a short, thick cable: 5 V / 5 A for a Pi 5, "
+                             "5 V / 3 A for a Pi 4. Radio dongles drop out when the voltage sags; software can't fix it."))
+    elif t["flags"]:
+        checks.append(_check("power", "Power and heat", "warn", ", ".join(t["flags"]), "Usually heat: give the Pi a fan or a heatsink case."))
+    else:
+        v = (s.get("rails") or {}).get("EXT5V", {}).get("V")
+        checks.append(_check("power", "Power supply", "ok", "no under-voltage since boot" + (f" · input {v:.2f} V" if v else "")))
+    if snap.get("usb_limit_ma") and snap["usb_ma"] > snap["usb_limit_ma"]:
+        checks.append(_check("usbpower", "USB power budget", "warn",
+                             f"devices ask for {snap['usb_ma']} mA, the Pi allows {snap['usb_limit_ma']} mA on its USB ports",
+                             "Use the official 27 W (5 V / 5 A) supply, or a powered USB hub for the dongles."))
+    temp = s.get("temp")
+    if temp is not None:
+        lvl = "bad" if temp >= 80 else "warn" if temp >= 70 else "ok"
+        checks.append(_check("temp", "CPU temperature", lvl, f"{temp:.1f} °C" + (f" · fan {s['fan_rpm']} rpm" if s.get("fan_rpm") else ""),
+                             "" if lvl == "ok" else "Above 80 °C the Pi slows itself down. Add a fan, keep it out of direct sun."))
+    cpu = s.get("cpu_pct")
+    load1 = s["load"][0] if s.get("load") else 0
+    lvl = "warn" if load1 > s["cores"] * 1.5 else "ok"
+    checks.append(_check("cpu", "CPU", lvl, f"{cpu if cpu is not None else '?'} % busy · load {load1} on {s['cores']} cores · "
+                         f"{s.get('mhz')} of {s.get('mhz_max')} MHz",
+                         "" if lvl == "ok" else "Something is using a lot of CPU: see the busiest programs below."))
+    if s.get("mem_total"):
+        pct = 100 * (1 - s["mem_avail"] / s["mem_total"])
+        lvl = "bad" if pct > 92 else "warn" if pct > 80 else "ok"
+        checks.append(_check("mem", "Memory", lvl, f"{pct:.0f} % used · {gb(s['mem_avail'])} free of {gb(s['mem_total'])}"
+                             + (f" · swap {gb(s['swap_total'] - s['swap_free'])} used" if s.get("swap_total") else ""),
+                             "" if lvl == "ok" else "Restart the scanner; if it climbs again, send a support log."))
+    d = s.get("disk") or {}
+    if d:
+        lvl = "bad" if d["free"] < 0.5e9 else "warn" if d["free"] < 2e9 else "ok"
+        checks.append(_check("disk", "Storage", lvl, f"{gb(d['free'])} free of {gb(d['total'])} on {s.get('root') or '/'}",
+                             "" if lvl == "ok" else "Free space: delete old files, or use a bigger card. Updates need about 200 MB."))
+    if s.get("root_ro"):
+        checks.append(_check("ro", "Storage", "bad", "the card is mounted read-only", "The SD card has errors: back up your settings and replace it."))
+    ev = cached("kev", 30, kernel_events)
+    if ev["mmc"]:
+        checks.append(_check("mmc", "SD card", "bad", f"{len(ev['mmc'])} card errors this boot", "Replace the SD card soon."))
+    if ev["oom"]:
+        checks.append(_check("oom", "Memory", "bad", f"a program was killed for lack of memory ({len(ev['oom'])}×)", "Restart the scanner and send a support log."))
+    rtls = [u for u in snap["usb"] if u["kind"] == "rtl"]
+    opened = bridge_rtl_opened()
+    if not rtls:
+        checks.append(_check("radios", "Radios", "bad", "no RTL-SDR on the USB bus", "Plug the dongles in (straight into the Pi, or a powered hub)."))
+    elif opened is not None and opened < len(rtls):
+        checks.append(_check("radios", "Radios", "warn", f"{len(rtls)} RTL-SDR on USB, the scanner opened {opened} at its last start",
+                             "Restart the scanner. If one still won't open, check the power first, then reboot."))
+    else:
+        checks.append(_check("radios", "Radios", "ok", f"{len(rtls)} RTL-SDR on USB" + (f", all {opened} opened" if opened else "")))
+    drops = [l for l in ev["usb_drop"]]
+    if drops:
+        checks.append(_check("usbdrop", "USB dropouts", "warn" if len(drops) < 5 else "bad",
+                             f"{len(drops)} USB device disconnect(s) this boot", "Loose cable, or not enough power. Check the Power line above."))
+    _, mods = run(["lsmod"], timeout=5)
+    if re.search(r"^dvb_usb_rtl28xxu\b", mods, re.M):
+        checks.append(_check("dvb", "TV tuner driver", "warn", "the kernel's DVB-T driver is loaded and can take a dongle",
+                             "Reboot (it is blocked from the next start)."))
+    for m in snap["bridge"]["missing"]:
+        checks.append(_check("hw", "Hardware", "warn", m))
+    bt = snap["bt"]
+    if not bt["present"]:
+        checks.append(_check("bt", "Bluetooth", "bad", "no Bluetooth adapter", "Reboot. The phone needs Bluetooth to connect."))
+    elif bt["powered"] is False:
+        checks.append(_check("bt", "Bluetooth", "bad", "adapter is off", "Reboot."))
+    else:
+        checks.append(_check("bt", "Bluetooth", "ok", f"adapter {bt['addr'] or 'on'}" +
+                             (" · phone connected" if snap["bridge"]["linked"] else " · no phone connected")))
+    wifi = next((n for n in snap["net"] if n.get("ssid")), None)
+    if wifi:
+        sig = wifi.get("signal")
+        checks.append(_check("wifi", "Wi-Fi", "warn" if sig is not None and sig < 35 else "ok",
+                             f"{wifi['ssid']} · signal {sig if sig is not None else '?'} % · {', '.join(wifi['ipv4']) or 'no address'}",
+                             "Weak signal: move the Pi closer to the router." if sig is not None and sig < 35 else ""))
+    elif any(n["up"] and n["ipv4"] for n in snap["net"]):
+        checks.append(_check("wifi", "Network", "ok", "wired: " + ", ".join(ip for n in snap["net"] for ip in n["ipv4"])))
+    else:
+        checks.append(_check("wifi", "Network", "info", "not on a network (fine in a car)", "Updates and area downloads need Wi-Fi."))
+    if deep:
+        ok, why = internet_ok()
+        checks.append(_check("internet", "Internet (for updates)", "ok" if ok else "warn",
+                             "GitHub reachable" if ok else f"GitHub not reachable ({why})",
+                             "" if ok else "Updates and area downloads won't work until the Pi is online."))
+    _, ntp = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"], timeout=5)
+    if ntp.strip() == "no":
+        checks.append(_check("clock", "Clock", "info", "not synchronised (no network time yet)", "Times in logs may be off until the Pi is online."))
+    a = read_json(AREA_FILE) or {}
+    if a.get("country"):
+        checks.append(_check("area", "Area", "ok", f"{a.get('country')} {a.get('postcode') or ''} · {a.get('licences', 0)} licensed frequencies"
+                             + (" · follow me on" if a.get("follow") else "")))
+    else:
+        checks.append(_check("area", "Area", "warn", "no area set: carriers are named by band only", "Set it on the Area page."))
+    if not shutil.which("dsd-fme"):
+        checks.append(_check("dsd", "Digital voice", "info", "dsd-fme is not installed: P25 / DMR calls can't be heard",
+                             "Ask support, or run companion/pi/install-dsd.sh."))
+    else:
+        checks.append(_check("dsd", "Digital voice", "ok", "dsd-fme installed"))
+    uj = read_json(UPDATE_JSON) or {}
+    if uj.get("available"):
+        checks.append(_check("update", "Software", "warn", f"update {uj['available']} is available (installed {installed_version()})", "Install it on the Update page."))
+    else:
+        checks.append(_check("update", "Software", "ok", f"{installed_version()}" + (f" · {uj.get('last_result')}" if uj.get("last_result") else "")))
+    for p in (st.get("problems") or [])[:4]:
+        checks.append(_check("data", "Local data", "warn", p))
+    order = {"bad": 0, "warn": 1, "info": 2, "ok": 3}
+    checks.sort(key=lambda c: order[c["level"]])
+    return {"at": int(time.time()), "checks": checks, "snap": snap, "top": top_processes(),
+            "events": {k: v[-5:] for k, v in ev.items()},
+            "summary": {k: sum(1 for c in checks if c["level"] == k) for k in order}}
+
+
+def support_report():
+    """Plain text for support: the checks, the hardware and the last bridge lines. No passwords, no Wi-Fi keys."""
+    d = run_diagnostics(deep=True)
+    out = [f"Wavelens support report · {time.strftime('%Y-%m-%d %H:%M:%S')} · {d['snap']['host']} · v{d['snap']['version']}", ""]
+    for c in d["checks"]:
+        out.append(f"[{c['level'].upper():4}] {c['title']}: {c['found']}" + (f"  → {c['fix']}" if c["fix"] else ""))
+    s = d["snap"]["sys"]
+    out += ["", f"{s['model']} · {s['os']} · kernel {s['kernel']} · Python {s['python']}",
+            "rails: " + ", ".join(k + "".join(f" {v[u]:.3f}{u}" for u in ("V", "A") if u in v) for k, v in s["rails"].items()),
+            f"supply limit: {s.get('psu_ma')} mA · USB asks {d['snap']['usb_ma']} mA of {d['snap']['usb_limit_ma']}", "", "USB:"]
+    for u in d["snap"]["usb"]:
+        out.append(f"  {u['port']:8} bus {u['bus']} dev {u['dev']} {u['id']} {u['label'] or u['product']} "
+                   f"sn={u['serial'] or '-'} {u['speed']} Mb/s {u['ma']} mA {' '.join(u['tty'])} {u.get('role', '')}")
+    out += ["", "Busiest programs:"] + [f"  {p['cpu']:>5}% cpu {p['rss_mb']:>7} MB {p['name']}" for p in d["top"]]
+    out += ["", "Kernel events this boot:"] + [f"  {l}" for v in d["events"].values() for l in v]
+    out += ["", "Bridge log (last 400 lines):"] + journal_lines(400)
+    return "\n".join(out) + "\n"
+
+
+def recent_events(n=10):
+    """The bridge's important lines lately, for the Status page: radios, area, updates, errors."""
+    keep = re.compile(r"auto: |advertising as|area|RadioReference overlay|FCC pack loaded|hardware|update|error|Error|"
+                      r"Traceback|left out|connected|disconnected", re.I)
+    return [l for l in journal_lines(600) if keep.search(l)][-n:]
+
+
+def update_history(n=10):
+    out = []
+    for line in read_text("/var/lib/wavelens/update-history.jsonl").splitlines()[-n:]:
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            pass
+    return list(reversed(out))
 
 
 # --------------------------------------------------------------------------------------------
@@ -946,9 +1474,28 @@ td.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,Consolas
 .pill{display:inline-block;padding:1px 8px;border:1px solid var(--line);border-radius:999px;font-size:12px;color:var(--mut)}.pill.lock{border-color:var(--bad);color:var(--bad)}
 .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0 14px}.check{display:flex;align-items:center;gap:8px;color:var(--fg);font-size:16px}
 .check input{width:20px;height:20px}.row.end{align-items:flex-end}.row.end>div{flex:1 1 140px}
+.spill{display:inline-flex;align-items:center;gap:6px;padding:4px 12px;border-radius:999px;border:1px solid var(--line);font-size:14px;font-weight:600}
+.spill.okp{border-color:var(--ok);color:var(--ok)}.spill.warnp{border-color:var(--acc);color:var(--acc)}.spill.badp{border-color:var(--bad);color:var(--bad)}
+.spill.act{border-color:#7fb2ff;color:#7fb2ff}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;animation:sp 0.8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+ol.steps{list-style:none;padding:0;margin:12px 0}ol.steps li{display:flex;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid var(--line)}
+ol.steps .mk{display:inline-flex;width:24px;height:24px;border-radius:50%;align-items:center;justify-content:center;border:1px solid var(--line);flex:none;font-size:13px}
+ol.steps .done .mk{background:var(--ok);border-color:var(--ok);color:#111}ol.steps .fail .mk{background:var(--bad);border-color:var(--bad);color:#111}
+ol.steps .act{color:#7fb2ff;font-weight:600}ol.steps .act .mk{border-color:#7fb2ff}ol.steps .todo,ol.steps .skip{color:var(--mut)}ol.steps .skip{text-decoration:line-through}
+.res{padding:12px 14px;border-radius:8px;margin-top:10px}.res.ok{background:#16281e;border:1px solid var(--ok)}.res.warn{background:#2a2f1a;border:1px solid var(--acc)}
+.res.bad{background:#2d1d1d;border:1px solid var(--bad)}
+#diagram{width:100%;min-height:200px}#diagram svg{width:100%;height:auto;display:block;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+ul.checks{list-style:none;padding:0;margin:0}ul.checks li{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--line)}
+ul.checks .ic{flex:none;width:22px;height:22px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#111}
+ul.checks .ok .ic{background:var(--ok)}ul.checks .warn .ic{background:var(--acc)}ul.checks .bad .ic{background:var(--bad)}ul.checks .info .ic{background:#7fb2ff}
+.meter{height:8px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:4px}.meter b{display:block;height:100%;background:var(--ok)}
+.meter b.w{background:var(--acc)}.meter b.x{background:var(--bad)}
+.stat{font-size:22px;font-weight:700}.small{font-size:13px}
+.tbl{overflow-x:auto}.tbl table{font-size:13px;min-width:560px}.tbl th{width:auto}
 """
 
-NAV = [("/", "Status"), ("/logs", "Logs"), ("/settings", "Settings"), ("/area", "Area"), ("/frequencies", "Frequencies"), ("/update", "Update"),
+NAV = [("/", "Status"), ("/diagnostics", "Diagnostics"), ("/logs", "Logs"), ("/settings", "Settings"), ("/area", "Area"), ("/frequencies", "Frequencies"), ("/update", "Update"),
        ("/wifi", "Wi-Fi"), ("/spotter", "Spotter"), ("/power", "Power"), ("/account", "Account")]
 
 
@@ -995,6 +1542,245 @@ POLL_JS = """
     }).catch(function(){});
   }
   tick(); setInterval(tick,2000); if(noise) noise.addEventListener('change',function(){last='';tick();});
+})();
+</script>"""
+
+
+
+UPDATE_JS = """
+<script>
+(function(){
+  var STEPS={
+    apply:[['fetch','Check GitHub for the new version',/checking GitHub|updating \\S+ -> /],
+           ['save','Save the working version to fall back to',/runs well before saving|saved a copy|keeping the saved copy/],
+           ['install','Download and install the new files',/unpacking|installing the new files|updater changed/],
+           ['verify','Check it loads on this Pi',/loads on this Pi/],
+           ['fw','Spotter firmware for the USB flasher',/Spotter firmware/],
+           ['restart','Restart the scanner',/restarting the scanner/],
+           ['health','Confirm the scanner is running',/waiting for the scanner/],
+           ['done','Finished',/done: .* is running|already on |is ahead of the published/]],
+    rollback:[['restore','Put the saved version back',/putting the saved version/],
+              ['health','Confirm the scanner is running',/waiting for the scanner/],
+              ['done','Finished',/rolled back to/]],
+    check:[['fetch','Ask GitHub for the latest version',/checking GitHub|wavelens-update check/],
+           ['done','Compare with this Pi',/installed .* available|up to date|is ahead of the published/]]};
+  var u=window.UPD, base=0, seen=0, fails=0, $=function(i){return document.getElementById(i);};
+  function action(j){
+    var l=(j.lines||[]).join('\\n');
+    if(/wavelens-update rollback|rollback started/.test(l)||j.title==='rollback') return 'rollback';
+    if(/wavelens-update check/.test(l)||j.title==='check') return 'check';
+    return 'apply';
+  }
+  function clean(l){return l.replace(/^update: /,'').replace(/^\\$ .*/,'');}
+  function fmt(s){s=Math.max(0,Math.round(s));return (s>=60?Math.floor(s/60)+' min ':'')+(s%60)+' s';}
+  function upto(lines, steps){ var last=-1; lines.forEach(function(l){ steps.forEach(function(s,k){ if(s[2].test(l)&&k>last) last=k; }); }); return last; }
+  function render(j){
+    var lines=j.lines||[], act=action(j), all=lines.join('\\n');
+    var ended=!j.running && j.exit!==null && j.exit!==undefined;
+    var good=ended && (j.exit===0 || (act==='check' && j.exit===10));
+    var items=[], rb=-1;
+    lines.forEach(function(l,i){ if(rb<0 && act==='apply' && /putting the saved version back/.test(l)) rb=i; });
+    function add(steps, last, failLast){
+      steps.forEach(function(s,k){
+        var c = k<last ? 'done' : k===last ? (ended ? (failLast?'fail':(good?'done':'fail')) : (failLast?'fail':'act')) : (ended?'skip':'todo');
+        items.push([c, s[1]]);
+      });
+    }
+    if(rb>=0){
+      var before=STEPS.apply.slice(0, Math.max(1, upto(lines.slice(0,rb), STEPS.apply)+1));
+      add(before, before.length-1, true);
+      var after=lines.slice(rb), back=/rolled back to/.test(after.join('\\n')), alive=/rolled back to .*the bridge is running/.test(after.join('\\n'));
+      items.push([back||ended?'done':'act', 'Put the saved version back']);
+      items.push([alive?'done':(back||ended)?'fail':(/waiting for the scanner/.test(after.join('\\n'))?'act':'todo'), 'Confirm the saved version is running']);
+    } else if(lines.length){
+      var st=STEPS[act], last=upto(lines, st);
+      if(good) last=st.length-1;
+      add(st, Math.max(last,0), false);
+    }
+    var mk={done:'✓',fail:'✕',act:'<span class="spin"></span>',todo:'○',skip:'–'};
+    $('steps').innerHTML=items.length?items.map(function(it){return '<li class="'+it[0]+'"><span class="mk">'+mk[it[0]]+'</span>'+it[1]+'</li>';}).join('')
+      :'<li class="mut">Nothing running. Start a check or an install above.</li>';
+    var msg=''; for(var i=lines.length-1;i>=0;i--){ var c=clean(lines[i]); if(c && !/^done \\(exit|^failed \\(exit/.test(c)){msg=c;break;} }
+    $('now').textContent=j.running&&msg?('Now: '+msg):'';
+    var out=$('out'); if(out.textContent!==all){out.textContent=all;out.scrollTop=out.scrollHeight;}
+    base=j.started?(j.now-j.started):0; seen=Date.now();
+    $('elapsed').textContent=j.started&&lines.length?(j.running?'running for ':'took ')+fmt(base):'';
+    var r=$('result');
+    if(ended && lines.length){
+      var kind=rb>=0?'warn':(good?'ok':'bad'), text=act==='check'?msg:(j.last_result||msg);
+      r.className='res '+kind; r.style.display='block';
+      r.innerHTML='<b>'+{ok:'✓',warn:'↺',bad:'✕'}[kind]+'</b> '+esc(text)+
+        (kind==='warn'?'<div class="note">The scanner is back on the version that worked. Nothing else needs doing; a fix usually follows in the next update.</div>':'')+
+        (kind==='bad'?'<div class="note">Open <a href="/diagnostics">Diagnostics</a>, download the support report and send it to wavelensapp@gmail.com.</div>':'');
+    } else r.style.display='none';
+    var pill=$('upill');
+    if(j.running){pill.className='spill act';pill.innerHTML='<span class="spin"></span> '+({apply:'Updating…',rollback:'Rolling back…',check:'Checking…'})[act];}
+    else if(j.available){pill.className='spill warnp';pill.textContent='Update '+j.available+' available';}
+    else if(ended && !good){pill.className='spill badp';pill.textContent=rb>=0?'Last update was put back':'Last action failed';}
+    else if(ended && rb>=0){pill.className='spill warnp';pill.textContent='Last update was put back';}
+    else {pill.className='spill okp';pill.textContent='Up to date';}
+    $('vinst').innerHTML='<b>'+esc(j.installed||'')+'</b>'+(j.prev?' <span class="mut">(saved fallback: '+esc(j.prev)+')</span>':'');
+    $('vavail').innerHTML=j.available?'<b class="ok">'+esc(j.available)+'</b>':'<span class="mut">none — up to date</span>';
+    $('vlast').textContent=j.last_result||'—';
+    document.querySelectorAll('#uform button').forEach(function(b){ if(b.value!=='rollback'||j.can_rollback) b.disabled=!!j.running; });
+  }
+  function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+  var timer=null, running=false;
+  function tick(){
+    fetch('/api/update/log',{credentials:'same-origin',cache:'no-store'}).then(function(r){
+      var ct=r.headers.get('content-type')||'';
+      if(ct.indexOf('json')<0) throw 'login';
+      return r.json();
+    }).then(function(j){ fails=0; $('conn').style.display='none'; running=j.running; render(j); })
+    .catch(function(e){
+      fails++; var c=$('conn'); c.style.display='block';
+      if(e==='login') c.innerHTML='Your login ended. <a href="/login">Log in again</a> to keep watching — the update carries on regardless.';
+      else c.textContent=(running?'The admin page is restarting with the new version (normal near the end of an update). Reconnecting… ':'Can\\'t reach the Pi. Retrying… ')+(fails>1?'('+fails+')':'');
+    }).then(function(){ clearTimeout(timer); timer=setTimeout(tick, running||fails?1000:4000); });
+  }
+  setInterval(function(){ if(running && base){ $('elapsed').textContent='running for '+fmt(base+(Date.now()-seen)/1000); }},1000);
+  render(u); running=u.running; tick();
+})();
+</script>"""
+
+
+DIAGRAM_JS = r"""
+<script>
+(function(){
+  var NS='http://www.w3.org/2000/svg';
+  function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+  function gbs(n){return n>=1e9?(n/1e9).toFixed(1)+' GB':(n/1e6).toFixed(0)+' MB';}
+  function clip(t,n){t=String(t||'');return t.length>n?t.slice(0,n-1)+'…':t;}
+  var COL={ok:'#5fd38d',warn:'#f2b705',bad:'#ff6b6b',off:'#5a6270',info:'#7fb2ff'};
+  function speedLabel(sp){sp=+sp||0;return sp>=10000?'USB 3.2':sp>=5000?'USB 3':sp>=480?'USB 2.0':sp>=12?'USB 1.1':'USB';}
+  function rail(d,k){return d.sys.rails&&d.sys.rails[k]?d.sys.rails[k]:null;}
+  function nodes(d){
+    var s=d.sys, L=[], R=[], t=s.throttled;
+    var ext=rail(d,'EXT5V'), core=rail(d,'VDD_CORE')||rail(d,'CORE');
+    var pst=t?(t.undervolt?'bad':(t.flags.length?'warn':'ok')):'info';
+    var pl=[];
+    if(ext&&ext.V) pl.push('Input '+ext.V.toFixed(2)+' V');
+    if(s.psu_ma) pl.push('Supply limit '+(s.psu_ma/1000).toFixed(1)+' A');
+    if(d.usb_limit_ma) pl.push('USB asks '+d.usb_ma+' of '+d.usb_limit_ma+' mA'); else if(d.usb_ma) pl.push('USB asks '+d.usb_ma+' mA');
+    pl.push(t?(t.flags.length?t.flags[0]:'No under-voltage since boot'):'Not reported');
+    if(d.usb_limit_ma && d.usb_ma>d.usb_limit_ma && pst==='ok') pst='warn';
+    L.push({t:'Power supply',l:pl,st:pst,edge:'5 V'+(ext&&ext.A?' · '+ext.A.toFixed(2)+' A':''),icon:'⚡'});
+    var b=d.bridge, bt=d.bt;
+    L.push({t:'Phone (Wavelens app)',icon:'📱',st:b.linked?'ok':'off',dash:!b.linked,
+            l:[b.linked?'Connected':'Not connected',b.name?'Radio name '+b.name:'',b.code?'Pair code '+b.code:'',bt.addr?'Pi BT '+bt.addr:(bt.present?'':'No Bluetooth adapter')],
+            edge:'Bluetooth LE'});
+    (d.net||[]).forEach(function(n){
+      if(!n.up && !n.wifi) return;
+      var w=n.wifi, ghz=n.freq?(parseInt(n.freq)>=5000?' 5 GHz':' 2.4 GHz'):'';
+      L.push({t:(w?'Wi-Fi ':'Ethernet ')+n.name,icon:w?'📶':'🔌',st:n.ipv4.length?((n.signal!=null&&n.signal<35)?'warn':'ok'):'off',dash:!n.ipv4.length,
+              l:[w?(n.ssid?n.ssid+(n.signal!=null?' · '+n.signal+' %':''):'Not connected'):(n.up?'Link up':'No cable'),n.ipv4.join(', ')||'No address','MAC '+n.mac],
+              edge:w?'Wi-Fi'+ghz:'Ethernet'});
+    });
+    (d.usb||[]).filter(function(u){return u.kind!=='hub';}).forEach(function(u){
+      var st=u.kind==='rtl'?(/not used|idle/.test(u.role||'')?'warn':'ok'):u.kind==='esp32'?(u.ok===false?'warn':'ok'):'info';
+      R.push({t:(u.label||u.product||u.id),icon:{rtl:'📡',hackrf:'📡',esp32:'🛰',gps:'🧭',wifi:'📶'}[u.kind]||'🔧',st:st,
+              l:[u.role||u.product||'',u.serial?'Serial '+u.serial:'', 'Port '+u.port+' · bus '+u.bus+' dev '+u.dev,
+                 (u.speed?u.speed+' Mb/s · ':'')+u.ma+' mA'+(u.tty.length?' · /dev/'+u.tty.join(' /dev/'):''), u.ver?'Firmware '+u.ver:''],
+              edge:speedLabel(u.speed)+' · '+u.port, full:u});
+    });
+    if(!R.length) R.push({t:'No USB radios',icon:'⚠',st:'bad',dash:true,l:['Plug the RTL-SDR dongles in'],edge:'USB'});
+    var tmp=s.temp, memu=s.mem_total?100*(1-s.mem_avail/s.mem_total):0;
+    var pist=(t&&t.undervolt)||tmp>=80?'bad':(tmp>=70||(t&&t.flags.length)||memu>90?'warn':'ok');
+    var pi={t:clip((s.model||'Pi').replace(/ Model ([A-Z]) Rev [\d.]+$/,' $1').replace(/ Rev [\d.]+$/,''),30),icon:'',st:pist,big:true,
+      l:[d.host+'.local','Wavelens v'+d.version,'Scanner '+(b.state==='active'?'running':b.state),
+         'CPU '+(s.cpu_pct!=null?s.cpu_pct+' %':'?')+' · '+(s.mhz||'?')+' MHz',
+         'Temp '+(tmp!=null?tmp.toFixed(1)+' °C':'?')+(s.fan_rpm?' · fan '+s.fan_rpm+' rpm':''),
+         'RAM '+memu.toFixed(0)+' % of '+gbs(s.mem_total),
+         s.disk&&s.disk.total?'Disk '+gbs(s.disk.free)+' free':'',
+         core&&core.V?'Core '+core.V.toFixed(3)+' V':'',
+         'Up '+Math.floor(s.uptime/86400)+' d '+Math.floor(s.uptime%86400/3600)+' h']};
+    [pi].concat(L,R).forEach(function(n){n.l=n.l.filter(function(x){return x;});});
+    return {L:L,R:R,pi:pi};
+  }
+  function el(tag,a,parent){var e=document.createElementNS(NS,tag);for(var k in a)e.setAttribute(k,a[k]);if(parent)parent.appendChild(e);return e;}
+  function box(svg,n,x,y,w){
+    var h=34+n.l.length*16, g=el('g',{},svg), c=COL[n.st]||COL.off;
+    var tt=el('title',{},g); tt.textContent=n.t+'\n'+n.l.join('\n');
+    el('rect',{x:x,y:y,width:w,height:h,rx:10,fill:'#171b21',stroke:c,'stroke-width':n.big?2.5:1.5,'stroke-dasharray':n.dash?'5 4':''},g);
+    el('rect',{x:x,y:y,width:6,height:h,rx:3,fill:c},g);
+    var tx=el('text',{x:x+16,y:y+21,fill:'#e6e8eb','font-size':n.big?15:13,'font-weight':700},g);
+    tx.textContent=(n.icon?n.icon+' ':'')+clip(n.t,n.big?28:30);
+    var dot=el('circle',{cx:x+w-14,cy:y+16,r:5,fill:c},g);
+    n.l.forEach(function(line,i){var t=el('text',{x:x+16,y:y+40+i*16,fill:i===0&&!n.big?'#e6e8eb':'#8b93a1','font-size':12},g);t.textContent=clip(line,n.big?34:36);});
+    n.h=h; n.x=x; n.y=y; n.w=w; return h;
+  }
+  function link(svg,x1,y1,x2,y2,n,vertical){
+    var c=COL[n.st]||COL.off, p;
+    if(vertical) p='M'+x1+' '+y1+' C'+x1+' '+(y1+y2)/2+' '+x2+' '+(y1+y2)/2+' '+x2+' '+y2;
+    else p='M'+x1+' '+y1+' C'+(x1+x2)/2+' '+y1+' '+(x1+x2)/2+' '+y2+' '+x2+' '+y2;
+    el('path',{d:p,fill:'none',stroke:c,'stroke-width':2,'stroke-dasharray':n.dash?'6 5':'', opacity:.9},svg);
+    if(n.st==='ok' && !n.dash){ var dot=el('circle',{r:3,fill:c},svg); var an=el('animateMotion',{dur:'2.4s',repeatCount:'indefinite',path:p},dot); }
+    if(n.edge){ var mx=(x1+x2)/2, my=(y1+y2)/2, w=n.edge.length*6.2+12;
+      el('rect',{x:mx-w/2,y:my-9,width:w,height:17,rx:8,fill:'#0f1216',stroke:'#262c35'},svg);
+      var t=el('text',{x:mx,y:my+4,'text-anchor':'middle',fill:'#8b93a1','font-size':11},svg); t.textContent=n.edge; }
+  }
+  function draw(d){
+    var host=document.getElementById('diagram'); if(!host) return;
+    var N=nodes(d), narrow=host.clientWidth<700, svg=document.createElementNS(NS,'svg'), gap=14;
+    svg.setAttribute('role','img'); svg.setAttribute('aria-label','Connected devices');
+    if(!narrow){
+      var W=980, cw=270, px=355, pw=270;
+      var hL=N.L.reduce(function(a,n){return a+34+n.l.length*16+gap;},0)-gap;
+      var hR=N.R.reduce(function(a,n){return a+34+n.l.length*16+gap;},0)-gap;
+      var hP=34+N.pi.l.length*16, H=Math.max(hL,hR,hP)+20;
+      svg.setAttribute('viewBox','0 0 '+W+' '+H);
+      var py=(H-hP)/2; box(svg,N.pi,px,py,pw);
+      var y=(H-hL)/2; N.L.forEach(function(n,i){ var h=34+n.l.length*16; n.y0=y; y+=h+gap; });
+      var y2=(H-hR)/2; N.R.forEach(function(n){ var h=34+n.l.length*16; n.y0=y2; y2+=h+gap; });
+      N.L.forEach(function(n,i){ var py1=py+24+(hP-36)*(i+0.5)/N.L.length; link(svg,10+cw,n.y0+(34+n.l.length*16)/2,px,py1,n); });
+      N.R.forEach(function(n,i){ var py1=py+24+(hP-36)*(i+0.5)/N.R.length; link(svg,px+pw,py1,W-10-cw,n.y0+(34+n.l.length*16)/2,n); });
+      N.L.forEach(function(n){box(svg,n,10,n.y0,cw);}); N.R.forEach(function(n){box(svg,n,W-10-cw,n.y0,cw);});
+      box(svg,N.pi,px,py,pw);
+    } else {
+      var W2=360, x=30, w=320, yy=6, all=N.L.concat([N.pi],N.R), pos=[];
+      all.forEach(function(n){ pos.push(yy); yy+=34+n.l.length*16+gap+10; });
+      svg.setAttribute('viewBox','0 0 '+W2+' '+yy);
+      var pi_i=N.L.length, piy=pos[pi_i], pih=34+N.pi.l.length*16;
+      all.forEach(function(n,i){ if(i===pi_i) return; var h=34+n.l.length*16, ny=pos[i]+h/2, ty=i<pi_i?piy+12+i*8:piy+pih-12-(i-pi_i-1)*8;
+        var c=COL[n.st]||COL.off; el('path',{d:'M'+x+' '+ny+' H14 V'+ty+' H'+x,fill:'none',stroke:c,'stroke-width':2,'stroke-dasharray':n.dash?'6 5':''},svg); });
+      all.forEach(function(n,i){ box(svg,n,x,pos[i],w); if(n.edge&&i!==pi_i){ var t=el('text',{x:x+w-8,y:pos[i]+(34+n.l.length*16)-6,'text-anchor':'end',fill:'#5a6270','font-size':10},svg); t.textContent=n.edge; } });
+    }
+    host.innerHTML=''; host.appendChild(svg);
+    var at=document.getElementById('dg-at'); if(at) at.textContent='updated '+new Date(d.at*1000).toLocaleTimeString();
+    var tb=document.getElementById('usb-table');
+    if(tb){ tb.innerHTML='<tr><th>Device</th><th>Port · bus/dev</th><th>ID · serial</th><th>Speed · power</th><th>Doing</th></tr>'+
+      (d.usb||[]).map(function(u){return '<tr><td>'+esc(u.label||u.product||u.kind)+'<br><span class="mut">'+esc(u.maker+' '+u.product)+'</span></td><td>'+esc(u.port)+'<br><span class="mut">'+esc(u.bus+'/'+u.dev)+'</span></td><td>'+esc(u.id)+'<br><span class="mut">'+esc(u.serial||'—')+'</span></td><td>'+esc(u.speed)+' Mb/s<br><span class="mut">'+esc(u.ma)+' mA'+(u.tty.length?' · '+esc(u.tty.join(' ')):'')+'</span></td><td>'+esc(u.role||u.driver||'—')+'</td></tr>';}).join(''); }
+    var rt=document.getElementById('rail-table');
+    if(rt){ var r=d.sys.rails||{}, ks=Object.keys(r).sort();
+      rt.innerHTML=ks.length?'<tr><th>Rail</th><th>Voltage</th><th>Current</th></tr>'+ks.map(function(k){return '<tr><td>'+esc(k)+'</td><td>'+(r[k].V!=null?r[k].V.toFixed(3)+' V':'—')+'</td><td>'+(r[k].A!=null?(r[k].A*1000).toFixed(0)+' mA':'—')+'</td></tr>';}).join(''):'<tr><td class="mut">This Pi does not report its rails.</td></tr>'; }
+  }
+  var last=null;
+  function tick(){ fetch('/api/devices',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(d){last=d;draw(d);}).catch(function(){
+    var at=document.getElementById('dg-at'); if(at) at.textContent='not updating — is the Pi still on?'; }); }
+  tick(); setInterval(tick,5000); window.addEventListener('resize',function(){ if(last) draw(last); });
+})();
+</script>"""
+
+CHECKS_JS = r"""
+<script>
+(function(){
+  var ICON={ok:'✓',warn:'!',bad:'✕',info:'i'};
+  function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+  window.renderChecks=function(d, host, full){
+    var c=d.checks.filter(function(x){return full||x.level!=='ok';});
+    var sm=d.summary, head='<div class="row" style="margin-bottom:8px">'+
+      (sm.bad?'<span class="spill badp">'+sm.bad+' problem'+(sm.bad>1?'s':'')+'</span>':'')+
+      (sm.warn?'<span class="spill warnp">'+sm.warn+' warning'+(sm.warn>1?'s':'')+'</span>':'')+
+      (!sm.bad&&!sm.warn?'<span class="spill okp">All checks passed</span>':'')+
+      '<span class="spill">'+sm.ok+' OK</span></div>';
+    host.innerHTML=head+(c.length?'<ul class="checks">'+c.map(function(x){return '<li class="'+x.level+'"><span class="ic">'+ICON[x.level]+'</span><div><b>'+esc(x.title)+'</b> — '+esc(x.found)+
+      (x.fix&&x.level!=='ok'?'<div class="note">'+esc(x.fix)+'</div>':'')+'</div></li>';}).join('')+'</ul>':'<p class="note">Nothing needs attention.</p>');
+  };
+  var h=document.getElementById('checks');
+  if(h && !h.dataset.manual){
+    var go=function(){ fetch('/api/diagnostics',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(d){window.renderChecks(d,h,false);}).catch(function(){}); };
+    go(); setInterval(go,30000);
+  }
 })();
 </script>"""
 
@@ -1195,7 +1981,7 @@ class Handler(BaseHTTPRequestHandler):
         tok, sess = self.session()
         if path == "/login" or not sess:
             return self.page_login()
-        routes = {"/": self.page_status, "/logs": self.page_logs, "/settings": self.page_settings,
+        routes = {"/": self.page_status, "/diagnostics": self.page_diag, "/logs": self.page_logs, "/settings": self.page_settings,
                   "/area": self.page_area, "/update": self.page_update, "/wifi": self.page_wifi, "/spotter": self.page_spotter,
                   "/power": self.page_power, "/account": self.page_account}
         if path in routes:
@@ -1209,7 +1995,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/logs.txt":
             return self.send_text("\n".join(journal_lines(5000, noise=True)) + "\n", "wavelens-bridge.log")
         if path == "/api/update/log":
-            return self.send_json(update_log_snapshot())
+            return self.send_json(update_status_json())
+        if path == "/api/devices":
+            return self.send_json(devices_snapshot())
+        if path == "/api/diagnostics":
+            d = run_diagnostics(deep="deep" in q)
+            if "deep" not in q:
+                d.pop("snap", None)
+            return self.send_json(d)
+        if path == "/api/report.txt":
+            return self.send_text(support_report(), f"wavelens-report-{time.strftime('%Y%m%d-%H%M')}.txt")
         if path == "/api/health":
             return self.send_json(bridge_health())
         if path == "/api/spotter/log":
@@ -1405,12 +2200,72 @@ Support: wavelensapp@gmail.com — attach the downloaded log.</p></div>"""
 <tr><th>Disk</th><td>{esc(facts['disk'])}</td></tr>
 <tr><th>Load</th><td>{esc(facts['load'])}</td></tr>
 <tr><th>Pi uptime</th><td>{esc(facts['uptime'])}</td></tr></table>"""
-        body = f"""{banner}{missing}<div class="grid">
+        events = recent_events(10)
+        body = f"""{banner}{missing}
+<div class="card"><div class="row" style="justify-content:space-between"><h2 style="margin:0">Connected devices</h2>
+<span class="note" id="dg-at">loading…</span></div>
+<div id="diagram"></div>
+<p class="note">Live, every 5 s. Green: working · amber: needs a look · red: problem · dashed: not connected. Hover or tap a box for its details.</p>
+<details><summary class="note" style="cursor:pointer">USB addresses, serials and power</summary><div class="tbl"><table id="usb-table"></table></div></details>
+<details><summary class="note" style="cursor:pointer">Voltages and currents</summary><div class="tbl"><table id="rail-table"></table></div></details></div>
+<div class="card"><div class="row" style="justify-content:space-between"><h2 style="margin:0">Checks</h2><a class="note" href="/diagnostics">Full diagnostics →</a></div>
+<div id="checks" style="margin-top:10px"><span class="note">running…</span></div></div>
+<div class="grid">
 <div class="card"><h2>Bridge</h2>{bridge}</div><div class="card"><h2>This Pi</h2>{pi}</div></div>
+<div class="card"><h2>Recent events</h2>{('<pre style="max-height:260px">' + esc(chr(10).join(events)) + '</pre>') if events else '<p class="note">Nothing notable since the scanner started.</p>'}
+<a class="note" href="/logs">All logs →</a></div>
 <div class="card"><h2>Quick actions</h2><div class="row">
 <form method="post" action="/bridge/restart" class="inline">{csrf_field(sess)}<button class="btn" type="submit">Restart bridge</button></form>
-<a class="btn sec" href="/power/reboot">Reboot…</a><a class="btn sec" href="/logs">View logs</a></div></div>"""
+<a class="btn sec" href="/power/reboot">Reboot…</a><a class="btn sec" href="/diagnostics">Run diagnostics</a>
+<a class="btn sec" href="/api/report.txt">Download support report</a></div></div>{DIAGRAM_JS}{CHECKS_JS}"""
         self.render(sess, "Status", body, "/")
+
+    # ---- /diagnostics ---------------------------------------------------------------------
+    def page_diag(self, sess):
+        body = """<div class="card"><div class="row" style="justify-content:space-between">
+<div class="row"><button class="btn" id="run">Run the test</button><a class="btn sec" href="/api/report.txt">Download support report</a></div>
+<span class="note" id="dat"></span></div>
+<p class="note">Checks power, heat, CPU, memory, storage and the SD card, the radios on USB, Bluetooth, Wi-Fi and the internet
+connection updates use, the area data and the software. Nothing is changed and the scanner keeps running. The support report
+has the results, the hardware list and the last bridge lines, and no passwords or Wi-Fi keys.</p></div>
+<div class="card"><h2>Results</h2><div id="checks" data-manual="1"><span class="note">running…</span></div></div>
+<div class="grid" id="tiles"></div>
+<div class="card"><h2>Busiest programs</h2><div class="tbl"><table id="top"></table></div></div>
+<div class="card"><h2>Kernel events this boot</h2><pre id="kev" style="max-height:240px">…</pre>
+<p class="note">USB disconnects (a dongle dropping off), SD card errors, out-of-memory kills and under-voltage warnings.</p></div>
+""" + CHECKS_JS + r"""<script>
+(function(){
+  function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+  function gbs(n){return n>=1e9?(n/1e9).toFixed(1)+' GB':(n/1e6).toFixed(0)+' MB';}
+  function meter(p){p=Math.max(0,Math.min(100,p));return '<div class="meter"><b class="'+(p>90?'x':p>75?'w':'')+'" style="width:'+p+'%"></b></div>';}
+  function tile(t,v,sub,p){return '<div class="card"><div class="note">'+t+'</div><div class="stat">'+v+'</div>'+(p!=null?meter(p):'')+'<div class="note small">'+(sub||'')+'</div></div>';}
+  var btn=document.getElementById('run');
+  function go(){
+    btn.disabled=true; btn.innerHTML='<span class="spin"></span> Testing…';
+    fetch('/api/diagnostics?deep=1',{credentials:'same-origin',cache:'no-store'}).then(function(r){return r.json();}).then(function(d){
+      window.renderChecks(d, document.getElementById('checks'), true);
+      var s=d.snap.sys, m=s.mem_total?100*(1-s.mem_avail/s.mem_total):0, dk=s.disk||{}, du=dk.total?100*(1-dk.free/dk.total):0;
+      var ext=(s.rails||{}).EXT5V;
+      document.getElementById('tiles').innerHTML=
+        tile('CPU',(s.cpu_pct!=null?s.cpu_pct:'?')+' %','load '+s.load.join(' / ')+' · '+s.cores+' cores · '+s.mhz+' / '+s.mhz_max+' MHz',s.cpu_pct)+
+        tile('Memory',m.toFixed(0)+' %',gbs(s.mem_avail)+' free of '+gbs(s.mem_total)+(s.swap_total?' · swap '+gbs(s.swap_total-s.swap_free)+' used':' · no swap'),m)+
+        tile('Temperature',s.temp!=null?s.temp.toFixed(1)+' °C':'?',(s.fan_rpm?'fan '+s.fan_rpm+' rpm · ':'')+'slows down at 80 °C',s.temp!=null?s.temp/85*100:null)+
+        tile('Storage',dk.free?gbs(dk.free)+' free':'?',(dk.total?'of '+gbs(dk.total)+' · ':'')+esc(s.root),du)+
+        tile('Power',ext&&ext.V?ext.V.toFixed(2)+' V':(s.throttled?(s.throttled.undervolt?'Low':'OK'):'n/a'),
+             (s.psu_ma?'supply limit '+(s.psu_ma/1000).toFixed(1)+' A · ':'')+(s.throttled?'get_throttled '+s.throttled.raw:''),null)+
+        tile('System',esc(s.model.replace(/ Rev [\d.]+$/,'')),esc(s.os)+' · kernel '+esc(s.kernel)+' · Python '+esc(s.python)+' · up '+Math.floor(s.uptime/3600)+' h',null);
+      document.getElementById('top').innerHTML='<tr><th>Program</th><th>CPU %</th><th>Memory</th><th>PID</th></tr>'+d.top.map(function(p){
+        return '<tr><td>'+esc(p.name)+'</td><td>'+esc(p.cpu)+'</td><td>'+esc(p.rss_mb)+' MB ('+esc(p.mem)+' %)</td><td class="mut">'+esc(p.pid)+'</td></tr>';}).join('');
+      var ev=[]; Object.keys(d.events).forEach(function(k){ev=ev.concat(d.events[k]);});
+      document.getElementById('kev').textContent=ev.length?ev.join('\n'):'None.';
+      document.getElementById('dat').textContent='tested '+new Date(d.at*1000).toLocaleTimeString();
+    }).catch(function(){ document.getElementById('checks').innerHTML='<div class="warn">The test did not finish. Reload the page and try again.</div>'; })
+    .then(function(){ btn.disabled=false; btn.textContent='Run the test again'; });
+  }
+  btn.addEventListener('click',go); go();
+})();
+</script>"""
+        self.render(sess, "Diagnostics", body, "/diagnostics")
 
     def post_bridge_restart(self, sess, form, files, tok):
         rc, out = run(["systemctl", "restart", BRIDGE_UNIT], timeout=30)
@@ -1542,6 +2397,23 @@ your Wi-Fi and set up, you can turn off what you don't use. This page keeps work
             rr_table = f"<table>{rr_rows}</table>"
         else:
             rr_table = '<p class="mut">None yet.</p>'
+        fcc_path = os.path.join(AREA_DIR, "fcc-local.json")
+        try:
+            fcc_size = os.path.getsize(fcc_path)
+            fcc_db = (f"<b>{fcc_size / 1e6:.1f} MB</b> on this Pi · {int(a.get('licences') or 0):,} records · "
+                      f"<span class=\"mut\">{esc(fcc_path)}</span>")
+        except OSError:
+            fcc_db = '<span class="mut">not downloaded</span>'
+        follow = bool(a.get("follow"))
+        fst = (read_json(STATUS_JSON) or {}).get("area_follow") or {}
+        follow_state = ""
+        if follow:
+            bits = []
+            if fst.get("km") is not None:
+                bits.append(f"phone is {fst['km']:g} km from the area's centre")
+            if fst.get("msg"):
+                bits.append(esc(fst["msg"]) + (f" ({esc(fmt_ts(fst['at']))})" if fst.get("at") else ""))
+            follow_state = "<p class=\"note\">" + (" · ".join(bits) or "on; the scanner checks the phone's position every minute") + "</p>"
         if a:
             where = " ".join(x for x in (a.get("country", ""), a.get("postcode", "")) if x)
             place = ", ".join(x for x in (a.get("district", ""), a.get("region", "")) if x)
@@ -1549,7 +2421,8 @@ your Wi-Fi and set up, you can turn off what you don't use. This page keeps work
 <tr><th>Area</th><td><b>{esc(where)}</b>{f' <span class="mut">({esc(place)})</span>' if place else ''}</td></tr>
 <tr><th>Position, radius</th><td>{esc(a.get('lat'))}, {esc(a.get('lon'))} · {esc(a.get('radius_km', 50))} km</td></tr>
 <tr><th>Districts in range</th><td>{esc(districts)}</td></tr>
-<tr><th>Licensed frequencies</th><td>{esc(a.get('licences', 0)) if a.get('licences') else '<span class="mut">none: no public licence data for this country yet</span>'}</td></tr>
+<tr><th>Licensed frequencies</th><td>{f"<b>{int(a['licences']):,}</b>" if a.get('licences') else '<span class="mut">none: no public licence data for this country yet</span>'}</td></tr>
+<tr><th>FCC database</th><td>{fcc_db}</td></tr>
 <tr><th>Data of</th><td>{esc(a.get('data_built') or '—')} <span class="mut">(set {esc(a.get('updated') or '—')})</span></td></tr></table>"""
         else:
             table = '<p><b>No area set.</b> The Scanner works without one; carriers are then named by band only.</p>'
@@ -1564,6 +2437,16 @@ your Wi-Fi and set up, you can turn off what you don't use. This page keeps work
 <p class="note">Any country: a two-letter code (US, CA, AU, GB, DE …) and a postcode. The Scanner downloads the public licence
 records around that place and names what it hears from them. Licence records exist where a country publishes them, today the
 United States (FCC). Needs Wi-Fi; restarts the bridge for a few seconds. Postcode positions: GeoNames, CC BY 4.0.</p></div>
+<div class="card"><h2>Follow me</h2>
+<form method="post" action="/area">{csrf_field(sess)}<input type="hidden" name="do" value="follow">
+<label style="margin:0;color:var(--fg)"><input type="checkbox" name="follow" value="1" {"checked" if follow else ""} {"" if a else "disabled"}>
+Move the area with me as I travel</label>
+<button class="btn sec" type="submit" {"" if a else "disabled"}>Save</button></form>{follow_state}
+<p class="note">For a car or a backpack. When the phone shares its position with the Scanner (Android: More → Companion radio → <i>Share my position with the companion</i>; iPhone: Scanner → <i>Share position with the Scanner</i>)
+and you have travelled out of the middle of the area (about {max(15, int(0.4 * float(a.get('radius_km') or 50)))} km for this radius),
+the Scanner re-centres the area on you and swaps in the local licences without restarting, so the phone stays connected.
+At most once every 10 minutes. It needs an internet connection at that moment (phone hotspot or Wi-Fi); without one it keeps
+the area it has and tries again later. {"Set an area first." if not a else ""}</p></div>
 <div class="card"><h2>Your own RadioReference exports</h2>
 {rr_table}
 <form method="post" action="/area" enctype="multipart/form-data">{csrf_field(sess)}<input type="hidden" name="do" value="rr_upload">
@@ -1580,6 +2463,23 @@ The files stay on this Scanner (<code>{esc(RR_DIR)}</code>) and are never sent a
         do = form.get("do", "")
         if do in ("rr_upload", "rr_delete"):
             return self.post_area_rr(sess, do, form, files)
+        if do == "follow":
+            on = form.get("follow") == "1"
+            a = read_json(AREA_FILE) or {}
+            if not a:
+                self.flash(sess, "Set an area first.")
+            else:
+                a["follow"] = on
+                try:
+                    tmp = AREA_FILE + ".tmp"
+                    with open(tmp, "w") as f:
+                        json.dump(a, f, separators=(",", ":"), ensure_ascii=False)
+                    os.chmod(tmp, 0o644)
+                    os.replace(tmp, AREA_FILE)
+                    self.flash(sess, "Follow me is on: the area moves with the phone's position." if on else "Follow me is off.")
+                except OSError as e:
+                    self.flash(sess, f"Could not save: {e}")
+            return self.redirect("/area")
         if not os.path.isfile(AREA_TOOL):
             self.flash(sess, "The area tool is not installed on this Pi: update the Scanner first.")
             return self.redirect("/area")
@@ -2054,26 +2954,45 @@ survives a lost SD card, export the list and keep the file.</p>
 
     # ---- /update ---------------------------------------------------------------------------
     def page_update(self, sess):
-        u = read_json(UPDATE_JSON) or {}
+        u = update_status_json()
         auto = defaults_read().get("WAVELENS_AUTO_UPDATE", "0") == "1"
-        snap = UPDATE_JOB.snapshot()
-        dis = "disabled" if snap["running"] else ""
-        avail = u.get("available")
-        body = f"""<div class="card"><table>
-<tr><th>Installed</th><td>{esc(u.get('installed') or installed_version())}{f' <span class="mut">({esc(u["commit"][:10])})</span>' if u.get('commit') else ''}</td></tr>
-<tr><th>Available</th><td>{f'<b class="ok">{esc(avail)}</b>' if avail else '<span class="mut">none — you are up to date</span>'}</td></tr>
-<tr><th>Last check</th><td>{esc(fmt_ts(u.get('checked_at')))}</td></tr>
-<tr><th>Last result</th><td>{esc(u.get('last_result') or '—')}</td></tr></table>
-<form method="post" action="/update" class="row">{csrf_field(sess)}
+        dis = "disabled" if u["running"] else ""
+        hist = update_history(10)
+        hist_rows = "".join(
+            f'<tr><td class="mut" style="white-space:nowrap">{esc(fmt_ts(h.get("at")))}</td><td>{esc(h.get("result") or "")}</td></tr>'
+            for h in hist) or '<tr><td class="mut">No updates recorded yet.</td></tr>'
+        prev = f' <span class="mut">(saved fallback: {esc(u["prev"])})</span>' if u["prev"] else ""
+        body = f"""<div class="card"><div class="row" style="justify-content:space-between">
+<div><div id="upill" class="spill">…</div></div>
+<div class="note" id="checked">Last check: {esc(fmt_ts(u.get('checked_at')))}</div></div>
+<table style="margin-top:10px">
+<tr><th>Installed</th><td id="vinst"><b>{esc(u['installed'])}</b>{prev}</td></tr>
+<tr><th>Available</th><td id="vavail">{f'<b class="ok">{esc(u["available"])}</b>' if u["available"] else '<span class="mut">none — up to date</span>'}</td></tr>
+<tr><th>Last result</th><td id="vlast">{esc(u['last_result'] or '—')}</td></tr></table>
+<form method="post" action="/update" class="row" id="uform">{csrf_field(sess)}
 <button class="btn sec" name="do" value="check" {dis}>Check now</button>
 <button class="btn" name="do" value="apply" {dis}>Install update</button>
-<button class="btn sec" name="do" value="rollback" {dis}>Roll back to previous</button></form>
-<p class="note">Updates are free for life, come from the public GitHub repo <code>pmcbrien/wavelens</code>, and need Wi-Fi.
-Installing restarts the bridge for a few seconds.</p></div>
-<div class="card"><form method="post" action="/update">{csrf_field(sess)}<input type="hidden" name="do" value="auto">
-<label style="margin:0"><input type="checkbox" name="auto" value="1" {"checked" if auto else ""}> Install updates automatically overnight</label>
+<button class="btn sec" name="do" value="rollback" {dis} {'' if u['can_rollback'] else 'disabled title="No saved version yet"'}
+ onclick="return confirm('Put the previous version back?')">Roll back to previous</button></form>
+<p class="note">Updates are free for life and come from the public GitHub repo <code>pmcbrien/wavelens</code> (the Pi needs Wi-Fi).
+An install takes one to three minutes: the scanner and this page restart near the end and this page reconnects by itself.
+If the new version doesn't start, the saved one is put back automatically.</p></div>
+
+<div class="card" id="pcard"><div class="row" style="justify-content:space-between"><h2 style="margin:0">Progress</h2>
+<span class="note" id="elapsed"></span></div>
+<div id="conn" class="flash" style="display:none;margin:10px 0 0"></div>
+<ol class="steps" id="steps"><li class="mut">Nothing running. Start a check or an install above.</li></ol>
+<div id="now" class="note"></div>
+<div id="result" style="display:none"></div>
+<details style="margin-top:10px"><summary class="note" style="cursor:pointer">Show the full log</summary>
+<pre id="out">{esc(chr(10).join(u['lines']))}</pre></details></div>
+
+<div class="card"><h2>Automatic updates</h2><form method="post" action="/update">{csrf_field(sess)}<input type="hidden" name="do" value="auto">
+<label style="margin:0"><input type="checkbox" name="auto" value="1" {"checked" if auto else ""}> Install updates automatically overnight
+(around 3 am, never while a phone is connected)</label>
 <button class="btn sec" type="submit">Save</button></form></div>
-<div class="card"><h2>Progress <span id="st" class="mut"></span></h2><pre id="out" data-url="/api/update/log">{esc(chr(10).join(snap['lines']))}</pre></div>{POLL_JS}"""
+<div class="card"><h2>History</h2><table>{hist_rows}</table></div>
+<script>window.UPD={json.dumps(u)};</script>{UPDATE_JS}"""
         self.render(sess, "Update", body, "/update")
 
     def post_update(self, sess, form, files, tok):
@@ -2085,7 +3004,8 @@ Installing restarts the bridge for a few seconds.</p></div>
             if not os.access(UPDATE_CLI, os.X_OK):
                 self.flash(sess, f"{UPDATE_CLI} is not installed on this Pi.")
             elif UPDATE_JOB.start(do, [UPDATE_CLI, do]):
-                self.flash(sess, f"Started: wavelens-update {do}. Watch the progress box.")
+                self.flash(sess, {"check": "Checking for an update …", "apply": "Installing the update — follow each step below.",
+                                  "rollback": "Putting the previous version back — follow each step below."}[do])
             else:
                 self.flash(sess, "An update task is already running.")
         self.redirect("/update")

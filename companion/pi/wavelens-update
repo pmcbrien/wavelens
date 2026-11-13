@@ -37,7 +37,7 @@ case "${1:-}" in apply|rollback)
         unit="wavelens-update-run"
         if systemctl is-active -q "$unit" 2>/dev/null; then die "an update is already running"; fi
         systemctl reset-failed "$unit" 2>/dev/null || true
-        : > "$LOGF"; rm -f "$STATE_DIR/update.rc"
+        echo "update: $1 started $(date '+%Y-%m-%d %H:%M:%S')" > "$LOGF"; rm -f "$STATE_DIR/update.rc"
         systemd-run --unit="$unit" --quiet --collect --setenv=WAVELENS_UPDATE_DETACHED=1 \
             ${WAVELENS_SRC:+--setenv=WAVELENS_SRC="$WAVELENS_SRC"} /usr/local/bin/wavelens-update "$@" \
             || die "could not start the update job"
@@ -91,10 +91,24 @@ import json, sys, time
 path, installed, avail, commit, result, auto = sys.argv[1:]
 json.dump({"installed": installed, "available": avail or None, "commit": commit, "checked_at": int(time.time()),
            "last_result": result, "auto": auto == "1"}, open(path, "w"))
+# one line per result for the admin page's history; the last 50 kept
+hist = path.replace("update.json", "update-history.jsonl")
+try:
+    lines = open(hist).read().splitlines()[-49:]
+except OSError:
+    lines = []
+lines.append(json.dumps({"at": int(time.time()), "installed": installed, "result": result}))
+try:
+    with open(hist + ".tmp", "w") as f:
+        f.write("\n".join(lines) + "\n")
+    import os; os.replace(hist + ".tmp", hist)
+except OSError:
+    pass
 EOF
 }
 
 do_fetch() {
+    log "checking GitHub for the latest version"
     git -C "$SRC" fetch -q origin main 2>&1 | grep -v "^$" || true
     git -C "$SRC" rev-parse --verify -q origin/main >/dev/null || die "fetch failed (no network?)"
 }
@@ -233,26 +247,34 @@ do_apply() {
         rm -f "$next"
     fi
     log "updating $have -> $want"
+    [ -d "$PREV" ] && [ -d "$LIB" ] && log "checking the scanner runs well before saving it as the fallback (about 30 s)"
     # Fall back to what is running now only if it is actually working; a bridge that is already broken
     # (or crash-looping) must not overwrite the last good copy.
     if [ -d "$LIB" ] && { [ ! -d "$PREV" ] || bridge_ok_now; }; then
         snapshot_good || die "could not save a copy of the current version; nothing changed"
+        log "saved a copy of $have to fall back to"
     else
         log "keeping the saved copy of $(cat "$PREV/VERSION" 2>/dev/null || echo 'the previous version') to fall back to (the current one isn't running properly)"
     fi
+    log "unpacking $want"
     git -C "$SRC" reset -q --hard origin/main || die "checkout failed; nothing changed"
+    log "installing the new files"
     if ! ( set -e; install_files ); then
         log "installing $want failed part-way; putting the saved version back"
         do_rollback; write_state "$want" "update to $want could not be installed, so the saved version was put back"; return 1
     fi
+    log "checking $want loads on this Pi"
     if ! why=$(preflight); then
         log "$want would not start on this Pi ($why); putting the saved version back"
         do_rollback; write_state "$want" "update to $want would not start on this Pi ($why), so the saved version was put back"; return 1
     fi
+    log "checking for new Spotter firmware"
     fetch_firmware
     t0=$(date '+%Y-%m-%d %H:%M:%S')
+    log "restarting the scanner on $want (the admin page restarts too and reconnects by itself)"
     systemctl restart wavelens-bridge
     systemctl is-enabled -q wavelens-admin 2>/dev/null && systemctl restart wavelens-admin || true
+    log "waiting for the scanner to start (up to 30 s)"
     if healthy "$t0"; then
         write_state "" "updated to $want"
         log "done: $want is running"
@@ -274,6 +296,7 @@ bridge_ok_now() {   # running, and no restart in the last 30 s
 do_rollback() {
     [ -d "$PREV" ] || die "nothing saved to roll back to"
     local t0 f
+    log "putting the saved version $(cat "$PREV/VERSION" 2>/dev/null || echo '') back"
     rm -rf "$LIB.failed"; [ -d "$LIB" ] && mv "$LIB" "$LIB.failed"; cp -a "$PREV" "$LIB"
     if [ -d "$LIB/.sys" ]; then
         for f in $SYS_FILES; do
@@ -286,6 +309,7 @@ do_rollback() {
     t0=$(date '+%Y-%m-%d %H:%M:%S')
     systemctl restart wavelens-bridge
     systemctl is-enabled -q wavelens-admin 2>/dev/null && systemctl restart wavelens-admin || true
+    log "waiting for the scanner to start (up to 30 s)"
     if healthy "$t0"; then
         log "rolled back to $(installed); the bridge is running"
     else

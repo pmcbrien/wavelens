@@ -206,6 +206,84 @@ def area_info() -> dict:
     return info
 
 
+AREA_FOLLOW_EVERY_S = 60.0       # how often the position is looked at
+AREA_FOLLOW_RETRY_S = 600.0      # at most one move (or failed attempt) per 10 minutes
+AREA_FOLLOW_MIN_KM = 15.0
+
+
+def area_follow_due(a: dict, lat: float, lon: float):
+    """(km from the area's centre, the distance that triggers a move). Moves once the phone is out of the
+    middle 40 % of the area (never under 15 km), so a 50 km area moves after about 20 km of travel."""
+    try:
+        import area as area_mod
+        km = area_mod.haversine_km(float(a["lat"]), float(a["lon"]), lat, lon)
+    except Exception:  # noqa: BLE001
+        return 0.0, 1e9
+    return km, max(AREA_FOLLOW_MIN_KM, 0.4 * float(a.get("radius_km") or 50))
+
+
+def area_follow_loop() -> None:
+    """Follow me (area.json "follow": true, set on the admin page or `wavelens-area follow on`): when the phone
+    shares its position and has left the middle of the area, the area is re-set around it and the licence
+    pack swapped in place. No restart, so the phone stays connected. Needs the Pi online for the download;
+    without it the attempt is logged and tried again later."""
+    global FCC
+    st = AREA.setdefault("follow", {})
+    last_try = 0.0
+    while True:
+        time.sleep(AREA_FOLLOW_EVERY_S)
+        try:
+            import area as area_mod
+            a = area_mod.read_area()
+            st["on"] = bool(a.get("follow"))
+            if not st["on"] or not a.get("country") or AREA["busy"]:
+                continue
+            lat, lon = state.get("lat"), state.get("lon")
+            if lat is None or time.time() - state.get("pos_at", 0) > 120:
+                st["msg"] = "waiting for the phone to share its position"
+                continue
+            km, due = area_follow_due(a, float(lat), float(lon))
+            st["km"] = round(km, 1)
+            if km < due or time.time() - last_try < AREA_FOLLOW_RETRY_S:
+                continue
+            last_try = time.time()
+            with AREA["lock"]:
+                if AREA["busy"]:
+                    continue
+                AREA["busy"] = True
+            try:
+                print(f"bridge: area: follow me: {km:.0f} km from the area's centre, moving it", file=sys.stderr)
+                tool = os.path.join(os.path.dirname(os.path.abspath(__file__)), "area.py")
+                env = dict(os.environ, WAVELENS_AREA_DIR=AREA["dir"], PYTHONUNBUFFERED="1")
+                r = subprocess.run([sys.executable or "python3", tool, "set", "--country", a["country"],
+                                    "--radius-km", f"{float(a.get('radius_km') or 50):g}",
+                                    f"--lat={float(lat):.2f}", f"--lon={float(lon):.2f}", "--no-restart"],
+                                   capture_output=True, text=True, env=env, timeout=900)
+                last = (r.stdout.strip().splitlines() or r.stderr.strip().splitlines() or [""])[-1]
+            finally:
+                AREA["busy"] = False
+            if r.returncode != 0:
+                st.update(msg=f"could not move the area: {last[:160]}", at=int(time.time()))
+                print(f"bridge: area: follow me failed: {last}", file=sys.stderr)
+                continue
+            found = area_mod.inputs_for_bridge(AREA["dir"])
+            if found.get("fcc"):
+                try:
+                    FCC = FccPack(found["fcc"])
+                except Exception as e:  # noqa: BLE001 - keep the old pack
+                    print(f"bridge: area: new licence pack not loaded ({e}); keeping the old one", file=sys.stderr)
+            else:
+                FCC = None
+            AREA["center_at"] = 0.0
+            st.update(msg="moved: " + area_mod.describe(area_mod.read_area())[:200], at=int(time.time()), km=0.0)
+            print(f"bridge: area: follow me: {st['msg']}", file=sys.stderr)
+            write_run_status()
+            hello()
+        except Exception as e:  # noqa: BLE001 - never take the bridge down
+            st["msg"] = f"error: {e}"
+            print(f"bridge: area: follow me error: {e}", file=sys.stderr)
+
+
 def area_emit(st: str, msg: str) -> None:
     """Progress of an area change, as its own line type (the set-up step shows it) and in the journal."""
     AREA["last"] = msg
@@ -302,7 +380,9 @@ def write_run_status(hw: dict | None = None) -> None:
     """A small JSON the admin page shows and wavelens-update reads (no update while a phone is linked)."""
     try:
         os.makedirs(os.path.dirname(RUN_STATUS), exist_ok=True)
-        doc = {"linked": bool(state.get("linked")), "name": state.get("name"), "code": state.get("code"),
+        if hw:
+            state["hw_detail"] = {k: hw.get(k) for k in ("rtl", "hackrf", "esp32")}
+        doc = {"hw": state.get("hw_detail"), "area_follow": dict(AREA.get("follow") or {}),"linked": bool(state.get("linked")), "name": state.get("name"), "code": state.get("code"),
                "hw_line": (hw or {}).get("line") or state.get("hw_line"), "hw_missing": (hw or {}).get("missing", []),
                "fw": FW, "at": int(time.time()), "update": update_info(),
                "problems": list(PACK_PROBLEMS),
@@ -6398,6 +6478,7 @@ def main() -> None:
             import area as area_mod
             AREA["dir"] = a.area_dir
             AREA["on"] = True
+            threading.Thread(target=area_follow_loop, name="area-follow", daemon=True).start()
             if APP_CONTROL:
                 CAPS.append("area")      # the phone may set the area: its set-up step asks when none is set
             found = area_mod.inputs_for_bridge(a.area_dir)
