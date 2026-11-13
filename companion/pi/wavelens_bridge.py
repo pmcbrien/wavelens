@@ -43,6 +43,7 @@ import bisect
 import fcntl
 import glob
 import json
+import urllib.request
 import math
 import multiprocessing
 import os
@@ -4179,7 +4180,8 @@ SWEEP_RANGES = []           # (lo, hi) MHz of every --rtl-power range running, f
 def free_dongle(dev: str, wait_s: float = 3.0) -> None:
     """Stop every rtl_power / rtl_fm / rtl_tcp holding this dongle (by serial or index as given on their
     command line), waiting up to wait_s for a clean exit before killing."""
-    pat = f"(rtl_power|rtl_fm|rtl_tcp)( .*)? -d {re.escape(dev)}( |$)" if dev else r"(rtl_power|rtl_fm)( |$)"
+    pat = (f"((rtl_power|rtl_fm|rtl_tcp)( .*)? -d {re.escape(dev)}( |$)|rx\\.py --args rtl={re.escape(dev)} )" if dev
+           else r"(rtl_power|rtl_fm)( |$)")
     for sig, pause in (("-TERM", wait_s), ("-KILL", 1.0)):
         subprocess.call(["pkill", sig, "-f", pat], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         t0 = time.time()
@@ -4368,6 +4370,30 @@ def follow_hit(obj: dict) -> None:
         if follow_busy(now):
             return                           # still tuning or probing, or busy with a live one: it's queued in "recent"
     follow_next(now)
+
+
+MANUAL_RENEW_S = (40.0, 100.0)   # the apps renew a listen about once a minute
+
+
+def manual_listen_is_renewal(mhz: float, mode: str, now: float) -> bool:
+    """A channel tapped while the scanner runs is a one-off visit. Apps before 2026.11.12.11 kept re-sending
+    that tap as their once-a-minute renewal, so every minute the scanner left the trunked system it was
+    following for the tapped carrier (an 854.6 MHz business carrier, on 12 Nov, cost a Bay Pines PD call).
+    The same channel again 40-100 s later, while Follow is on and the scanner has since moved on, is that
+    renewal: keep scanning and keep Follow alive. True when the command has been handled that way."""
+    key = (round(mhz, 3), mode)
+    prev = LISTEN.get("manual_cmd")
+    LISTEN["manual_cmd"] = (key, now)
+    if not (LISTEN["follow"] and prev and prev[0] == key and MANUAL_RENEW_S[0] <= now - prev[1] <= MANUAL_RENEW_S[1]):
+        return False
+    if LISTEN["req"] is not None and abs(LISTEN["mhz"] - mhz) < 0.02:
+        return False                     # still on it: an ordinary renewal of the channel itself
+    LISTEN["follow_until"] = now + FOLLOW_TTL_S
+    if LISTEN["req"] is not None:
+        LISTEN["until"] = now + LISTEN_MAX_S
+    print(f"bridge: listen: {mhz:.4f} MHz again a minute later is the app's renewal of an earlier tap; "
+          "scanning carries on", file=sys.stderr)
+    return True
 
 
 def follow_next(now: float) -> bool:
@@ -4625,9 +4651,169 @@ def stop_tools(procs: list) -> None:
 
 
 def kill_strays() -> None:
-    """A bridge that died mid-listen leaves rtl_tcp/dsd-fme holding the dongle: clear them before starting."""
+    """A bridge that died mid-listen leaves rtl_tcp/dsd-fme/OP25 holding the dongle: clear them before starting."""
     subprocess.call(["pkill", "-f", f"rtl_tcp -a 127.0.0.1 -p {RTL_TCP_PORT}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.call(["pkill", "-f", f"udp:127.0.0.1:{DSD_UDP_PORT}"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.call(["pkill", "-KILL", "-f", f"rx\\.py --args rtl=.* -u {OP25_UDP_PORT} "], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ---------------------------------------------------------------- OP25: the trunked P25 decoder where it is installed
+# On simulcast P25 (several towers sending the same signal, the usual county system) dsd-fme's audio carries
+# about two bit errors per voice frame: the warble a dedicated scanner does not have. OP25's CQPSK demodulator
+# copes better. It does its own trunking (control channel, grants, retunes), reads the dongle itself (no
+# rtl_tcp), sends 8 kHz mono audio over UDP and answers a JSON poll on its HTTP terminal with the call on the
+# air: talkgroup, unit, encryption, NAC and the control channel's message count. That fills the same fields
+# dsd-fme's log does, so holds, mutes, the category filter and the phone's call line work unchanged.
+# Installed by install-op25.sh in /opt/op25. WAVELENS_TRUNK_DECODER: auto (OP25 when installed), op25, dsd-fme.
+OP25_APPS = os.environ.get("WAVELENS_OP25_APPS", "/opt/op25/op25/gr-op25_repeater/apps")
+OP25_UDP_PORT = 23472
+OP25_HTTP_PORT = 23473
+OP25_DIR = "/run/wavelens/op25"
+OP25_MODES = {"trunkq": "cqpsk", "trunk": "c4fm"}
+OP25_START_S = 25.0                        # GNU Radio builds its flowgraph and opens the dongle in this
+OP25 = {"fails": 0, "benched_until": 0.0}
+
+
+def trunk_decoder() -> str:
+    return (os.environ.get("WAVELENS_TRUNK_DECODER") or "auto").strip().lower()
+
+
+def op25_wanted(mode: str) -> bool:
+    if mode not in OP25_MODES or trunk_decoder() in ("dsd", "dsd-fme", "dsdfme"):
+        return False
+    if not os.path.isfile(os.path.join(OP25_APPS, "rx.py")):
+        return False
+    return time.time() >= OP25["benched_until"]
+
+
+def op25_files(mhz: float, mode: str, blocked: tuple) -> str:
+    """trunk.tsv for this control channel (and the skip list as OP25's blacklist); returns its path."""
+    os.makedirs(OP25_DIR, exist_ok=True)
+    black = os.path.join(OP25_DIR, "blacklist.tsv")
+    with open(black + ".tmp", "w") as f:
+        f.writelines(f"{tg}\n" for tg in blocked)
+    os.replace(black + ".tmp", black)
+    tsv = os.path.join(OP25_DIR, "trunk.tsv")
+    cols = ["Sysname", "Control Channel List", "Offset", "NAC", "Modulation", "TGID Tags File", "Whitelist", "Blacklist",
+            "Center Frequency"]
+    vals = ["Wavelens", f"{mhz:.5f}", "0", "0", OP25_MODES[mode], "", "", black if blocked else "", ""]
+    with open(tsv + ".tmp", "w") as f:
+        f.write("\t".join(f'"{c}"' for c in cols) + "\n" + "\t".join(f'"{v}"' for v in vals) + "\n")
+    os.replace(tsv + ".tmp", tsv)
+    return tsv
+
+
+def op25_poll(proc, gen: int) -> None:
+    """Ask OP25's HTTP terminal twice a second what is on the air; keep the fields the trunk loop reads."""
+    url = f"http://127.0.0.1:{OP25_HTTP_PORT}/"
+    body = json.dumps([{"command": "update", "arg1": 0, "arg2": 0}]).encode()
+    tsbks0 = None
+    while proc.poll() is None and LISTEN["gen"] == gen:
+        time.sleep(0.5)
+        try:
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=2) as r:       # noqa: S310 - localhost
+                msgs = json.loads(r.read().decode("utf-8", "replace") or "[]")
+        except Exception:  # noqa: BLE001 - starting up, or busy: next time
+            continue
+        now = time.time()
+        proc.http_at = now
+        tgid, freq, src, enc, nac, tsbks = None, 0.0, 0, None, None, None
+        for m in msgs if isinstance(msgs, list) else []:
+            if not isinstance(m, dict):
+                continue
+            jt = m.get("json_type")
+            if jt == "trunk_update":
+                src, enc, nac = m.get("srcaddr") or 0, m.get("encrypted"), m.get("nac")
+                for k, v in m.items():
+                    if isinstance(v, dict) and isinstance(v.get("tsbks"), int):
+                        tsbks = (tsbks or 0) + v["tsbks"]
+            elif jt == "change_freq":
+                tgid, freq = m.get("tgid"), float(m.get("freq") or 0.0)
+        if tsbks is not None:
+            if tsbks0 is not None and tsbks > tsbks0:
+                proc.sync, proc.sync_at, proc.ctrl_at = "P25p1", now, now
+                proc.alive_at = getattr(proc, "alive_at", 0.0) or now
+            tsbks0 = tsbks
+        if isinstance(nac, int) and nac:
+            proc.nac = f"{nac:X}"
+        try:
+            tg = int(tgid or 0)
+        except (TypeError, ValueError):
+            tg = 0
+        if tg:
+            try:
+                unit = int(src or 0)
+            except (TypeError, ValueError):
+                unit = 0
+            e = bool(enc) if enc is not None else None
+            said = f"TG {tg}" + (f" from {unit}" if unit else "")
+            had = (proc.call or "").split(" ·")[0]
+            if said != had and not had.startswith(said + " from "):
+                proc.call = said
+            proc.call_at = proc.voice_at = now
+            proc.sync, proc.sync_at = "P25p1", now
+            if e is not None:
+                proc.enc_now, proc.enc_at = e, now
+            active_note(proc, tg, unit, e)
+            proc.voice_mhz = freq / 1e6 if freq > 1e6 else freq
+
+
+def start_op25(mhz: float, mode: str, gen: int, blocked: tuple):
+    """OP25's rx.py on the listening dongle, following the system on this control channel. The process (with
+    the same fields start_tool gives dsd-fme), or None when it does not come up (the caller uses dsd-fme)."""
+    try:
+        tsv = op25_files(mhz, mode, blocked)
+    except OSError as e:
+        print(f"bridge: listen: OP25 files not written ({e}); using dsd-fme", file=sys.stderr)
+        return None
+    dev = LISTEN["dev"] or "0"
+    argv = ["python3", "rx.py", "--args", f"rtl={dev}", "-S", "960000", "-q", str(int(LISTEN["ppm"] or 0))]
+    if LISTEN["gain"]:
+        argv += ["-N", f"LNA:{int(LISTEN['gain'])}"]
+    argv += ["-X", "-V", "-2", "-w", "-W", "127.0.0.1", "-u", str(OP25_UDP_PORT), "-T", tsv,
+             "-l", f"http:127.0.0.1:{OP25_HTTP_PORT}", "-v", "1", "--nocrypt"]
+    try:
+        p = subprocess.Popen(argv, cwd=OP25_APPS, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except (FileNotFoundError, OSError) as e:
+        print(f"bridge: listen: OP25 did not start ({e}); using dsd-fme", file=sys.stderr)
+        return None
+    p.err_tail, p.err_log = deque(maxlen=3), deque(maxlen=15)
+    p.sync, p.sync_at, p.call, p.call_at = "", 0.0, "", 0.0
+    p.voice_at, p.enc_now, p.enc_at = 0.0, False, 0.0
+    p.frames = {"voice": 0, "bad": 0, "ctrl": 0}
+    p.decoder = "OP25"
+
+    def drain(proc=p):
+        for ln in proc.stderr:
+            ln = ANSI_RE.sub("", ln.decode("utf-8", "replace")).strip()
+            if ln:
+                proc.err_tail.append(ln)
+                proc.err_log.append(ln)
+                if re.search(r"(?i)traceback|error|fail|usb_claim|unable|exception", ln):
+                    log_line(f"OP25: {ln}")
+    threading.Thread(target=drain, daemon=True).start()
+    threading.Thread(target=op25_poll, args=(p, gen), daemon=True).start()
+    t0 = time.time()
+    while time.time() - t0 < OP25_START_S and LISTEN["gen"] == gen:
+        if p.poll() is not None:
+            break
+        if getattr(p, "http_at", 0.0):
+            OP25["fails"] = 0
+            print(f"bridge: listen: OP25 decoding {mhz:.4f} MHz ({OP25_MODES[mode]}), up in {time.time() - t0:.0f} s",
+                  file=sys.stderr)
+            return p
+        time.sleep(0.25)
+    stop_tools([p])
+    if LISTEN["gen"] != gen:
+        return None
+    OP25["fails"] += 1
+    if OP25["fails"] >= 3:
+        OP25["benched_until"], OP25["fails"] = time.time() + 600.0, 0
+    print(f"bridge: listen: OP25 did not come up on {mhz:.4f} MHz; using dsd-fme"
+          + (f" (benched for 10 min)" if OP25["benched_until"] > time.time() else "")
+          + "; its last lines: " + (" | ".join(p.err_log) or "none"), file=sys.stderr)
+    return None
 
 
 def start_tool(cmd: str, gen: int, attempts: int = 12, **kw):
@@ -4964,7 +5150,32 @@ def _serve_listen(req: tuple, gen: int) -> None:
     procs = []
     sock = None
     pager, out_rate, demod_rate = False, LISTEN_RATE, float(AFC_RATE_IN)
-    if mode in DIGITAL_MODES:
+    op25 = None
+    if mode in DIGITAL_MODES and op25_wanted(mode):
+        kill_strays()
+        blocked = trunk_blocked(mhz) if mode in TRUNK_GROUPS_MODES else ()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2 * 1024 * 1024)
+        except OSError:
+            pass
+        sock.bind(("127.0.0.1", OP25_UDP_PORT))
+        sock.settimeout(0.5)
+        op25 = start_op25(mhz, mode, gen, blocked)
+        if op25 is None:
+            sock.close()
+            sock = None
+            if LISTEN["gen"] != gen:
+                return
+        else:
+            LISTEN["blocked"], LISTEN["blocked_at"] = blocked, time.time()
+            if blocked:
+                print(f"bridge: listen: {len(blocked)} talkgroup(s) outside the filter or always encrypted are not followed", file=sys.stderr)
+            procs.append(op25)
+            p, chans = op25, 1               # OP25 sends 8 kHz 16-bit mono, 20 ms per datagram
+    if op25 is not None:
+        pass                                 # OP25 reads the dongle itself: no rtl_tcp, no dsd-fme
+    elif mode in DIGITAL_MODES:
         flag, chans = DIGITAL_MODES[mode]
         kill_strays()
         # -b 32 / -n 64: more and bigger USB transfers than the defaults, so a busy moment on the Pi (the
@@ -5047,7 +5258,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
     LISTEN["proc"] = p
     LISTEN["starting"] = False
     LISTEN["tuned_at"] = LISTEN["last_audio"] = time.time()
-    print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})", file=sys.stderr)
+    print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})" + (" · OP25" if op25 is not None else ""), file=sys.stderr)
     listen_status(f"listening on {mhz:.4f} MHz ({mode.upper()}); the RTL-SDR sweep is paused")
     enc = Ima()
     in_rate = out_rate if sock is None else LISTEN_RATE
@@ -5204,6 +5415,8 @@ def _serve_listen(req: tuple, gen: int) -> None:
                 data = sock.recv(65536)
             except socket.timeout:
                 continue
+            if op25 is not None and len(data) < 64:
+                continue                     # OP25's end-of-call marker, not audio
             return layout.feed(data)
 
     ended_itself = True
@@ -6037,6 +6250,8 @@ def run_peripheral(name: str) -> None:
                     except (TypeError, ValueError):
                         tol = 0.05
                     mode = str(cmd.get("mode") or "fm")
+                    if manual_listen_is_renewal(mhz, mode, time.time()):
+                        return
                     # A tap on a channel the RadioReference list knows as part of a trunked system: follow the
                     # system (P25 / EDACS / DMR with its control channel and channel map) instead of probing
                     # the channel as if it were conventional — AUTO on an EDACS or P25 data stream yields a
