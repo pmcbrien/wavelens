@@ -5424,7 +5424,70 @@ def feed_rtl433_child(dev: str, extra: str = "") -> None:
 
 RTL433_DEFAULT_ARGS = "-f 315M -f 433.92M -f 915M -H 30 -g 40"
 RTL433_CHILD = {"p": None}       # the rtl_433 the auto plan runs, so a region change can restart it
-AUTO = {"on": False, "known": set(), "hackrf": False, "args": None}
+AUTO = {"on": False, "known": set(), "hackrf": False, "args": None, "listen_home": None}
+
+
+USB_RESCUE = {"seen_at": 0.0, "tries": [], "gave_up": False}
+USB_RESCUE_AFTER_S = 10.0          # a port with something on it that won't enumerate, this long, is a hung radio
+USB_RESCUE_GAP_S = 120.0           # at most one power cycle every two minutes ...
+USB_RESCUE_PER_HOUR = 3            # ... and three an hour; then say so and leave it to a replug
+
+
+def usb_stuck_hubs(status: str) -> "list[str]":
+    """Hubs (uhubctl location ids) with a port that has something connected that never enumerated:
+    "Port 1: 0503 power highspeed enable connect []". An unplugged port has no "connect" at all, so a
+    radio the user pulled out never counts; only a hung one (error -71, not accepting address) does."""
+    hubs, hub = [], None
+    for line in status.splitlines():
+        m = re.match(r"Current status for hub (\S+)", line.strip())
+        if m:
+            hub = m.group(1); continue
+        if hub and re.search(r"\bconnect \[\]\s*$", line) and hub not in hubs:
+            hubs.append(hub)
+    return hubs
+
+
+def usb_all_hubs(status: str) -> "list[str]":
+    return re.findall(r"Current status for hub (\S+)", status)
+
+
+def usb_rescue(now: float, status: "str | None" = None, run=None) -> bool:
+    """A hung RTL-SDR drops off the bus and stays connected-but-dead until its power is cut. Cut power to
+    every USB port for five seconds (on a Pi 5 a single port can't be switched on its own, so the other
+    radio blinks too) and let hotplug put the roles back. Rate-limited; returns True when it cycled."""
+    run = run or (lambda cmd: subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30).stdout)
+    if USB_RESCUE["gave_up"] or not shutil.which("uhubctl"):
+        return False
+    status = run("uhubctl") if status is None else status
+    stuck = usb_stuck_hubs(status or "")
+    if not stuck:
+        USB_RESCUE["seen_at"] = 0.0
+        return False
+    if not USB_RESCUE["seen_at"]:
+        USB_RESCUE["seen_at"] = now or 1e-9
+        return False
+    if now - USB_RESCUE["seen_at"] < USB_RESCUE_AFTER_S:
+        return False
+    tries = [t for t in USB_RESCUE["tries"] if now - t < 3600.0]
+    USB_RESCUE["tries"] = tries
+    if tries and now - tries[-1] < USB_RESCUE_GAP_S:
+        return False
+    if len(tries) >= USB_RESCUE_PER_HOUR:
+        USB_RESCUE["gave_up"] = True
+        print("bridge: usb: a radio is still hung after three power cycles this hour; unplug it and plug it back in", file=sys.stderr)
+        emit({"t": "status", "msg": "A radio is stuck on USB and power cycles didn't free it: unplug it and plug it back in", "band": state["band"], "mode": state["mode"]})
+        return False
+    hubs = usb_all_hubs(status)
+    print(f"bridge: usb: radio hung on hub {', '.join(stuck)}; power-cycling USB ({len(tries) + 1} of {USB_RESCUE_PER_HOUR} this hour)", file=sys.stderr)
+    emit({"t": "status", "msg": "A radio hung on USB: power-cycling the USB ports (about 10 s)", "band": state["band"], "mode": state["mode"]})
+    for h in hubs:
+        run(f"uhubctl -l {shlex.quote(h)} -a off")
+    time.sleep(5)
+    for h in hubs:
+        run(f"uhubctl -l {shlex.quote(h)} -a on")
+    USB_RESCUE["tries"].append(now)
+    USB_RESCUE["seen_at"] = 0.0
+    return True
 
 
 def hotplug_watch() -> None:
@@ -5432,57 +5495,78 @@ def hotplug_watch() -> None:
     is listening becomes the listening/sweep dongle; a HackRF that appears starts sweeping; something that
     vanishes is said once (the hardware line on the phone shows it too). Serials never matter: the plan
     is redone from what is present."""
-    a = AUTO["args"]
     while True:
         time.sleep(10)
         try:
-            now_rtl = set(usb_rtl_serials())
-            hk = hackrf_on_usb()
-            gone = AUTO["known"] - now_rtl
-            new = now_rtl - AUTO["known"]
-            for sn in gone:
-                role = "listen" if sn == LISTEN.get("dev") else "a sweep/sensor"
-                print(f"bridge: hotplug: RTL-SDR {sn} ({role} dongle) left the bus", file=sys.stderr)
-                if sn == LISTEN.get("dev"):
-                    spare = [x for x in now_rtl if x != AUTO.get("rtl433")]
-                    if spare:
-                        LISTEN["dev"] = spare[0]
-                        print(f"bridge: hotplug: listening moves to {spare[0]}", file=sys.stderr)
-                        emit({"t": "status", "msg": f"RTL-SDR {sn} unplugged; listening on {spare[0]} now", "band": state["band"], "mode": state["mode"]})
-                    else:
-                        emit({"t": "status", "msg": f"RTL-SDR {sn} unplugged: nothing left to listen with", "band": state["band"], "mode": state["mode"]})
-            for sn in new:
-                print(f"bridge: hotplug: RTL-SDR {sn} appeared", file=sys.stderr)
-                if not LISTEN.get("dev") or LISTEN["dev"] not in now_rtl:
-                    LISTEN["dev"] = sn
-                    if "listen" not in CAPS:
-                        CAPS.extend(["listen", "trunk"])
-                    if a is not None and not any(sn in d for d in SWEEP_DEVS):
-                        specs = SWEEP_VHF + SWEEP_UHF + ([] if sweep_specs_cover(SWEEP_VHF + SWEEP_UHF, CC_BANDS[0]) else [CC_BANDS[0][0]])
-                        SWEEP_DEVS.add(sn)
-                        for sp in specs:
-                            SWEEP_RANGES.append((_mhz(sp.split(":")[0]), _mhz(sp.split(":")[1])))
-                        threading.Thread(target=feed_rtl_power, args=(specs, sn, max(3, a.rtl_power_dwell), a.rtl_ppm, a.rtl_gain), daemon=True).start()
-                        if "sweep" not in CAPS:
-                            CAPS.append("sweep")
-                    print(f"bridge: hotplug: {sn} is now the listening + sweep dongle", file=sys.stderr)
-                    emit({"t": "status", "msg": f"RTL-SDR {sn} plugged in: listening and sweeping on it", "band": state["band"], "mode": state["mode"]})
-                    hello()
-                elif AUTO["on"] and not AUTO.get("rtl433") and shutil.which("rtl_433"):
-                    AUTO["rtl433"] = sn
-                    threading.Thread(target=feed_rtl433_child, args=(sn,), daemon=True).start()
-                    print(f"bridge: hotplug: {sn} is now the sensor (rtl_433) dongle", file=sys.stderr)
-                    hello()
-            if hk and not AUTO["hackrf"] and a is not None and not HACKRF_ON:
-                print("bridge: hotplug: HackRF appeared; sweeping 1–6000 MHz with it", file=sys.stderr)
-                globals()["HACKRF_ON"] = True
-                if "sweep" not in CAPS: CAPS.append("sweep")
-                if "park" not in CAPS: CAPS.append("park")
-                hackrf_start(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask, a.hackrf_ppm)
-                hello()
-            AUTO["known"], AUTO["hackrf"] = now_rtl, hk
+            hotplug_step(set(usb_rtl_serials()), hackrf_on_usb())
+            usb_rescue(time.time())
         except Exception as e:
             print(f"bridge: hotplug: {e}", file=sys.stderr)
+
+
+def hotplug_step(now_rtl: "set[str]", hk: bool) -> None:
+    """One look at the bus (hotplug_watch). A listening dongle that drops off and comes back gets
+    listening back: while it was gone the job moved to the sweep dongle, which then had to share."""
+    a = AUTO["args"]
+    gone = AUTO["known"] - now_rtl
+    new = now_rtl - AUTO["known"]
+    for sn in gone:
+        role = "listen" if sn == LISTEN.get("dev") else "a sweep/sensor"
+        print(f"bridge: hotplug: RTL-SDR {sn} ({role} dongle) left the bus", file=sys.stderr)
+        if sn == LISTEN.get("dev"):
+            AUTO["listen_home"] = sn          # give it back when it returns
+            spare = [x for x in now_rtl if x != AUTO.get("rtl433")]
+            if spare:
+                LISTEN["dev"] = spare[0]
+                print(f"bridge: hotplug: listening moves to {spare[0]}", file=sys.stderr)
+                emit({"t": "status", "msg": f"RTL-SDR {sn} unplugged; listening on {spare[0]} now", "band": state["band"], "mode": state["mode"]})
+            else:
+                emit({"t": "status", "msg": f"RTL-SDR {sn} unplugged: nothing left to listen with", "band": state["band"], "mode": state["mode"]})
+    for sn in new:
+        print(f"bridge: hotplug: RTL-SDR {sn} appeared", file=sys.stderr)
+        if sn == AUTO.get("listen_home") and LISTEN.get("dev") and LISTEN["dev"] != sn and LISTEN["dev"] in now_rtl:
+            AUTO["listen_home"] = None
+            LISTEN["dev"] = sn
+            print(f"bridge: hotplug: {sn} is back; listening returns to it", file=sys.stderr)
+            emit({"t": "status", "msg": f"RTL-SDR {sn} is back: listening on it again", "band": state["band"], "mode": state["mode"]})
+            if LISTEN["req"] is not None:
+                listen_resolve(LISTEN["mode"], "the listening dongle is back")
+            hello()
+            continue
+        if sn == AUTO.get("listen_home") and LISTEN.get("dev") == sn:
+            AUTO["listen_home"] = None                # nothing else could listen while it was gone: restart on it
+            if LISTEN["req"] is not None:
+                listen_resolve(LISTEN["mode"], "the listening dongle is back")
+            continue
+        if not LISTEN.get("dev") or LISTEN["dev"] not in now_rtl:
+            AUTO["listen_home"] = None
+            LISTEN["dev"] = sn
+            if "listen" not in CAPS:
+                CAPS.extend(["listen", "trunk"])
+            if a is not None and not any(sn in d for d in SWEEP_DEVS):
+                specs = SWEEP_VHF + SWEEP_UHF + ([] if sweep_specs_cover(SWEEP_VHF + SWEEP_UHF, CC_BANDS[0]) else [CC_BANDS[0][0]])
+                SWEEP_DEVS.add(sn)
+                for sp in specs:
+                    SWEEP_RANGES.append((_mhz(sp.split(":")[0]), _mhz(sp.split(":")[1])))
+                threading.Thread(target=feed_rtl_power, args=(specs, sn, max(3, a.rtl_power_dwell), a.rtl_ppm, a.rtl_gain), daemon=True).start()
+                if "sweep" not in CAPS:
+                    CAPS.append("sweep")
+            print(f"bridge: hotplug: {sn} is now the listening + sweep dongle", file=sys.stderr)
+            emit({"t": "status", "msg": f"RTL-SDR {sn} plugged in: listening and sweeping on it", "band": state["band"], "mode": state["mode"]})
+            hello()
+        elif AUTO["on"] and not AUTO.get("rtl433") and len(now_rtl) >= 3 and shutil.which("rtl_433"):   # sensors only with a third dongle, as at start
+            AUTO["rtl433"] = sn
+            threading.Thread(target=feed_rtl433_child, args=(sn,), daemon=True).start()
+            print(f"bridge: hotplug: {sn} is now the sensor (rtl_433) dongle", file=sys.stderr)
+            hello()
+    if hk and not AUTO["hackrf"] and a is not None and not HACKRF_ON:
+        print("bridge: hotplug: HackRF appeared; sweeping 1–6000 MHz with it", file=sys.stderr)
+        globals()["HACKRF_ON"] = True
+        if "sweep" not in CAPS: CAPS.append("sweep")
+        if "park" not in CAPS: CAPS.append("park")
+        hackrf_start(a.hackrf_range, a.hackrf_bin, a.hackrf_lna, a.hackrf_vga, a.hackrf_mask, a.hackrf_ppm)
+        hello()
+    AUTO["known"], AUTO["hackrf"] = now_rtl, hk
 
 
 SWEEP_DEVS: "set[str]" = set()

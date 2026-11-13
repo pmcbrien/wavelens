@@ -129,6 +129,8 @@ install_files() {   # from $SRC into $LIB (same list as install-service.sh)
     install -d "$LIB" "$LIB/packs" "$LIB/firmware"
     # every module the bridge might import, not a hand-kept list: a new .py (spotters.py, 4 Nov) that the
     # list forgot made the update fail preflight with ModuleNotFoundError and roll back
+    # uhubctl lets the bridge power-cycle USB when a radio hangs (2026.11.12.9); units provisioned before then lack it
+    command -v uhubctl >/dev/null 2>&1 || timeout 120 apt-get install -y -q uhubctl >/dev/null 2>&1 || true
     install -m 0644 "$p"/*.py "$LIB/"
     install -m 0755 "$p/run-bridge.sh" "$LIB/"
     chmod 0755 "$LIB/wavelens_bridge.py" "$LIB/smartnet.py"

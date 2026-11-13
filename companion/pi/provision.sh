@@ -81,9 +81,9 @@ fi
 echo "== packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q git python3 python3-pip python3-dbus python3-gi rtl-sdr rtl-433 bluez bluez-tools \
+apt-get install -y -q git python3 python3-pip python3-dbus python3-gi rtl-sdr rtl-433 uhubctl bluez bluez-tools \
     network-manager avahi-daemon esptool curl multimon-ng sox || \
-apt-get install -y -q git python3 python3-pip python3-dbus python3-gi rtl-sdr rtl-433 bluez network-manager \
+apt-get install -y -q git python3 python3-pip python3-dbus python3-gi rtl-sdr rtl-433 uhubctl bluez network-manager \
     avahi-daemon curl
 # esptool from apt is missing on some images; pip is fine for a tool
 command -v esptool.py >/dev/null 2>&1 || command -v esptool >/dev/null 2>&1 || pip3 install -q --break-system-packages esptool || true
