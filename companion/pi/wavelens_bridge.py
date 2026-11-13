@@ -74,6 +74,11 @@ except ImportError:                  # an install that predates region packs: US
         @staticmethod
         def radio_plan(pack): return {}
 try:
+    import freqdb                    # noqa: E402  the owner's own frequency list (companion/pi/freqdb.py)
+    OWN = freqdb.Lookup()            # re-reads /etc/wavelens/frequencies.json by itself when the admin page changes it
+except ImportError:                  # an install that predates it
+    OWN = None
+try:
     import audioop                   # C-speed mixing/resampling; gone in Python 3.13 (the Pi images have it)
 except ImportError:
     audioop = None
@@ -1527,14 +1532,19 @@ FCC: "FccPack | None" = None
 
 
 def licensed_label(mhz: float, tol_khz: float):
-    """What is known to be on a frequency: the RadioReference overlay first (curated, with mode and
-    tone), then the FCC pack. Either returns (name, cat, conf, extras) or None.
+    """What is known to be on a frequency: the owner's own list first (the admin page's Frequencies tab:
+    what they typed in beats any record), then the RadioReference overlay (curated, with mode and
+    tone), then the FCC pack. Each returns (name, cat, conf, extras) or None.
     Not in the bands the sweep skips (2.4 / 5 GHz Wi-Fi and Bluetooth): a 2.4 GHz licence does exist
     for many agencies, but what the sweep hears there is Wi-Fi, and a morning of "11 law-enforcement
     licensees in this bin" for the neighbour's router is worse than no label."""
     b = band_of(mhz)
     if b is not None and b.get("name") is None:
         return None
+    if OWN:
+        lic = OWN.label(mhz, tol_khz=tol_khz)
+        if lic:
+            return lic
     if RR:
         lic = RR.label(mhz, tol_khz=tol_khz)
         if lic:
@@ -2037,7 +2047,8 @@ class Sweep:
                 if cat in PERSIST and n < 2:
                     continue
                 # a named licensee keeps its own id; an ambiguous wide-bin hit falls back to the 1 MHz bucket id
-                ident = f"fcc/{lx['call_sign']}/{mhz:.3f}" if lx.get("call_sign") else None
+                ident = (f"fcc/{lx['call_sign']}/{mhz:.3f}" if lx.get("call_sign")
+                         else f"own/{lx['own_id']}" if lx.get("own_id") else None)   # one of the owner's channels: its own card
                 self.report(mhz, db, step, db - f, name, cat, conf, None, ident, now, x)
                 continue
             b = band_of(mhz)
@@ -3205,7 +3216,9 @@ LOCKOUT_TOL = 0.02                         # a hit within this of a locked-out f
 
 
 def locked_out(mhz: float) -> bool:
-    return any(abs(mhz - f) <= LOCKOUT_TOL for f in LISTEN["lockout"])
+    """Follow leaves this frequency alone: the phone's lockout list, or a channel locked out in the owner's
+    frequency list on the admin page."""
+    return any(abs(mhz - f) <= LOCKOUT_TOL for f in LISTEN["lockout"]) or bool(OWN and OWN.locked(mhz))
 LISTEN_CV = threading.Condition()
 # LISTEN["recent"] / LISTEN["played"] are touched by the sweep reader (follow hits), follow_watch and the phone's
 # commands (lockout), each on its own thread: iterating one while another adds or deletes raised "dictionary
@@ -5341,7 +5354,7 @@ def feed_rtl433(line: str) -> None:
     except (TypeError, ValueError):
         rssi = -70
     x = {k: str(v) for k, v in d.items() if k in ("pressure_kPa", "pressure_PSI", "temperature_C", "battery_ok", "mic", "type")}
-    if (FCC or RR) and cat == "UNKNOWN" and freq_f:
+    if (FCC or RR or OWN) and cat == "UNKNOWN" and freq_f:
         lic = licensed_label(freq_f, 12.5)
         if lic:
             _, cat, conf, lx = lic

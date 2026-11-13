@@ -32,11 +32,56 @@ later visit asks for that password; a login lasts 12 hours on that device. Chang
 | **Logs** | The last 300 lines of the bridge's log, refreshing every 2 seconds. The very chatty signal lines are hidden unless you tick *include rf/spec lines*. *Download full log* saves the last 5000 lines to send to support. |
 | **Settings** | The radio name the app lists under *Find*, and the bridge's options from `/etc/default/wavelens-bridge`, with the file's own explanations below. Saving restarts the bridge. The **Bluetooth and remote access** card has four on/off switches: Wi-Fi set-up from the app (`WAVELENS_WIFI_SETUP`), updates and area from the app (`WAVELENS_APP_CONTROL`), accepting Bluetooth pairing without a prompt (the `wavelens-bt-agent` service) and SSH login (the `ssh` service). Only what changed is touched; the bridge restarts only for the first two. |
 | **Area** | Where the Scanner is used: a two-letter country and a postcode, any country. *Set area and download* fetches the public licence records around that place (where a country publishes them, today the United States) so hits are named by licensee. Needs Wi-Fi; restarts the bridge. **Your own RadioReference exports**: upload the CSV downloads from your RadioReference account here (a county's, a state's or the nationwide frequencies, a trunked system's sites, its talkgroups; several at once), see what each was recognised as, and delete them. The files stay on the Scanner in `/var/lib/wavelens/area/rr/`; uploading or deleting restarts the bridge. |
+| **Frequencies** | Your own frequency list, kept on the Scanner. Add, edit, group, search and delete channels; lock one out so Follow never stops on it; import a list you already keep and export yours; put back an earlier version. See [Your own frequency list](#your-own-frequency-list) below. No restart: a change is in use within a few seconds. |
 | **Update** | Installed and available version, *Check now*, *Install update*, *Roll back to previous*, and a box for installing updates automatically overnight. Progress streams onto the page. Updates are free for life and come from the public GitHub repo `pmcbrien/wavelens`; the Pi needs Wi-Fi to fetch them. |
 | **Wi-Fi** | Networks nearby, join one, forget saved ones, and rename the Pi. Do this on your home Wi-Fi, not public Wi-Fi: the password you type travels over the local network unencrypted. |
 | **Spotter** | *Spotters on this Pi*: each ESP32 plugged into the Pi's USB, whether it's working, what it's heard, and its job (Automatic, Bluetooth only, a Wi-Fi channel, …) — change it from the list. Then flash a Spotter plugged into the Pi's USB: download the latest firmware (one image per chip: classic ESP32, S3, C3, C5, C6), or upload a `.bin`, pick the port, flash. With the downloaded firmware the Pi asks the board which chip it is and flashes the matching image; an uploaded file is flashed as given (`--chip auto`). Progress streams onto the page. Needs `esptool` on the Pi (`sudo apt install esptool`). |
 | **Power** | Restart the bridge, restart the admin page, reboot, shut down. Each asks you to confirm. |
 | **Account** | Change the admin password, log out. |
+
+## Your own frequency list
+
+The **Frequencies** page is where you keep the channels you care about. What the Scanner does with them:
+
+- **Names.** A hit on one of your frequencies is named from your list first, ahead of any licence record or RadioReference export.
+  A hit on a channel's repeater input says *keying up nearby*.
+- **Mode.** Listen and Follow tune the channel in the mode you set (FM, AM, DMR, P25, NXDN) instead of working it out.
+- **Lockout.** Follow never stops on a channel you lock out: a pager, a busy repeater, a data channel. This adds to the
+  lockout list in the app; neither replaces the other.
+
+Each channel has a name, a frequency, and optionally a repeater input, mode, tone or code, group, who uses it, tags, notes,
+an emission designator, a bandwidth and a position. Two channels are the same channel when frequency and tone agree, and the
+page won't keep two of those.
+
+**Import** reads a file from your phone or computer, works out what kind it is from its contents, and shows what it read
+(and which rows it left out, and why) before anything is added:
+
+| File | What is read |
+|------|--------------|
+| Wavelens frequency list (JSON) | everything, as exported |
+| Plain CSV | a header row with a frequency column (`frequency`, `freq`, `mhz`, `frequency_mhz` or `frequency_hz`); `name`, `input`, `mode`, `tone`, `group`, `service`, `tags`, `lockout`, `notes`, `lat`, `lon` when present |
+| CHIRP CSV | name, frequency, duplex and offset, tone or DCS, mode, skip, comment |
+| Gqrx bookmarks | frequency, name, modulation, bandwidth; the first tag becomes the group |
+| SDR++ frequency manager | an exported list or the whole file: name, frequency, bandwidth, mode |
+| RadioReference CSV | your own export of conventional frequencies. Trunked sites and talkgroups go in the area folder instead (the **Area** page) |
+
+**Export** writes the whole list or one group as the Wavelens JSON, plain CSV, CHIRP CSV, Gqrx bookmarks or an SDR++ list.
+The Wavelens file keeps everything; the others carry what they have room for.
+
+**Backups.** Every change keeps the list it replaced, the last 20 of them, in `/var/lib/wavelens/frequency-backups/`.
+*Put back* restores one, and keeps today's list as a backup too. For a copy that survives a lost SD card, export the list.
+
+**The format.** The list is one JSON file, `/etc/wavelens/frequencies.json` (updates never touch it), format
+`wavelens-frequencies/1`. Its layout is published as a JSON Schema (the link on the page, or `freqdb.py schema`).
+Frequencies are whole hertz; emission designators are the ITU ones (11K2F3E); CTCSS tones are in hertz, DCS codes octal,
+P25 NACs hex; times are ISO 8601 in UTC; positions are WGS 84 decimal degrees.
+
+Over SSH the same list has a command line:
+
+    sudo python3 /usr/local/lib/wavelens/freqdb.py list
+    sudo python3 /usr/local/lib/wavelens/freqdb.py check my-list.csv        # what an import would take; changes nothing
+    sudo python3 /usr/local/lib/wavelens/freqdb.py import my-list.csv --mode add
+    sudo python3 /usr/local/lib/wavelens/freqdb.py export --format chirp > radio.csv
 
 ## When something goes wrong
 

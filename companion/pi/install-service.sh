@@ -29,7 +29,7 @@ install -d /usr/local/lib/wavelens /usr/local/lib/wavelens/packs /usr/local/lib/
 # owner's own RadioReference exports in rr/. The bridge reads it at start; nothing ships in it.
 install -d /var/lib/wavelens/area /var/lib/wavelens/area/rr
 install -m 0755 wavelens_bridge.py smartnet.py run-bridge.sh /usr/local/lib/wavelens/
-install -m 0644 regions.py spotters.py area.py /usr/local/lib/wavelens/
+install -m 0644 regions.py spotters.py area.py freqdb.py /usr/local/lib/wavelens/
 install -m 0755 wavelens-area /usr/local/bin/wavelens-area
 install -m 0644 ../../packs/??.json /usr/local/lib/wavelens/packs/ 2>/dev/null || true
 install -m 0644 ../VERSION /usr/local/lib/wavelens/VERSION

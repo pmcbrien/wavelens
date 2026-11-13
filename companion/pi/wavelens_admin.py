@@ -10,6 +10,7 @@ Pages:  /          status, Pi facts, update banner, quick actions
         /logs      bridge journal (last 300 lines, live polling, download)
         /settings  /etc/default/wavelens-bridge editor (comments preserved), and the Bluetooth / Wi-Fi
                    set-up / SSH switches (POST /security)
+        /frequencies  your own frequency list: add, edit, lock out, import, export, backups (freqdb.py)
         /update    check / install / roll back via /usr/local/bin/wavelens-update
         /wifi      join a network, forget saved ones, rename the Pi
         /spotter   flash a Wavelens Spotter (ESP32) over USB with esptool
@@ -54,6 +55,12 @@ import time
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import freqdb                    # the owner's frequency list (companion/pi/freqdb.py)
+except ImportError:                  # an install that predates it: the Frequencies tab says to update
+    freqdb = None
 
 # --------------------------------------------------------------------------------------------
 # Paths and constants (match install-service.sh / wavelens-bridge.service)
@@ -933,9 +940,15 @@ textarea{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
 pre{background:#0a0c0f;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto;max-height:60vh;font-size:12px;line-height:1.35;white-space:pre-wrap;word-break:break-all}
 footer{color:var(--mut);font-size:12px;text-align:center;padding:24px 16px}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}form.inline{display:inline}
+input[type=number],input[type=file]{padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit;max-width:100%}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}table.list th{width:auto;white-space:nowrap}table.list td{white-space:nowrap}table.list td.wrap{white-space:normal;min-width:160px}
+td.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,Menlo,Consolas,monospace}
+.pill{display:inline-block;padding:1px 8px;border:1px solid var(--line);border-radius:999px;font-size:12px;color:var(--mut)}.pill.lock{border-color:var(--bad);color:var(--bad)}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:0 14px}.check{display:flex;align-items:center;gap:8px;color:var(--fg);font-size:16px}
+.check input{width:20px;height:20px}.row.end{align-items:flex-end}.row.end>div{flex:1 1 140px}
 """
 
-NAV = [("/", "Status"), ("/logs", "Logs"), ("/settings", "Settings"), ("/area", "Area"), ("/update", "Update"),
+NAV = [("/", "Status"), ("/logs", "Logs"), ("/settings", "Settings"), ("/area", "Area"), ("/frequencies", "Frequencies"), ("/update", "Update"),
        ("/wifi", "Wi-Fi"), ("/spotter", "Spotter"), ("/power", "Power"), ("/account", "Account")]
 
 
@@ -1096,6 +1109,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_download(self, text, filename, ctype):
+        data = text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", f"{ctype}; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def redirect(self, path, cookie=None):
         self.send_response(303)
         self.send_header("Location", path)
@@ -1178,6 +1202,8 @@ class Handler(BaseHTTPRequestHandler):
             return routes[path](sess)
         if path.startswith("/power/"):
             return self.page_power_confirm(sess, path[7:])
+        if path == "/frequencies" or path.startswith("/frequencies/"):
+            return self.get_frequencies(sess, path, {k: v[0] for k, v in q.items()})
         if path == "/api/logs":
             return self.send_json({"lines": journal_lines(300, noise="noise" in q)})
         if path == "/api/logs.txt":
@@ -1212,7 +1238,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_html(page("Rejected", "<p>Form token mismatch — go back, reload the page and try again.</p>"), 403)
             handlers = {"/logout": self.post_logout, "/account": self.post_account, "/settings": self.post_settings, "/security": self.post_security,
                         "/area": self.post_area, "/update": self.post_update, "/wifi": self.post_wifi, "/spotter": self.post_spotter,
-                        "/bridge/restart": self.post_bridge_restart}
+                        "/bridge/restart": self.post_bridge_restart, "/frequencies": self.post_frequencies}
             if path in handlers:
                 return handlers[path](sess, form, files, tok)
             if path.startswith("/power/"):
@@ -1602,6 +1628,429 @@ The files stay on this Scanner (<code>{esc(RR_DIR)}</code>) and are never sent a
             msg += " Bridge restarted." if rc == 0 else f" The bridge did not restart ({out}); restart it from Power."
         self.flash(sess, msg)
         self.redirect("/area")
+
+    # ---- /frequencies ----------------------------------------------------------------------
+    # The owner's own frequency list. All the rules (what a valid channel is, the file formats, backups,
+    # locking) live in freqdb.py; this is the pages. The bridge re-reads the list by itself when it changes.
+    FREQ_PER_PAGE = 100
+    FREQ_FILTERS = ("q", "group", "mode", "show", "sort", "page")
+    FREQ_SORTS = {"freq": "Frequency", "name": "Name", "group": "Group", "new": "Newest change"}
+
+    @staticmethod
+    def freq_qs(d, **over):
+        """The list's filter settings as a query string (only the known ones, so a form can't steer a redirect)."""
+        keep = {k: str(d.get(k) or "") for k in Handler.FREQ_FILTERS}
+        keep.update({k: str(v) for k, v in over.items()})
+        keep = {k: v[:80] for k, v in keep.items() if v}
+        return ("?" + urllib.parse.urlencode(keep)) if keep else ""
+
+    @staticmethod
+    def freq_options(pairs, chosen):
+        return "".join(f'<option value="{esc(v)}"{" selected" if v == chosen else ""}>{esc(t)}</option>' for v, t in pairs)
+
+    @staticmethod
+    def freq_groups(channels):
+        return sorted({c.get("group") or "" for c in channels} - {""}, key=str.lower)
+
+    def get_frequencies(self, sess, path, q):
+        if freqdb is None:
+            return self.render(sess, "Frequencies", '<div class="warn">This page needs a newer version of the scanner '
+                               'software. <a href="/update">Install the latest update</a>, then come back.</div>', "/frequencies")
+        store = freqdb.Store()
+        if path == "/frequencies/schema":
+            return self.send_download(json.dumps(freqdb.SCHEMA, indent=1) + "\n", "wavelens-frequencies.schema.json", "application/json")
+        if path == "/frequencies/backups":
+            return self.page_freq_backups(sess, store)
+        if path == "/frequencies/backup":
+            try:
+                return self.send_download(read_text(store.backup_path(q.get("name", ""))), "wavelens-frequencies-backup.json", "application/json")
+            except freqdb.StoreError:
+                return self.send_html(page("Not found", "<p>No such backup.</p>"), 404)
+        try:
+            doc = store.load()
+        except freqdb.StoreError as e:
+            return self.render(sess, "Frequencies", f'<div class="warn"><b>{esc(e)}</b></div>'
+                               '<p><a class="btn" href="/frequencies/backups">Backups</a></p>', "/frequencies")
+        if path == "/frequencies":
+            return self.page_freq_list(sess, doc, q)
+        if path == "/frequencies/edit":
+            ch = next((c for c in doc["channels"] if c.get("id") == q.get("id")), None) if q.get("id") else None
+            if q.get("id") and ch is None:
+                self.flash(sess, "That channel is no longer in the list.")
+                return self.redirect("/frequencies")
+            return self.page_freq_edit(sess, doc, self.freq_form_values(ch), ch, q)
+        if path == "/frequencies/import":
+            return self.page_freq_import(sess, doc)
+        if path == "/frequencies/export":
+            fmt = q.get("fmt", "")
+            if fmt not in freqdb.EXPORT_FORMATS:
+                return self.send_html(page("Not found", "<p>No such format.</p>"), 404)
+            chans = [c for c in doc["channels"] if not q.get("group") or c.get("group") == q["group"]]
+            _, filename, ctype = freqdb.EXPORT_FORMATS[fmt]
+            return self.send_download(freqdb.export(chans, fmt), filename, ctype)
+        self.send_html(page("Not found", "<p>No such page.</p>"), 404)
+
+    @staticmethod
+    def freq_tone_text(c):
+        kind, tone = c.get("tone_type") or "", c.get("tone") or ""
+        if not kind:
+            return ""
+        return {"ctcss": f"{tone} Hz", "dcs": f"DCS {tone}", "nac": f"NAC {tone}", "cc": f"CC {tone}", "ran": f"RAN {tone}"}[kind]
+
+    def page_freq_list(self, sess, doc, q):
+        chans = doc["channels"]
+        groups = self.freq_groups(chans)
+        needle = (q.get("q") or "").strip().lower()
+        shown = []
+        for c in chans:
+            if q.get("group") and (c.get("group") or "") != q["group"]:
+                continue
+            if q.get("mode") and c.get("mode") != q["mode"]:
+                continue
+            if q.get("show") == "locked" and not c.get("lockout") or q.get("show") == "open" and c.get("lockout"):
+                continue
+            if needle and needle not in " ".join([c["name"], freqdb.mhz(c["freq_hz"]), c.get("group", ""), c.get("service", ""),
+                                                  c.get("notes", ""), " ".join(c.get("tags") or [])]).lower():
+                continue
+            shown.append(c)
+        sort = q.get("sort") if q.get("sort") in self.FREQ_SORTS else "freq"
+        if sort == "name":
+            shown.sort(key=lambda c: c["name"].lower())
+        elif sort == "group":
+            shown.sort(key=lambda c: ((c.get("group") or "~").lower(), c["freq_hz"]))
+        elif sort == "new":
+            shown.sort(key=lambda c: c.get("updated", ""), reverse=True)
+        pages = max(1, -(-len(shown) // self.FREQ_PER_PAGE))
+        try:
+            pg = min(max(int(q.get("page") or 1), 1), pages)
+        except ValueError:
+            pg = 1
+        rows = []
+        for c in shown[(pg - 1) * self.FREQ_PER_PAGE: pg * self.FREQ_PER_PAGE]:
+            out_of_range = not freqdb.RTL_HZ[0] <= c["freq_hz"] <= freqdb.RTL_HZ[1]
+            pills = ('<span class="pill lock">locked out</span> ' if c.get("lockout") else "") + \
+                    ('<span class="pill" title="Outside what the kit\'s radios tune: kept for reference">reference</span>' if out_of_range else "")
+            pair = f'<br><span class="mut">in {esc(freqdb.mhz(c["input_hz"]))}</span>' if c.get("input_hz") else ""
+            edit = f'/frequencies/edit{self.freq_qs(q, id=c["id"])}'
+            rows.append(f'<tr><td><input type="checkbox" name="id_{esc(c["id"])}" value="1" aria-label="select {esc(c["name"])}"></td>'
+                        f'<td class="num"><a href="{esc(edit)}">{esc(freqdb.mhz(c["freq_hz"]))}</a>{pair}</td>'
+                        f'<td class="wrap"><a href="{esc(edit)}">{esc(c["name"])}</a> {pills}</td>'
+                        f'<td>{esc(freqdb.MODE_NAMES.get(c.get("mode"), "Auto"))}</td><td>{esc(self.freq_tone_text(c))}</td>'
+                        f'<td class="wrap">{esc(c.get("group", ""))}</td></tr>')
+        locked = sum(1 for c in chans if c.get("lockout"))
+        hidden = "".join(f'<input type="hidden" name="{k}" value="{esc(q.get(k) or "")}">' for k in self.FREQ_FILTERS if q.get(k))
+        group_opts = self.freq_options([("", "All groups")] + [(g, g) for g in groups], q.get("group") or "")
+        mode_opts = self.freq_options([("", "All modes")] + [(m, freqdb.MODE_NAMES[m]) for m in freqdb.MODES], q.get("mode") or "")
+        show_opts = self.freq_options([("", "All"), ("locked", "Locked out"), ("open", "Not locked out")], q.get("show") or "")
+        sort_opts = self.freq_options(list(self.FREQ_SORTS.items()), sort)
+        pager = ""
+        if pages > 1:
+            prev_ = f'<a class="btn sec" href="/frequencies{esc(self.freq_qs(q, page=pg - 1))}">Previous</a>' if pg > 1 else ""
+            next_ = f'<a class="btn sec" href="/frequencies{esc(self.freq_qs(q, page=pg + 1))}">Next</a>' if pg < pages else ""
+            pager = f'<div class="row">{prev_}<span class="mut">page {pg} of {pages}</span>{next_}</div>'
+        if not chans:
+            table = ('<p><b>No channels yet.</b> Add one, or import a list you already keep: a spreadsheet saved as CSV, '
+                     'a radio programming file, SDR bookmarks or your own RadioReference export.</p>')
+        elif not shown:
+            table = '<p class="mut">Nothing matches. <a href="/frequencies">Show everything</a></p>'
+        else:
+            table = f"""<form method="post" action="/frequencies">{csrf_field(sess)}{hidden}
+<div class="scroll"><table class="list"><tr><th><input type="checkbox" id="all" aria-label="select all on this page"></th>
+<th>MHz</th><th>Name</th><th>Mode</th><th>Tone / code</th><th>Group</th></tr>{''.join(rows)}</table></div>{pager}
+<div class="row end"><div><label>With the ticked channels</label><select name="act">
+<option value="lock">Lock out (Follow skips them)</option><option value="unlock">Clear lockout</option>
+<option value="group">Move to the group named here</option><option value="delete">Delete</option></select></div>
+<div><label>Group name (for a move)</label><input type="text" name="to_group" maxlength="40" list="groups"></div>
+<div><label class="check"><input type="checkbox" name="sure" value="1"> Yes, delete them</label></div>
+<div><button class="btn" name="do" value="bulk">Apply</button></div></div></form>
+<script>document.getElementById('all').addEventListener('change',function(e){{
+var b=document.querySelectorAll('input[name^="id_"]');for(var i=0;i<b.length;i++)b[i].checked=e.target.checked;}});</script>"""
+        fmt_opts = self.freq_options([(k, v[0]) for k, v in freqdb.EXPORT_FORMATS.items()], "wavelens")
+        body = f"""<div class="card"><p><b>{len(chans)}</b> channel{'' if len(chans) == 1 else 's'} · <b>{locked}</b> locked out · <b>{len(groups)}</b> group{'' if len(groups) == 1 else 's'}
+{f'<span class="mut">· showing {len(shown)}</span>' if len(shown) != len(chans) else ''}</p>
+<div class="row"><a class="btn" href="/frequencies/edit{esc(self.freq_qs(q))}">Add a channel</a><a class="btn sec" href="/frequencies/import">Import</a>
+<a class="btn sec" href="/frequencies/backups">Backups</a></div>
+<p class="note">Your own list, kept on this Scanner. A hit on one of these frequencies is named from here before any licence
+record, Listen and Follow tune it in the mode you set, and Follow never stops on a channel you lock out. A change is in use
+within a few seconds, with no restart.</p></div>
+<div class="card"><form method="get" action="/frequencies"><div class="row end">
+<div><label>Search</label><input type="text" name="q" value="{esc(q.get('q') or '')}" maxlength="80" placeholder="name, MHz, notes"></div>
+<div><label>Group</label><select name="group">{group_opts}</select></div>
+<div><label>Mode</label><select name="mode">{mode_opts}</select></div>
+<div><label>Show</label><select name="show">{show_opts}</select></div>
+<div><label>Sort by</label><select name="sort">{sort_opts}</select></div>
+<div><button class="btn sec">Filter</button></div></div></form>
+<datalist id="groups">{''.join(f'<option value="{esc(g)}">' for g in groups)}</datalist>{table}</div>
+<div class="card"><h2>Export</h2><form method="get" action="/frequencies/export"><div class="row end">
+<div><label>Format</label><select name="fmt">{fmt_opts}</select></div>
+<div><label>Which channels</label><select name="group">{self.freq_options([("", "The whole list")] + [(g, g) for g in groups], "")}</select></div>
+<div><button class="btn sec"{' disabled' if not chans else ''}>Download</button></div></div></form>
+<p class="note">The list is yours to take anywhere. The Wavelens file keeps everything and is the one to keep as a copy; its layout is
+published as a <a href="/frequencies/schema">JSON Schema</a>. The other formats carry what they have room for (a bookmark file has
+no tones, for one).</p></div>"""
+        self.render(sess, "Frequencies", body, "/frequencies")
+
+    @staticmethod
+    def freq_form_values(ch):
+        """A stored channel as the edit form's text fields (a new channel when ch is None)."""
+        if ch is None:
+            return {"mode": "auto"}
+        bw = ch.get("bandwidth_hz")
+        return {"id": ch["id"], "stamp": ch.get("updated", ""), "name": ch["name"], "freq": freqdb.mhz(ch["freq_hz"]),
+                "input": freqdb.mhz(ch["input_hz"]) if ch.get("input_hz") else "", "mode": ch.get("mode", "auto"),
+                "tone_type": ch.get("tone_type", ""), "tone": ch.get("tone", ""), "emission": ch.get("emission", ""),
+                "bandwidth": f"{bw / 1000:g}" if bw else "", "group": ch.get("group", ""), "service": ch.get("service", ""),
+                "tags": ", ".join(ch.get("tags") or []), "lockout": "1" if ch.get("lockout") else "",
+                "notes": ch.get("notes", ""), "lat": "" if ch.get("lat") is None else ch["lat"],
+                "lon": "" if ch.get("lon") is None else ch["lon"]}
+
+    def page_freq_edit(self, sess, doc, v, ch, q, errors=""):
+        new = not v.get("id")
+        hidden = "".join(f'<input type="hidden" name="{k}" value="{esc(q.get(k) or "")}">' for k in self.FREQ_FILTERS if q.get(k))
+        err = f'<div class="warn"><b>Not saved.</b> {esc(errors)}</div>' if errors else ""
+        tone_opts = self.freq_options([(t, freqdb.TONE_NAMES[t]) for t in freqdb.TONE_TYPES], v.get("tone_type") or "")
+        mode_opts = self.freq_options([(m, freqdb.MODE_NAMES[m] + ("" if m in freqdb.LISTEN_MODES or m == "auto" else " (kept for export; heard as Auto)"))
+                                       for m in freqdb.MODES], v.get("mode") or "auto")
+        service_opts = self.freq_options([(s, s or "Not set") for s in freqdb.SERVICES] +
+                                         ([(v["service"], v["service"])] if v.get("service") and v["service"] not in freqdb.SERVICES else []),
+                                         v.get("service") or "")
+        delete = "" if new else f"""<div class="card"><h2>Delete</h2><form method="post" action="/frequencies">{csrf_field(sess)}{hidden}
+<input type="hidden" name="id" value="{esc(v['id'])}"><label class="check"><input type="checkbox" name="sure" value="1"> Yes, delete this channel</label>
+<button class="btn dng" name="do" value="delete">Delete</button></form>
+<p class="note">A deleted channel can be put back from Backups.</p></div>"""
+        when = f'<p class="note">Added {esc((ch or {}).get("created", "")[:10])} · last changed {esc((ch or {}).get("updated", "")[:16].replace("T", " "))} UTC · from {esc((ch or {}).get("source", "manual"))}</p>' if ch else ""
+        body = f"""{err}<div class="card"><form method="post" action="/frequencies">{csrf_field(sess)}{hidden}
+<input type="hidden" name="id" value="{esc(v.get('id') or '')}"><input type="hidden" name="stamp" value="{esc(v.get('stamp') or '')}">
+<label>Name</label><input type="text" name="name" value="{esc(v.get('name') or '')}" maxlength="64" required placeholder="PCSO Dispatch North">
+<div class="cols">
+<div><label>Frequency (MHz)</label><input type="text" name="freq" value="{esc(v.get('freq') or '')}" inputmode="decimal" required placeholder="155.475"></div>
+<div><label>Repeater input (MHz), if any</label><input type="text" name="input" value="{esc(v.get('input') or '')}" inputmode="decimal" placeholder="empty for simplex"></div>
+<div><label>Mode</label><select name="mode">{mode_opts}</select></div>
+<div><label>Tone or code</label><select name="tone_type">{tone_opts}</select></div>
+<div><label>Its value</label><input type="text" name="tone" value="{esc(v.get('tone') or '')}" maxlength="12" list="ctcss" placeholder="127.3 · 023 · 293"></div>
+<div><label>Group</label><input type="text" name="group" value="{esc(v.get('group') or '')}" maxlength="40" list="groups" placeholder="County fire"></div>
+<div><label>Who uses it</label><select name="service">{service_opts}</select></div>
+<div><label>Tags (commas between)</label><input type="text" name="tags" value="{esc(v.get('tags') or '')}" maxlength="200"></div>
+</div>
+<label class="check" style="margin-top:14px"><input type="checkbox" name="lockout" value="1"{' checked' if v.get('lockout') else ''}> Locked out: Follow never stops on it (a pager, a busy repeater, a data channel)</label>
+<label>Notes</label><input type="text" name="notes" value="{esc(v.get('notes') or '')}" maxlength="500">
+<details style="margin-top:12px"{' open' if any(v.get(k) not in (None, '') for k in ('emission', 'bandwidth', 'lat', 'lon')) else ''}><summary class="mut">Technical details (all optional)</summary>
+<div class="cols">
+<div><label>Emission designator (ITU)</label><input type="text" name="emission" value="{esc(v.get('emission') or '')}" maxlength="9" placeholder="11K2F3E"></div>
+<div><label>Bandwidth (kHz)</label><input type="text" name="bandwidth" value="{esc(v.get('bandwidth') or '')}" inputmode="decimal" placeholder="12.5"></div>
+<div><label>Latitude</label><input type="text" name="lat" value="{esc(v.get('lat'))}" inputmode="decimal" placeholder="27.8760"></div>
+<div><label>Longitude</label><input type="text" name="lon" value="{esc(v.get('lon'))}" inputmode="decimal" placeholder="-82.8510"></div>
+</div><p class="note">The emission designator is the code on a licence (11K2F3E is 11.2 kHz analog FM voice, 8K10F1E is P25 voice). Give it and
+the bandwidth is read from it. The position is the transmitter's, in decimal degrees (WGS 84).</p></details>
+<datalist id="ctcss">{''.join(f'<option value="{t}">' for t in freqdb.CTCSS)}</datalist>
+<datalist id="groups">{''.join(f'<option value="{esc(g)}">' for g in self.freq_groups(doc['channels']))}</datalist>
+<div class="row"><button class="btn" name="do" value="save">Save</button><a class="btn sec" href="/frequencies{esc(self.freq_qs(q))}">Cancel</a></div>
+</form>{when}</div>{delete}"""
+        self.render(sess, "Add a channel" if new else "Edit channel", body, "/frequencies")
+
+    def page_freq_import(self, sess, doc):
+        got = sess.get("freq_import")
+        if got:
+            have = {freqdb.dedupe_key(c) for c in doc["channels"]}
+            dup = sum(1 for c in got["channels"] if freqdb.dedupe_key(c) in have)
+            sample = "".join(f'<tr><td class="num">{esc(freqdb.mhz(c["freq_hz"]))}</td><td class="wrap">{esc(c["name"])}</td>'
+                             f'<td>{esc(freqdb.MODE_NAMES.get(c["mode"], "Auto"))}</td><td>{esc(self.freq_tone_text(c))}</td>'
+                             f'<td class="wrap">{esc(c.get("group", ""))}</td></tr>' for c in got["channels"][:15])
+            problems = ""
+            if got["problems"]:
+                problems = (f'<div class="warn"><b>{len(got["problems"])} row{"" if len(got["problems"]) == 1 else "s"} left out</b> '
+                            f'(the rest are fine to import):<pre>{esc(chr(10).join(got["problems"][:60]))}</pre></div>')
+            body = f"""<div class="card"><h2>Check before importing</h2>
+<table><tr><th>File</th><td>{esc(got['name'])} <span class="mut">read as {esc(freqdb.IMPORT_FORMATS[got['format']])}</span></td></tr>
+<tr><th>Channels readable</th><td><b>{len(got['channels'])}</b>{f' <span class="mut">({got["repeats"]} repeated in the file, counted once)</span>' if got['repeats'] else ''}</td></tr>
+<tr><th>New to your list</th><td><b>{len(got['channels']) - dup}</b></td></tr>
+<tr><th>Already in your list</th><td>{dup} <span class="mut">(same frequency and tone)</span></td></tr></table>{problems}
+<div class="scroll"><table class="list"><tr><th>MHz</th><th>Name</th><th>Mode</th><th>Tone / code</th><th>Group</th></tr>{sample}</table></div>
+{f'<p class="mut">… and {len(got["channels"]) - 15} more</p>' if len(got['channels']) > 15 else ''}
+<form method="post" action="/frequencies">{csrf_field(sess)}
+<label>What to do with channels already in your list</label><select name="mode">
+<option value="add">Keep mine, add only the new ones</option><option value="update">Overwrite mine with the file's</option>
+<option value="replace">Replace my whole list with this file</option></select>
+<label>Put every imported channel in this group (empty keeps the file's own)</label><input type="text" name="to_group" maxlength="40">
+<div class="row"><button class="btn" name="do" value="import_apply"{' disabled' if not got['channels'] else ''}>Import</button>
+<button class="btn sec" name="do" value="import_cancel">Cancel</button></div></form>
+<p class="note">Nothing has changed yet. The list as it is now is kept as a backup when you import.</p></div>"""
+            return self.render(sess, "Import", body, "/frequencies")
+        fmts = "".join(f"<tr><th>{esc(t)}</th><td>{esc(d)}</td></tr>" for t, d in (
+            ("Wavelens frequency list", "the JSON this page exports: everything comes back as it was"),
+            ("Plain CSV", "any spreadsheet saved as CSV with a header row. Needs a frequency column (frequency, freq, mhz or frequency_mhz); "
+                          "name, mode, tone, group, notes, input, lockout, lat and lon are read when present"),
+            ("CHIRP CSV", "the generic CSV radio programming tools exchange: name, frequency, offset, tone or DCS, mode, skip"),
+            ("Gqrx bookmarks", "a bookmarks.csv: frequency, name, modulation, bandwidth; the first tag becomes the group"),
+            ("SDR++ frequency manager", "an exported list or the whole frequency manager file: name, frequency, bandwidth, mode"),
+            ("RadioReference CSV", "your own export of a county's or agency's conventional frequencies. Trunked sites and talkgroups "
+                                   "belong on the Area page instead")))
+        body = f"""<div class="card"><form method="post" action="/frequencies" enctype="multipart/form-data">{csrf_field(sess)}
+<label>A file from your phone or computer (up to 4 MB)</label><input type="file" name="file" required>
+<div class="row"><button class="btn" name="do" value="import_upload">Read the file</button><a class="btn sec" href="/frequencies">Back</a></div></form>
+<p class="note">The kind of file is worked out from what is in it. You see what was read, and what was left out and why, before
+anything is added.</p></div>
+<div class="card"><h2>Files this page reads</h2><table>{fmts}</table></div>"""
+        self.render(sess, "Import", body, "/frequencies")
+
+    def page_freq_backups(self, sess, store):
+        rows = "".join(
+            f'<tr><td>{esc(b["when"][:16].replace("T", " "))} UTC</td><td>{esc("?" if b["channels"] is None else b["channels"])}</td>'
+            f'<td><a href="/frequencies/backup?{esc(urllib.parse.urlencode({"name": b["name"]}))}">Download</a></td>'
+            f'<td><form class="inline" method="post" action="/frequencies">{csrf_field(sess)}<input type="hidden" name="name" value="{esc(b["name"])}">'
+            f'<button class="btn sec" name="do" value="restore" style="margin:0">Put back</button></form></td></tr>' for b in store.backups())
+        table = (f'<div class="scroll"><table class="list"><tr><th>Saved over at</th><th>Channels</th><th></th><th></th></tr>{rows}</table></div>'
+                 if rows else '<p class="mut">No backups yet: one is kept each time the list changes.</p>')
+        body = f"""<div class="card">{table}
+<p class="note">Every change keeps the list it replaced, the last {freqdb.KEEP_BACKUPS} of them. Putting one back keeps today's
+list as a backup too, so it can be undone. Backups stay on this Scanner (<code>{esc(store.backup_dir)}</code>); for a copy that
+survives a lost SD card, export the list and keep the file.</p>
+<a class="btn sec" href="/frequencies">Back to the list</a></div>
+<div class="card"><h2>Start again</h2><form method="post" action="/frequencies">{csrf_field(sess)}
+<label class="check"><input type="checkbox" name="sure" value="1"> Yes, remove every channel</label>
+<button class="btn dng" name="do" value="clear">Empty the list</button></form>
+<p class="note">Also the way out if the list file is damaged. The emptied list is kept as a backup.</p></div>"""
+        self.render(sess, "Frequency backups", body, "/frequencies")
+
+    def post_frequencies(self, sess, form, files, tok):
+        if freqdb is None:
+            return self.redirect("/frequencies")
+        store, do = freqdb.Store(), form.get("do", "")
+        back = "/frequencies" + self.freq_qs(form)
+        try:
+            if do == "save":
+                return self.post_freq_save(sess, form, store, back)
+            if do == "delete":
+                if form.get("sure") != "1":
+                    self.flash(sess, "Tick the box to confirm, then press Delete.")
+                    return self.redirect(f'/frequencies/edit{self.freq_qs(form, id=form.get("id", ""))}')
+
+                def drop(doc):
+                    n = len(doc["channels"])
+                    doc["channels"] = [c for c in doc["channels"] if c.get("id") != form.get("id")]
+                    return n - len(doc["channels"])
+                self.flash(sess, "Deleted." if store.edit(drop) else "That channel was already gone.")
+                return self.redirect(back)
+            if do == "bulk":
+                ids = {k[3:] for k in form if k.startswith("id_")}
+                act, to_group = form.get("act", ""), freqdb.text(form.get("to_group"), 40)
+                if not ids:
+                    self.flash(sess, "Tick the channels first.")
+                elif act == "delete" and form.get("sure") != "1":
+                    self.flash(sess, "Nothing deleted: tick “Yes, delete them” as well.")
+                elif act == "group" and not to_group:
+                    self.flash(sess, "Type the group name to move them to.")
+                elif act in ("lock", "unlock", "group", "delete"):
+                    def bulk(doc):
+                        hit = [c for c in doc["channels"] if c.get("id") in ids]
+                        if act == "delete":
+                            doc["channels"] = [c for c in doc["channels"] if c.get("id") not in ids]
+                        for c in hit:
+                            if act in ("lock", "unlock"):
+                                c["lockout"] = act == "lock"
+                            elif act == "group":
+                                c["group"] = to_group
+                            c["updated"] = freqdb.now_iso()
+                        return len(hit)
+                    n = store.edit(bulk)
+                    what = {"lock": "locked out", "unlock": "cleared", "group": f"moved to {to_group}", "delete": "deleted"}[act]
+                    self.flash(sess, f"{n} channel{'' if n == 1 else 's'} {what}.")
+                return self.redirect(back)
+            if do == "import_upload":
+                name, data = files.get("file") or ("", b"")
+                if not data:
+                    self.flash(sess, "Choose a file first.")
+                    return self.redirect("/frequencies/import")
+                try:
+                    got = freqdb.parse_import(data)
+                except ValueError as e:
+                    self.flash(sess, f"Not imported: {e}.")
+                    return self.redirect("/frequencies/import")
+                got["name"] = freqdb.text(os.path.basename(name.replace("\\", "/")), 80) or "file"
+                sess["freq_import"] = got
+                return self.redirect("/frequencies/import")
+            if do == "import_cancel":
+                sess.pop("freq_import", None)
+                return self.redirect("/frequencies")
+            if do == "import_apply":
+                got = sess.pop("freq_import", None)
+                if not got:
+                    self.flash(sess, "That import has expired: read the file again.")
+                    return self.redirect("/frequencies/import")
+                mode = form.get("mode") if form.get("mode") in ("add", "update", "replace") else "add"
+                to_group = freqdb.text(form.get("to_group"), 40)
+                if to_group:
+                    for c in got["channels"]:
+                        c["group"] = to_group
+                n = store.edit(lambda doc: freqdb.merge(doc, got["channels"], mode), recover=mode == "replace")
+                self.flash(sess, f"Imported from {got['name']}: {n['added']} added, {n['updated']} overwritten, {n['skipped']} already in your list.")
+                return self.redirect("/frequencies")
+            if do == "restore":
+                n = store.restore(form.get("name", ""))
+                self.flash(sess, f"Put back: {n} channel{'' if n == 1 else 's'}. The list it replaced is now the newest backup.")
+                return self.redirect("/frequencies")
+            if do == "clear":
+                if form.get("sure") != "1":
+                    self.flash(sess, "Nothing removed: tick the box to confirm.")
+                    return self.redirect("/frequencies/backups")
+                store.edit(lambda doc: doc.update(channels=[]), recover=True)
+                self.flash(sess, "The list is empty. What it held is the newest backup.")
+                return self.redirect("/frequencies")
+        except freqdb.StoreError as e:
+            self.flash(sess, f"Not done: {e}")
+            return self.redirect("/frequencies/backups" if do in ("restore", "clear") else back)
+        self.redirect("/frequencies")
+
+    def post_freq_save(self, sess, form, store, back):
+        cid = form.get("id", "")
+        v = {k: form.get(k, "") for k in ("name", "freq", "input", "mode", "tone_type", "tone", "emission", "bandwidth", "group",
+                                          "service", "tags", "lockout", "notes", "lat", "lon")}
+        v.update(id=cid, stamp=form.get("stamp", ""))
+        problem = {"text": ""}
+
+        def save(doc):
+            old = next((c for c in doc["channels"] if c.get("id") == cid), None) if cid else None
+            if cid and old is None:
+                problem["text"] = "this channel was deleted in another window. Saving now would add it again: press Save once more to do that."
+                v["id"] = v["stamp"] = ""
+                raise ValueError
+            if old is not None and v["stamp"] and old.get("updated") != v["stamp"]:
+                problem["text"] = "this channel was changed in another window since you opened it. Check the values below and save again."
+                v["stamp"] = old.get("updated", "")
+                raise ValueError
+            raw = dict(v, freq_hz=v["freq"], input_hz=v["input"], lockout=v["lockout"] == "1", source=(old or {}).get("source", "manual"))
+            raw.pop("bandwidth_hz", None)
+            if v["bandwidth"].strip():
+                try:
+                    raw["bandwidth_hz"] = str(int(freqdb.decimal.Decimal(v["bandwidth"].replace(",", ".").strip()) * 1000))
+                except (ArithmeticError, ValueError):
+                    raw["bandwidth_hz"] = "x"            # clean_channel words the complaint
+            try:
+                ch = freqdb.clean_channel(raw, old)
+            except ValueError as e:
+                problem["text"] = str(e)
+                raise
+            twin = next((c for c in doc["channels"] if c is not old and freqdb.dedupe_key(c) == freqdb.dedupe_key(ch)), None)
+            if twin is not None:
+                problem["text"] = (f"{freqdb.mhz(ch['freq_hz'])} MHz with that tone is already in your list as “{twin['name']}”. "
+                                   "Edit that one, or give this one its own tone or code.")
+                raise ValueError
+            if old is None:
+                doc["channels"].append(ch)
+            else:
+                doc["channels"][doc["channels"].index(old)] = ch
+            return ch
+        try:
+            ch = store.edit(save)
+        except ValueError:
+            try:
+                doc = store.load()
+            except freqdb.StoreError:
+                doc = {"channels": []}
+            current = next((c for c in doc["channels"] if c.get("id") == v["id"]), None) if v["id"] else None
+            return self.page_freq_edit(sess, doc, v, current, form, errors=problem["text"])
+        self.flash(sess, f"Saved {ch['name']} on {freqdb.mhz(ch['freq_hz'])} MHz.")
+        self.redirect(back)
 
     # ---- /update ---------------------------------------------------------------------------
     def page_update(self, sess):
