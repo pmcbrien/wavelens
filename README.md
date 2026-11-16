@@ -405,7 +405,7 @@ Phones, Raspberry Pi models, RTL-SDR dongles (V3 yes; V4 only for sensors until 
 
 ## Contribute
 
-Email an export from the app (*More → Help improve Wavelens where you live* — nothing is sent unless you press send), open a pull request here (region packs in `packs/`, companion code), or write a signature pack. The rule format, field by field: [wavelensapp.us/contribute.html](https://wavelensapp.us/contribute.html).
+Email an export from the app (*Setup → Help improve Wavelens where you live* — nothing is sent unless you press send), open a pull request here (region packs in `packs/`, companion code), or write a signature pack. The rule format, field by field: [wavelensapp.us/contribute.html](https://wavelensapp.us/contribute.html).
 
 ## Privacy
 

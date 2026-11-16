@@ -59,7 +59,7 @@ RADIOS = [
      "2.4 GHz Wi-Fi + Bluetooth, parked on the channels you pick; 5 GHz on an ESP32-C5", "left"),
     ("ESP32 add-on modules", "DIY", "#b45309", [(300, 348), (387, 464), (779, 928), (5645, 5945)],
      "CC1101 / SX1276 sub-GHz sweep; RX5808 5.8 GHz video", "left"),
-    ("RTL-SDR", "in Scanner, $199", "#1d4ed8", [(24, 1766)],
+    ("RTL-SDR", "in Full Spectrum", "#1d4ed8", [(24, 1766)],
      "24 MHz to 1.77 GHz: decodes sensors and fobs, sweeps, listens", "in"),
     ("HackRF One", "build only", "#7c3aed", [(1, 6000)],
      "1 MHz to 6 GHz: energy sweep, about once a second", "in"),

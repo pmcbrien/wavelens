@@ -331,7 +331,7 @@ The full step-by-step guide, with every command, is on the website:
 
 `companion/desktop/wavelens_scanner.py` is the app's Scanner tab as a Windows / Mac / Linux window: the
 frequency and talkgroup being heard, the ranked systems (double-click to tune one), the spectrum around the
-channel (click to listen there), recent calls (double-click to lock a talkgroup), the companion journal,
+channel (click to listen there), recent calls (double-click to hear only that talkgroup), the companion journal,
 SCAN / STOP / HOLD / SKIP, the PUBLIC SAFETY / FIRE / EMS / OTHER filter and the hand-off time, with Listen audio
 through the speakers. `pip install bleak sounddevice`, then `python wavelens_scanner.py`
 (`--demo` shows the window with a scripted session and no radio). Needs tkinter — included with
@@ -556,6 +556,12 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 {"c":"listen","v":"hold","on":true}      // stay on this trunked system (no 5 s rotation); "on":false releases
 {"c":"listen","v":"skip"}                // leave this system now, go to the next strongest
 {"c":"listen","v":"tglock","tg":1234}    // hear only this talkgroup (0 unlocks); "tgavoid" with "tgs":[...] mutes a list
+{"c":"listen","v":"tgallow","tgs":[1234]}   // talkgroups always heard even when the category filter would mute them
+{"c":"listen","v":"syslist","fav":["…"],"avoid":["…"]}   // the app's favourite and ignored systems (resent on every
+                                     // connect); favourites rank first, an ignored system is never tuned (ignoring the
+                                     // held one releases it). Status carries "sysfav", "sysavoid".
+{"c":"listen","v":"radio","gain":0,"ppm":0}   // listening dongle gain (dB, 0 = auto, ≤50) and correction (±200 ppm),
+                                     // applied to the current channel at once
 {"c":"listen","v":"cats","cats":["police"]}   // category filter, from each talkgroup's RadioReference tag:
                                      // police / fire / ems / other. Police only by default; [] hears everything;
                                      // a talkgroup the pack can't classify is always heard. Status carries
@@ -697,7 +703,12 @@ frequency — the usual convention, not a guarantee); **Motorola Type II / Smart
 the bridge's own decoder** (`pi/smartnet.py`: `rtl_fm` discriminator audio → 3600-baud FSK bits →
 preamble, 4×19 deinterleave, parity correction, 10-bit CRC → OSWs → grants; the same dongle plays each
 grant's analog voice channel and returns; `--moto-band` 800 | 800r | 800s | 900 | obt:BASE:SPACING:OFFSET).
-LTR has no control channel to follow. Unencrypted public-safety trunked traffic is lawful to receive in
+**OP25 for trunked P25** (new, being proven): `pi/install-op25.sh` builds boatbod's OP25 into `/opt/op25`, and
+the bridge then follows trunked P25 with OP25's CQPSK demodulator instead of dsd-fme (much cleaner on
+simulcast); same call fields, holds, ignores and filters. If OP25 can't start, that listen falls back to
+dsd-fme; DMR, NXDN, EDACS and conventional digital always use dsd-fme. `WAVELENS_TRUNK_DECODER=auto|op25|dsd-fme`
+in `/etc/default/wavelens-bridge` (default `auto`). OP25's IMBE vocoder is patented in some countries; the
+installer asks first. LTR has no control channel to follow. Unencrypted public-safety trunked traffic is lawful to receive in
 the US; check state law for a receiver in a vehicle.
 
 **Auto mode** (a plain Listen on a carrier) starts `dsd-fme -fa`; the sync it reports ("Sync: +DMR",
