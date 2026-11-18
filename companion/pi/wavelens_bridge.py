@@ -398,6 +398,92 @@ def write_run_status(hw: dict | None = None) -> None:
         pass
 
 
+# ---------------------------------------------------------------- the owner's name for this Scanner
+# {"c":"name","v":"Dads-Truck"} from the app's Companion screen: the same thing as the admin page's "Radio
+# name" box. The name lives in /etc/default/wavelens-bridge as "--name X" inside WAVELENS_ARGS, so it survives
+# restarts and updates; the bridge has to restart to advertise it. {"c":"name","v":""} goes back to
+# Wavelens-XXXX. The pair code is the end of the Bluetooth address and never changes.
+DEFAULTS_FILE = os.environ.get("WAVELENS_DEFAULTS", "/etc/default/wavelens-bridge")
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")      # the admin page's rule, and the Spotter firmware's
+_ARGS_LINE_RE = re.compile(r'^\s*(export\s+)?WAVELENS_ARGS=(.*)$')
+
+
+def can_rename() -> bool:
+    """Only a bridge started by its service can rename itself: the name is in the service's settings file."""
+    return bool(os.environ.get("INVOCATION_ID")) and os.access(DEFAULTS_FILE, os.W_OK)
+
+
+def args_with_name(args: str, name: str) -> str:
+    """WAVELENS_ARGS with any --name removed and '--name <name>' appended (when a name is given)."""
+    try:
+        parts = shlex.split(args)
+    except ValueError:
+        parts = args.split()
+    out, skip = [], False
+    for p in parts:
+        if skip:
+            skip = False
+        elif p == "--name":
+            skip = True
+        elif not p.startswith("--name="):
+            out.append(p)
+    if name:
+        out += ["--name", name]
+    return shlex.join(out)
+
+
+def save_name(name: str, path: str = "") -> None:
+    """Rewrite only the WAVELENS_ARGS line of the settings file (comments and every other line untouched)."""
+    path = path or DEFAULTS_FILE
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    done = False
+    for i, line in enumerate(lines):
+        m = _ARGS_LINE_RE.match(line)
+        if not m or line.lstrip().startswith("#"):
+            continue
+        if done:                                        # a second definition would win over the first: drop it
+            lines[i] = "# " + line
+            continue
+        raw = m.group(2).strip()
+        try:
+            cur = " ".join(shlex.split(raw, comments=True))
+        except ValueError:
+            cur = raw.strip('"')
+        val = args_with_name(cur, name)
+        val = val.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+        lines[i] = 'WAVELENS_ARGS="' + val + '"'
+        done = True
+    if not done:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append('WAVELENS_ARGS="' + args_with_name("", name) + '"')
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+
+
+def rename(v) -> None:
+    """Phone asked for a new name (c=name): save it, say so, restart the service so the advert carries it."""
+    def say(msg: str) -> None:
+        print("bridge: " + msg, file=sys.stderr)
+        emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
+    name = "" if v is None else v.strip() if isinstance(v, str) else None
+    if name is None or (name and not NAME_RE.match(name)):
+        return say("name must be 1-20 letters, digits, - or _")
+    if not can_rename():
+        return say("this bridge was started by hand: set its name with --name")
+    try:
+        save_name(name)
+    except OSError as e:
+        return say(f"could not save the name ({e})")
+    say(f"renamed to {name}; restarting" if name else "name reset; restarting")
+    time.sleep(1.2)                                     # let the status line reach the phone
+    subprocess.Popen(["systemctl", "restart", "--no-block", "wavelens-bridge"])
+
+
 def run_update(what: str) -> None:
     """Phone asked for an update (c=update, v=check|apply|rollback): run wavelens-update, report as status lines."""
     if what not in ("check", "apply", "rollback"):
@@ -6068,6 +6154,9 @@ def run_peripheral(name: str) -> None:
         elif c == "blink":
             threading.Thread(target=blink, args=(int(cmd.get("v") or 5),), daemon=True).start()
             emit({"t": "status", "msg": "blinking", "band": state["band"], "mode": state["mode"]})
+        elif c == "name":
+            # The Companion screen's Rename: saved to the settings file, then the service restarts
+            threading.Thread(target=rename, args=(cmd.get("v"),), daemon=True).start()
         elif c == "net":
             # The Companion screen's Wi-Fi card: what the Pi is on, what it can see, join one (see net_command).
             net_command(cmd)
@@ -6767,6 +6856,8 @@ def main() -> None:
     CAPS.append("update")            # kept with WAVELENS_APP_CONTROL=0 too: older apps read its absence as "too old"
     if net_available():
         CAPS.append("net")           # the phone may set this computer's Wi-Fi over the link
+    if can_rename():
+        CAPS.append("rename")                  # the app shows its Rename button
     globals()["PORTAPACK_TTY"] = a.portapack_port
     a.region = start_region(a.region, os.environ.get("WAVELENS_AREA_FILE", ""))
     if a.plan:

@@ -525,6 +525,12 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // This is the one command that may not fit a write: the bridge joins pieces
                                      // until the newline.
 {"c":"blink","v":5}                  // identify: flash the LED for v seconds (1–30)
+{"c":"name","v":"Dads-Truck"}        // rename: the name it advertises and reports in its hello, instead of
+                                     // Wavelens-XXXX. 1–20 letters, digits, - or _; "" puts the default back.
+                                     // Saved (flash on a Spotter, --name in /etc/default/wavelens-bridge on a
+                                     // Pi), then it restarts and the phone reconnects. The pair code ("code" in
+                                     // the hello) is the end of the Bluetooth address and never changes. Only
+                                     // a companion whose hello caps list "rename" takes it.
 {"c":"lock","v":true}                // Spotter: require pairing with the passkey (answers a sec line with the
                                      // passkey, then restarts). v false, from a paired phone: unlock + forget
                                      // every phone. Over USB only: {"c":"unlock"}, {"c":"passkey"}

@@ -130,7 +130,7 @@ enum Mode { M_BOTH, M_WIFI, M_BLE, M_RF };
 static Mode     mode = M_BOTH;
 static char     band[8] = "all";
 static bool     hopping = true;
-static char     devName[24] = "Wavelens-0000";   // "Wavelens-" + last 4 hex of the BT address
+static char     devName[24] = "Wavelens-0000";   // "Wavelens-" + last 4 hex of the BT address, or the owner's own name (see nameCommand)
 static char     pairCode[5] = "0000";
 static uint32_t blinkUntil = 0;
 static uint8_t  chList[48];   // 13 at 2.4 GHz + 25 at 5 GHz on a C5
@@ -182,7 +182,7 @@ static volatile bool         usbHost = false;
 // Output ring: the Wi-Fi callback runs in the Wi-Fi task, so lines are queued and
 // drained from loop() where it is safe to notify.
 #define QN 24
-#define QL 512   // the longest line is the hello: see HELLO_WORST below (the compiler checks it fits)
+#define QL 544   // the longest line is the hello: see HELLO_WORST below (the compiler checks it fits)
 static char     q[QN][QL];
 static volatile uint8_t qh = 0, qt = 0;
 
@@ -288,7 +288,7 @@ static_assert(sizeof(HW_WORST) <= HW_CAP, "hwJson() can overflow its buffer: rai
 // devName is at most 23 characters, pairCode 4, the chip name ("esp32c5", …) 7.
 #define HELLO_WORST "{\"t\":\"hello\",\"fw\":\"" FW_NAME "\",\"ver\":\"" WL_VERSION "\",\"chip\":\"esp32c5\"," \
                     "\"name\":\"XXXXXXXXXXXXXXXXXXXXXXX\",\"code\":\"XXXX\"," \
-                    "\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\",\"5g\",\"rf\",\"subghz\",\"sweep\",\"listen\",\"scan\"]," \
+                    "\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\",\"rename\",\"5g\",\"rf\",\"subghz\",\"sweep\",\"listen\",\"scan\"]," \
                     "\"spec\":[" SPEC_RANGE_STR "]" ",\"hw\":" HW_WORST "}\n"
 static_assert(sizeof(HELLO_WORST) <= QL, "the hello can be longer than a queue line: raise QL");
 // The sec line that follows every hello, and the one-off sec line with the passkey a lock answers with. btId is
@@ -304,7 +304,7 @@ static void hello() {
   hwJson(hw, sizeof hw);
   char line[QL];
   snprintf(line, sizeof line,
-           "{\"t\":\"hello\",\"fw\":\"%s\",\"ver\":\"%s\",\"chip\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\"%s%s%s%s%s]%s,\"hw\":%s}\n",
+           "{\"t\":\"hello\",\"fw\":\"%s\",\"ver\":\"%s\",\"chip\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\",\"rename\"%s%s%s%s%s]%s,\"hw\":%s}\n",
            FW_NAME, WL_VERSION, WL_CHIP, devName, pairCode,
 #if SOC_WIFI_SUPPORT_5G
            ",\"5g\"",
@@ -1290,6 +1290,59 @@ static void lockCommand(const char* v, bool usb) {
   }
 }
 
+// ------------------------------------------------------------------ the owner's name for the board
+//
+// {"c":"name","v":"Dads-Truck"} renames the board: the name it advertises and reports in its hello. Kept in
+// flash, so it survives power cycles and firmware updates; {"c":"name","v":""} goes back to "Wavelens-XXXX".
+// 1-20 characters, letters, digits, '-' and '_' only (the same rule as the Pi bridge's --name): that fits the
+// 31-byte scan response and needs no JSON escaping. The pair code never changes: it is the end of the Bluetooth
+// address, and the hello carries it whatever the name is. Accepted from whoever may send commands at all: any
+// phone while the board is unlocked, only a paired phone once it is locked, and always over USB.
+
+static bool nameOk(const char* s, size_t n) {
+  if (n < 1 || n > 20) return false;
+  for (size_t i = 0; i < n; i++) {
+    char ch = s[i];
+    if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_')) return false;
+  }
+  return true;
+}
+
+// Called from setup() after devName holds the default: a saved name, if there is a good one, replaces it.
+static void nameLoad() {
+  Preferences p;
+  p.begin("wavelens", false);
+  char saved[sizeof devName] = "";
+  if (p.isKey("name")) p.getString("name", saved, sizeof saved);
+  p.end();
+  if (nameOk(saved, strlen(saved))) strcpy(devName, saved);
+}
+
+// v points just past "v": in the command line. The new name is advertised from the next boot, so the board
+// restarts (a second or two; the phone reconnects on its own), the same way a lock change does.
+static void nameCommand(const char* v) {
+  if (otaOn) { status("busy updating; rename after the update"); return; }
+  char want[sizeof devName] = "";
+  size_t n = 0;
+  bool bad = false;
+  if (v) {
+    while (*v == ' ') v++;
+    if (*v == '"') {
+      for (v++; *v && *v != '"'; v++) { if (n < sizeof want - 1) want[n++] = *v; else bad = true; }
+      want[n] = 0;
+    } else if (strncmp(v, "null", 4)) bad = true;       // a number, a list: not a name
+  }
+  if (bad || (n && !nameOk(want, n))) { status("name must be 1-20 letters, digits, - or _"); return; }
+  Preferences p;
+  p.begin("wavelens", false);
+  if (n) p.putString("name", want); else p.remove("name");
+  p.end();
+  if (n) Serial.printf("name: now %s (was %s); restarting\n", want, devName);
+  else   Serial.printf("name: back to Wavelens-%s (was %s); restarting\n", pairCode, devName);
+  status(n ? "renamed; restarting" : "name reset; restarting");
+  rebootAt = millis() + 1200; if (!rebootAt) rebootAt = 1;
+}
+
 // usb: the line came in on the serial port (physical access), not over Bluetooth.
 static void applyCommand(const char* line, bool usb = false) {
   // Tiny parser: enough for {"c":"band","v":"2g"} / {"c":"ch","v":[1,6,11]} / {"c":"mode","v":"ble"} / {"c":"ping"}
@@ -1307,6 +1360,7 @@ static void applyCommand(const char* line, bool usb = false) {
     return;
   }
   const char* v = strstr(line, "\"v\":");
+  if (!strncmp(c, "name\"", 5)) { nameCommand(v ? v + 4 : nullptr); return; }
   if (!strncmp(c, "ota", 3)) {                 // see otaMx: this can run in loop() (USB) or the NimBLE task
     xSemaphoreTake(otaMx, portMAX_DELAY); otaCommand(line, v ? v + 4 : nullptr); xSemaphoreGive(otaMx);
     return;
@@ -1504,6 +1558,7 @@ void setup() {
   snprintf(devName, sizeof devName, "Wavelens-%s", pairCode);
   snprintf(btId, sizeof btId, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   secLoad();
+  nameLoad();                                  // the owner's own name, if they gave it one
   otaMx = xSemaphoreCreateMutex();             // before the BLE server: OtaCB / RxCB take it
   if (RESET_BTN_PIN >= 0) pinMode(RESET_BTN_PIN, INPUT_PULLUP);
   NimBLEDevice::init(devName);
