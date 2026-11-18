@@ -22,9 +22,12 @@ fi
 
 # Wait for the Bluetooth adapter to come up after boot (up to ~30 s).
 i=0
+# bluetoothctl waits for ever when bluetoothd is down, and on Pi OS Buster (BlueZ 5.50) bluetoothd can
+# abort when the previous bridge stops, with no Restart= in its unit: start it, and time-box bluetoothctl.
 while [ $i -lt 30 ]; do
-    if bluetoothctl show 2>/dev/null | grep -q "Powered: yes"; then break; fi
-    bluetoothctl power on >/dev/null 2>&1 || true
+    systemctl is-active -q bluetooth 2>/dev/null || systemctl start bluetooth 2>/dev/null || true
+    if timeout 5 bluetoothctl show 2>/dev/null | grep -q "Powered: yes"; then break; fi
+    timeout 5 bluetoothctl power on >/dev/null 2>&1 || true
     i=$((i + 1)); sleep 1
 done
 
