@@ -6074,10 +6074,31 @@ def blink(secs: int) -> None:
         pass
 
 
+def bluez_version() -> "tuple[int, ...] | None":
+    """bluetoothd's version as (major, minor), or None when it can't be read."""
+    for exe in ("/usr/libexec/bluetooth/bluetoothd", "/usr/lib/bluetooth/bluetoothd", "bluetoothd"):
+        try:
+            out = subprocess.run([exe, "-v"], capture_output=True, text=True, timeout=5).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        m = re.match(r"(\d+)\.(\d+)", out)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return None
+
+
 def drop_stale_centrals() -> None:
     """A restart leaves the phone's connection alive in BlueZ while the GATT server it was talking to
     is gone: the app shows "connected" and hears nothing. Disconnect whoever is still attached, so the
-    app sees the drop and reconnects to this instance."""
+    app sees the drop and reconnects to this instance.
+
+    Skipped on BlueZ older than 5.55: on 5.50 (Pi OS Buster) the Disconnect aborts bluetoothd
+    ("free(): invalid pointer"), the bridge then dies on its next D-Bus call and the updater rolls back."""
+    ver = bluez_version()
+    if ver and ver < (5, 55):
+        print(f"bridge: BlueZ {'.'.join(map(str, ver))} — not dropping a left-over central (it crashes this BlueZ);"
+              " if the app shows connected but hears nothing, reconnect it", file=sys.stderr)
+        return
     try:
         import dbus
         bus = dbus.SystemBus()
