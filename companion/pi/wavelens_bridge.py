@@ -1699,7 +1699,7 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(a))
 
 
-FCC: "FccPack | None" = None
+FCC = None  # type: FccPack | None  (no annotation: Python 3.7 refuses an annotated name that a function above declares global)
 
 
 def licensed_label(mhz: float, tol_khz: float):
