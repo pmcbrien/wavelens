@@ -615,6 +615,10 @@ def log_line(text: str) -> None:
         return
     if "total sweeps completed" in text or "Stop with Ctrl-C" in text:
         return                               # hackrf_sweep's once-a-second progress line
+    if text.startswith("dsd-fme:") and ("Sync:" in text or "ALG ID:" in text):
+        return                               # one per voice frame (~6 a second in a call): they filled the BLE
+                                             # link the desktop app keeps a log stream open on ("hci0: link tx
+                                             # timeout"); the call itself is reported as "bridge: listen: call …"
     item = (time.time(), text[:300])
     with LOG["lock"]:
         LOG["lines"].append(item)
