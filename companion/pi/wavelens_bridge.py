@@ -6609,7 +6609,34 @@ def run_peripheral(name: str) -> None:
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, on_term)
     except Exception as e:
         print(f"bridge: no SIGTERM hook ({e})", file=sys.stderr)
+    watch_bluez_restart()
     dev.publish()
+
+
+def watch_bluez_restart() -> None:
+    """Our advert and GATT service live inside bluetoothd. If it dies and systemd brings it back (BlueZ 5.50
+    on Pi OS Buster aborts now and then), the bridge keeps running but nothing advertises: the companion
+    vanishes until someone restarts it. So when the org.bluez owner goes away, exit: systemd restarts the
+    bridge, which registers again with the new bluetoothd."""
+    try:
+        import dbus
+        from dbus.mainloop.glib import DBusGMainLoop
+
+        def changed(name, old_owner, new_owner):
+            if name != "org.bluez" or not old_owner:
+                return
+            print("bridge: bluetoothd went away (Bluetooth service crashed or restarted); exiting so the "
+                  "service restarts and advertises again", file=sys.stderr)
+            try:
+                subprocess.call(["pkill", "-KILL", "-P", str(os.getpid())], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+            os._exit(1)
+        bus = dbus.SystemBus(mainloop=DBusGMainLoop())
+        bus.add_signal_receiver(changed, signal_name="NameOwnerChanged", dbus_interface="org.freedesktop.DBus",
+                                bus_name="org.freedesktop.DBus", path="/org/freedesktop/DBus", arg0="org.bluez")
+    except Exception as e:
+        print(f"bridge: not watching for a Bluetooth restart ({e})", file=sys.stderr)
 
 
 
