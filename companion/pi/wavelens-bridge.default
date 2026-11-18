@@ -7,7 +7,7 @@
 # listening; 4: VHF and UHF sweeps on separate dongles; HackRF: the 1–6000 MHz sweep when one is present —
 # and keeps watching: a dongle or HackRF plugged in later is taken up, one that is unplugged is handed off.
 # The Companion screen's hardware line shows the result. WAVELENS_ARGS then carries only the extras
-# (--rr-pack, --rr-county, --fcc-pack, --hackrf-mask, --name).
+# (--rr-pack, --rr-county, --licence-pack, --hackrf-mask, --name).
 #   WAVELENS_AUTO=1  does the same plan in the shell at each start (older way; no hot-plug)
 #   Naming radios in WAVELENS_ARGS (--rtl-power …@SERIAL, --listen-device, --hackrf-sweep) pins them by hand;
 #   a named dongle that isn't on the bus is still replaced by one that is.
@@ -19,7 +19,7 @@ WAVELENS_RTL433=""
 
 # Local data needs no flags: set the area once (sudo wavelens-area set US 49749, or the admin page's Area tab)
 # and the bridge loads /var/lib/wavelens/area/ at each start: the licence pack downloaded for that postcode
-# and any RadioReference exports you put in its rr/ folder. --fcc-pack / --rr-pack below are the manual way.
+# and any RadioReference exports you put in its rr/ folder. --licence-pack / --rr-pack below are the manual way.
 #
 # Extra bridge flags. Examples:
 #   --hackrf-sweep                          HackRF energy sweep of the whole 1 MHz–6 GHz range (~1 s a pass),
@@ -37,13 +37,14 @@ WAVELENS_RTL433=""
 #                                           with that serial (rtl_test lists serials); give rtl_433 the
 #                                           other one with -d :SERIAL in WAVELENS_RTL433
 #   --dump1090 localhost:30003              aircraft from dump1090 / readsb (needs a second dongle)
-#   --fcc-pack /usr/local/lib/wavelens/fcc-local.json
+#   --licence-pack /usr/local/lib/wavelens/fcc-local.json
+#                                           a licence pack you built or were sent (--fcc-pack is the older name, still works)
 #   --rr-pack /usr/local/lib/wavelens/rr/pinellas.csv --rr-pack /usr/local/lib/wavelens/rr/hillsborough.csv \
 #   --rr-pack /usr/local/lib/wavelens/rr/florida.csv --rr-pack /usr/local/lib/wavelens/rr/nationwide.csv \
 #   --rr-pack /usr/local/lib/wavelens/rr/trunked_sites.csv --rr-pack /usr/local/lib/wavelens/rr/talkgroups.csv \
 #   --rr-county Pinellas --rr-county Hillsborough
 #                                           RadioReference frequency exports (CSV) for your counties: hits are named
-#                                           by agency, description, alpha tag and mode; preferred over the FCC pack
+#                                           by agency, description, alpha tag and mode; preferred over the licence pack
 #                                           (a trunked-sites export gives trunk lock-on its control channels;
 #                                           a talkgroups export names the calls)
 #   --listen-device SERIAL                  the RTL-SDR the scanner listens with (default: the first @SERIAL sweep dongle);

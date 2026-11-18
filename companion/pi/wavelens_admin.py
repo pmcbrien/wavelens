@@ -855,7 +855,7 @@ KNOWN_FAULTS = [
     (re.compile(r"unsupported operand type\(s\) for \||SyntaxError|ModuleNotFoundError|ImportError"),
      "This version of the scanner software doesn't run on this Pi.",
      "rollback"),
-    # A data file the settings name (--fcc-pack, --rr-pack) that is not there. Bridges from 2026.11.10.8 skip
+    # A data file the settings name (--licence-pack / --fcc-pack, --rr-pack) that is not there. Bridges from 2026.11.10.8 skip
     # it and start; older ones stop here. Before the next entry, which used to claim it for itself and send
     # people to reinstall software that was all present.
     (re.compile(r"No such file or directory: '[^']+\.(?:json|csv)'"),
@@ -878,8 +878,8 @@ FIXES = {
     "rollback": "Tap <b>Put the previous version back</b>. If there's no previous version, tap <b>Install the latest update</b> — "
                 "fixes for problems like this are usually already out.",
     "reinstall": "Tap <b>Install the latest update</b>: it reinstalls every file and checks the result.",
-    "settings": "Copy that file to the path shown below, or open <b>Settings</b> and remove the <code>--fcc-pack</code> / "
-                "<code>--rr-pack</code> entry that names it. Then tap <b>Restart the scanner</b>. Installing an update will not help: "
+    "settings": "Copy that file to the path shown below, or open <b>Settings</b> and remove the <code>--licence-pack</code> "
+                "(or <code>--fcc-pack</code>) / <code>--rr-pack</code> entry that names it. Then tap <b>Restart the scanner</b>. Installing an update will not help: "
                 "no software is missing.",
     "replug": "Unplug each USB radio, wait five seconds, plug it back in. The scanner picks it up by itself within ten seconds.",
     "reboot": "Tap <b>Reboot</b>. If it comes back the same, power the Pi off for ten seconds.",
@@ -1447,6 +1447,32 @@ def update_history(n=10):
 # --------------------------------------------------------------------------------------------
 # HTML shell
 # --------------------------------------------------------------------------------------------
+RR_DROP_JS = r"""<script>
+(function(){
+  var zone=document.getElementById('rrdrop'), inp=document.getElementById('rrfile'), form=document.getElementById('rrform'),
+      names=document.getElementById('rrnames');
+  if(!zone||!inp||!form) return;
+  function show(){ var n=[]; for(var i=0;i<inp.files.length;i++) n.push(inp.files[i].name); names.textContent=n.join(', '); }
+  inp.addEventListener('change', show);
+  ['dragenter','dragover'].forEach(function(t){ zone.addEventListener(t,function(e){ e.preventDefault(); zone.classList.add('over'); }); });
+  ['dragleave','dragend'].forEach(function(t){ zone.addEventListener(t,function(){ zone.classList.remove('over'); }); });
+  // A file dropped anywhere else on the page would otherwise open in the browser and leave the admin page.
+  ['dragover','drop'].forEach(function(t){ window.addEventListener(t,function(e){ if(e.target!==zone && !zone.contains(e.target)) e.preventDefault(); }); });
+  zone.addEventListener('drop', function(e){
+    e.preventDefault(); zone.classList.remove('over');
+    var dt=e.dataTransfer; if(!dt||!dt.files||!dt.files.length) return;
+    var keep=new DataTransfer(), skipped=[];
+    for(var i=0;i<dt.files.length;i++){ var f=dt.files[i]; if(/\.csv$/i.test(f.name)) keep.items.add(f); else skipped.push(f.name); }
+    if(!keep.files.length){ names.textContent='Only .csv files: '+skipped.join(', ')+' left out.'; return; }
+    inp.files=keep.files; show();
+    if(skipped.length) names.textContent+=' (not .csv, left out: '+skipped.join(', ')+')';
+    names.textContent+=' Uploading…';
+    form.submit();
+  });
+})();
+</script>"""
+
+
 CSS = """
 :root{--bg:#0f1216;--card:#171b21;--line:#262c35;--fg:#e6e8eb;--mut:#8b93a1;--acc:#f2b705;--bad:#ff6b6b;--ok:#5fd38d}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
@@ -1456,6 +1482,9 @@ nav{display:flex;gap:4px;overflow-x:auto;padding:8px 12px;border-bottom:1px soli
 nav a{white-space:nowrap;padding:8px 12px;border-radius:8px;text-decoration:none;color:var(--fg)}nav a.on{background:var(--acc);color:#111;font-weight:600}
 main{max-width:860px;margin:0 auto;padding:16px}h1{font-size:22px;margin:4px 0 14px}h2{font-size:17px;margin:0 0 10px;color:var(--acc)}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+.drop{display:block;border:2px dashed var(--line);border-radius:12px;padding:22px 14px;text-align:center;cursor:pointer;margin:8px 0;color:var(--fg)}
+.drop.over{border-color:var(--acc);background:rgba(255,255,255,.04)}.drop #rrnames{display:block;margin-top:8px;word-break:break-all}
+.dropin{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px}
 table{width:100%;border-collapse:collapse}td,th{padding:6px 4px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--mut);font-weight:500;width:38%}
 label{display:block;color:var(--mut);font-size:14px;margin:10px 0 4px}input[type=text],input[type=password],textarea,select{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
@@ -2449,9 +2478,10 @@ At most once every 10 minutes. It needs an internet connection at that moment (p
 the area it has and tries again later. {"Set an area first." if not a else ""}</p></div>
 <div class="card"><h2>Your own RadioReference exports</h2>
 {rr_table}
-<form method="post" action="/area" enctype="multipart/form-data">{csrf_field(sess)}<input type="hidden" name="do" value="rr_upload">
-<label>Add exports (.csv, several at once is fine)</label><input type="file" name="rr" accept=".csv,text/csv" multiple required>
-<div class="row"><button class="btn">Upload</button></div></form>
+<form id="rrform" method="post" action="/area" enctype="multipart/form-data">{csrf_field(sess)}<input type="hidden" name="do" value="rr_upload">
+<label for="rrfile" id="rrdrop" class="drop"><b>Drop RadioReference .csv files here</b><br><span class="mut">or tap to choose them (several at once is fine)</span>
+<span id="rrnames" class="mut"></span></label><input id="rrfile" class="dropin" type="file" name="rr" accept=".csv,text/csv" multiple required>
+<div class="row"><button class="btn">Upload</button></div></form>{RR_DROP_JS}
 <p class="note">The CSV downloads from your own RadioReference account: a county's, a state's or the nationwide frequencies, a trunked
 system's sites, and its talkgroups. The Scanner tells them apart by their headers, so the file names don't matter; a file with
 the same name replaces the old one. Uploading or deleting restarts the bridge for a few seconds so the change is used.

@@ -69,7 +69,7 @@ class MissingPackTest(unittest.TestCase):
         self.assertIsNone(fcc)
         self.assertEqual(len(problems), 1)
         self.assertIn("is not on this Pi", problems[0])
-        self.assertIn("--fcc-pack", problems[0])
+        self.assertIn("--licence-pack", problems[0])
         self.assertIn("left out", log)
 
     def test_named_pack_missing_falls_back_to_the_area_folder(self):
@@ -81,6 +81,23 @@ class MissingPackTest(unittest.TestCase):
         fcc, _, problems, _ = self.packs(fcc=self.junk)
         self.assertIsNone(fcc)
         self.assertIn("could not be read", problems[0])
+
+    def test_log_names_the_pack_by_its_source_not_by_one_country(self):
+        au = os.path.join(self.tmp.name, "licences-au.json")
+        with open(au, "w", encoding="utf-8") as f:
+            json.dump(dict(PACK, source="Based on Example Authority information"), f)
+        _, _, _, log = self.packs(fcc=au)
+        self.assertIn("licence pack loaded (Based on Example Authority information), 1 licensed frequencies", log)
+        self.assertNotIn("FCC", log)
+        _, _, _, log = self.packs(fcc=self.good_fcc)             # a pack with no source still loads and says so plainly
+        self.assertIn("licence pack loaded, 1 licensed frequencies", log)
+
+    def test_the_setting_has_a_neutral_name_and_the_old_one_still_works(self):
+        import subprocess
+        bridge = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "wavelens_bridge.py")
+        out = subprocess.run([sys.executable, bridge, "--help"], capture_output=True, text=True, timeout=60).stdout
+        for flag in ("--licence-pack", "--license-pack", "--fcc-pack"):
+            self.assertIn(flag, out)
 
     def test_one_bad_radioreference_file_costs_only_itself(self):
         _, rr, problems, _ = self.packs(rr=[os.path.join(self.tmp.name, "nope.csv"), self.good_rr])

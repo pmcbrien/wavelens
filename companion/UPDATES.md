@@ -66,7 +66,7 @@ Started from the phone or the admin page, the update runs in a systemd unit of i
 `/var/lib/wavelens/update.json`, shown on the admin page's Status and Update pages and on the phone's
 Companion screen. The step-by-step log is `/var/lib/wavelens/update.log`.
 
-Your settings (`/etc/default/wavelens-bridge`), RadioReference packs and the admin password are never touched.
+Your settings (`/etc/default/wavelens-bridge`), your frequency lists and the admin password are never touched.
 
 CI (`.github/workflows/pi.yml`) loads the bridge on Python 3.9, 3.11 and 3.13 and runs the updater against
 a fake systemd — a good update, one that won't load, one that crash-loops, a rollback, and an update from an

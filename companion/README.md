@@ -28,7 +28,7 @@ Wiring and antenna diagrams: [diagrams/](diagrams/) — overview, ESP32, Pi + SD
 - **RTL-SDR** (24–1766 MHz): decoding, via `rtl_433`. It names things: a Schrader TPMS sensor, an Acurite weather station, a garage remote. Ceiling is 1.7 GHz, so no Wi-Fi, BLE or 5.8 GHz.
 - **HackRF** (1 MHz–6 GHz): energy, via `hackrf_sweep`. It reaches the bands the RTL-SDR can't, but a sweep sees *carriers*, not packets: "30 dB over the floor at 5745 MHz" could be a video link or a Wi-Fi access point on channel 149. The bridge labels these honestly and the app shows them as *Possible*. It does not demodulate Wi-Fi usefully (a $15 monitor-mode adapter does that better) and cannot tell a camera's LTE modem from the phones around you. **Receive only** — the bridge never transmits, and neither should you.
 - **ESP32 + CC1101 / SX1276**: a subset of rtl_433's decoders on a $5 module, tuned to one frequency at a time. The no-Pi way to hear TPMS and 433 MHz. With `HAS_SPECTRUM` the same chip also sweeps RSSI across its band (SX1276 433-variant: 410–525 MHz) for the app's spectrum strip and reports carriers as hits.
-- **Motorola Type II (SmartNet / SmartZone)** on the Pi: no dsd-fme involved. The bridge's own decoder (`pi/smartnet.py`) reads the 3600-baud control channel from `rtl_fm`, and on each group grant the same dongle switches to the voice channel (analog FM) for the call and back. The Scanner tab's SCAN finds Type II control channels like any other (they are steady carriers; the RadioReference sites export marks the system "Motorola Type II"), and a tap on one of the system's channels follows it. Channel plan: `--moto-band 800` (default), `800r` rebanded, `800s` splinter, `900`, or `obt:BASE:SPACING:OFFSET` for a UHF/VHF system. Encrypted-flagged and private/interconnect calls are never tuned. LTR remains unsupported (no control channel).
+- **Motorola Type II (SmartNet / SmartZone)** on the Pi: no dsd-fme involved. The bridge's own decoder (`pi/smartnet.py`) reads the 3600-baud control channel from `rtl_fm`, and on each group grant the same dongle switches to the voice channel (analog FM) for the call and back. The Scanner tab's SCAN finds Type II control channels like any other (they are steady carriers; the trunked-sites list marks the system "Motorola Type II"), and a tap on one of the system's channels follows it. Channel plan: `--moto-band 800` (default), `800r` rebanded, `800s` splinter, `900`, or `obt:BASE:SPACING:OFFSET` for a UHF/VHF system. Encrypted-flagged and private/interconnect calls are never tuned. LTR remains unsupported (no control channel).
 - **ESP32 + SA818**: an SA818-U (400–480 MHz) or SA818-V (134–174 MHz) FM receiver module on a UART, audio into the ADC, makes the ESP32 an **analog scanner**: the Scanner tab's Listen and Follow work exactly as with the Pi (same commands, same ADPCM audio over BLE), Follow steps a channel list (GMRS/FRS, MURS, marine, 2 m/70 cm simplex by default; the app can send its own) and tunes carriers the spectrum sweep finds. **No digital voice and no trunking** — P25/DMR need the Pi and dsd-fme; the ESP32 says so if asked. Wiring: module AF out → 1 µF → 10k/10k divider to 1.65 V → ADC1 pin; SQ pin → GPIO (low = open); PD and PTT tied high (receive only). Build with `-DHAS_SA818_U` / `-DHAS_SA818_V` (see `platformio.ini`, env `esp32-full` / `esp32-scanner`).
 - **ADS-B** (`dump1090`, `readsb`): aircraft overhead with callsign, altitude and position in the detail view. Unclassified on purpose — an airliner is not a drone.
 
@@ -508,8 +508,6 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 {"t":"spec","src":"hackrf","lo":851.0,"hi":869.0,"n":184,"bin_hz":98039,"db0":-120.0,"step_db":0.5,"b":"<base64>"}
                                      // one byte per bin: dB = db0 + byte * step_db. src hackrf | rtlpower | esp32
 {"t":"log","ts":1793469838,"l":"bridge: control-channel hunt: 800 MHz (sweep, 3 passes): 13 steady — …"}
-{"t":"page","f":462.75,"proto":"POCSAG1200","addr":"202803","msg":"…"}   // Lab: a decoded page (control
-                                     // tokens and bytes stripped on the Pi)
 ```
 
 ### Phone → companion
@@ -562,7 +560,7 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // held one releases it). Status carries "sysfav", "sysavoid".
 {"c":"listen","v":"radio","gain":0,"ppm":0}   // listening dongle gain (dB, 0 = auto, ≤50) and correction (±200 ppm),
                                      // applied to the current channel at once
-{"c":"listen","v":"cats","cats":["police"]}   // category filter, from each talkgroup's RadioReference tag:
+{"c":"listen","v":"cats","cats":["police"]}   // category filter, from each talkgroup's tag in your talkgroup list:
                                      // police / fire / ems / other. Police only by default; [] hears everything;
                                      // a talkgroup the pack can't classify is always heard. Status carries
                                      // "cats", "hold", "tglock", "tgavoid", "system", "systems":[...], "tgs":[...].
@@ -588,8 +586,7 @@ HackRF, when present, sweeps 1–6000 MHz. Dongles are addressed by serial when 
 `WAVELENS_ARGS` then carries only the extras (mask, packs, name). Replug and restart to re-plan.
 
 **Listening (SDR bridge, capability `listen`).** Listen, Follow, digital voice and trunk-tracking are in
-the Play Store app as well as Wavelens Lab (since 28 Oct); only pager decoding is Lab-only, and the
-bridge runs that decoder only for a client that sends `{"c":"pages","v":true}`. The bridge borrows an RTL-SDR — by default the first
+the Play Store app (since 28 Oct). The bridge borrows an RTL-SDR — by default the first
 `--rtl-power` dongle pinned with `@SERIAL`, or `--listen-device SERIAL` — pauses that sweep, runs
 `rtl_fm` and sends audio on a third characteristic, `…0004` (notify): 8 kHz mono IMA ADPCM in 164-byte
 frames — `seq` (u8), predictor (i16 LE), step index (u8), then 320 samples as 4-bit codes, high nibble
@@ -604,36 +601,22 @@ and the listen retunes to the channel that offset points at (the DC is removed b
 out). Later sweep readings of the same carrier refine it too. `--rtl-ppm` matters here: an uncorrected
 dongle's crystal error (often 20–50 ppm, 10–20 kHz at 450 MHz) looks like a channel offset.
 
-**Pager data.** With `multimon-ng` installed, every analog FM listen also feeds the audio (22.05 kHz,
-DC removed) to a POCSAG512/1200/2400 + FLEX decoder — on paging bands only (the US list is `PAGER_BANDS_US`
-in the bridge; a country pack can give `"companion": {"pager_bands": [[lo, hi], …]}`; `--pager-any-band`
-lifts the limit). Off those bands the decoder reads telemetry and mobile data as "numeric pages", so it is
-not run there, and on them a decode still has to look like a page (a short call-back number, or readable
-text) or it is dropped. A FLEX page, or the second plausible POCSAG page on a listen, sets `detected` to
-`POCSAG`/`FLEX` and mutes the audio frames; pages go to the phone as
-`{"t":"page","f":460.6,"proto":"POCSAG1200","addr":"1234567","msg":"…"}`. The Lab app shows them
-under the companion line on the Live tab, on the Companion screen, and on More → Pages (a page-only
-view with per-address filtering), and reads them aloud (toggle on either screen). Lab only — the Play app never asks for it; nothing is stored.
-Public-safety dispatch paging on an agency's own system is lawful to receive in the US
-(18 U.S.C. § 2511(2)(g)); commercial paging-carrier traffic is not — the decoder runs only on the
-frequency that was tuned.
-
-**RadioReference overlay.** `--rr-pack county.csv` (repeatable) loads a RadioReference frequency
-export — the CSV its county pages offer — and names sweep hits from it: *Agency · Description (Alpha
+**Frequency list overlay.** `--rr-pack county.csv` (repeatable) loads a county frequency list
+you supply as a CSV and names sweep hits from it: *Agency · Description (Alpha
 Tag)*, on both sides of a repeater pair (the input side is "radio keying up nearby", LIKELY). Extras
 carry `rr_agency`, `rr_description`, `rr_alpha`, `rr_mode`, `rr_tone`, `rr_tag`; `agency` is mapped
 from the Tag column so the agency-type alerts work from it; `listen` says how to demodulate (FM, AM,
 DMR, P25, NXDN) and the app's Listen uses it; trunked-site rows say so. Preferred over the FCC pack
-where it has the frequency. Several exports layer: give them most local first (county, statewide, nationwide); a statewide export's County column ranks the `--rr-county` counties and "Statewide" rows ahead of other counties'. The exports are the user's own files on the Pi; nothing from them is shipped.
+where it has the frequency. Several lists layer: give them most local first (county, statewide, nationwide); a statewide export's County column ranks the `--rr-county` counties and "Statewide" rows ahead of other counties'. The exports are the user's own files on the Pi; nothing from them is shipped.
 
-Two more RadioReference exports load with the same flag, recognised by their header:
+Two more kinds of list load with the same flag, recognised by their header:
 - **Trunked sites** (`System, SID, Counties, Site Dec, Site Hex, Description, County Name, Lat, Lon, Range,
   Frequencies`): one row per site, its frequencies in the trailing cells with `c` on control channels. The
   middle columns differ by system type (P25 rows add RFSS and NAC), so each row is read from its end. The
   system type comes from the system name — "(EDACS)", "(P25)", "Capacity Plus", "Connect Plus", "(DMR)",
   "(NXDN)"; LTR / Type II sites are skipped (dsd-fme cannot follow them); a name without a type is tried as
   P25 and DMR. These give trunk lock-on its control channels, the site's coordinates and coverage, and the
-  EDACS / DMR channel map in RadioReference's own LCN order. Every listed channel also names sweep hits.
+  EDACS / DMR channel map in the list's own LCN order. Every listed channel also names sweep hits.
 - **Talkgroups** (`System, SID, Counties, Decimal, Hex, Alpha Tag, Mode, Description, Tag, Category`): a
   followed call reads "TG 1308 · CPD Info (Law Talk) · encrypted" instead of "TG 1308" — the system being
   followed is preferred when several share a number. Mode `DE` / `TE` marks it encrypted (shown, never
@@ -645,7 +628,7 @@ utilities and businesses, P25 before DMR before EDACS; two candidates per site s
 
 **It finds its own radios.** With no radio named on the command line the bridge plans from the USB bus at start — whatever the serials: the first RTL-SDR decodes sensors (the bridge runs `rtl_433` itself), the next sweeps and listens, a third listens on its own, a HackRF sweeps 1–6000 MHz — and keeps watching: a dongle plugged in later is taken up (it becomes the listening dongle if none is, else the sensor dongle), a HackRF plugged in starts sweeping, an unplugged listening dongle hands off to another one present. The journal says `bridge: auto: …` / `bridge: hotplug: …`, the phone gets a status, and the hardware line shows the result.
 
-**Backpressure, never silence.** Everything bound for the phone goes through one outbox in three classes: audio frames first, on their 40 ms clock; then control (hello, status, pages); then bulk — sweep hits, journal lines, pager data — which is queued without limit (20,000 lines) and sent one chunk per frame gap while a call plays and flat out between calls. A long journal line can never delay an audio frame (lines go out in ≤180-byte chunks with the audio clock checked after each), and nothing in bulk is dropped short of the cap, which is logged. Spectrum frames are replaced, not queued.
+**Backpressure, never silence.** Everything bound for the phone goes through one outbox in three classes: audio frames first, on their 40 ms clock; then control (hello, status); then bulk — sweep hits, journal lines — which is queued without limit (20,000 lines) and sent one chunk per frame gap while a call plays and flat out between calls. A long journal line can never delay an audio frame (lines go out in ≤180-byte chunks with the audio clock checked after each), and nothing in bulk is dropped short of the cap, which is logged. Spectrum frames are replaced, not queued.
 
 **It adapts to what is plugged in.** The config names dongles by serial, but the bridge fits that plan to the radios on the USB bus at every start: a sweep or listen dongle that is missing has its job moved to a dongle that is present (a free one, else it shares — listening borrows the sweep dongle, which is how a two-dongle setup works anyway); a HackRF that is configured but absent is simply not swept with — the control-channel hunt and Follow run on the RTL-SDR sweep, and the phone's spectrum reach shrinks to what the sweep covers (`"spec":[lo,hi]` in hello). A HackRF plugged in later is picked up; one that drops off the bus is waited for with one journal line, not a restart every 3 s. The journal says what was adapted (`bridge: adapting: …`) and the hello's `hw` says what is there now.
 
@@ -661,14 +644,14 @@ utilities and businesses, P25 before DMR before EDACS; two candidates per site s
    that stayed 12 dB over the band in *every* reading are steady — a control channel never stops. If no
    sweep covers a band, `rtl_power` probes it as the last resort. The journal prints
    `control-channel hunt: 800 MHz (sweep, 3 passes): 13 steady — 856.9688 (+40 dB), …`.
-2. **Rank.** Steady carriers are ranked by strength; the RadioReference sites export names each one and
+2. **Rank.** Steady carriers are ranked by strength; the trunked-sites list names each one and
    fixes its decoder (P25 / DMR / EDACS / Motorola Type II; LTR is skipped). One entry per site — a busy
    system keeps several carriers up, and they are one system. `systems ranked: 856.9625 (+40 dB) Pinellas
    County (Countywide Simulcast); …` lists them. Only carriers `--trunk-min-db` (default 18) over the floor
    are candidates.
 3. **Lock.** Each candidate gets `dsd-fme -ft -T` with each demodulator for `TRUNK_CC_WAIT_S` (18 s):
    C4FM first, or **CQPSK first** (`-mq`) when the phone's Simulcast switch is on or the site's
-   RadioReference row says simulcast / Phase II — a simulcast (LSM) system syncs on C4FM but its voice
+   row in your list says simulcast / Phase II — a simulcast (LSM) system syncs on C4FM but its voice
    comes out chopped. The first sync is the lock (`locked onto the control channel 856.9625 MHz (P25p1,
    QPSK)`) and is cached in `/var/lib/wavelens/control-channel.json` for next time; a P25 phase 2 sync is
    a voice channel, not a control channel, and is skipped. A candidate with no sync is not retried for
@@ -692,7 +675,7 @@ makes Follow conventional-only; `"qpsk":true` on either is the Simulcast switch 
 current system with the other demodulator). Automatic following takes **public-safety systems only** —
 never military / federal, and never business, utility or transit systems (FleetTalk, hospitals, Duke
 Energy), even ones a talkgroups export covers; a tap on one of those systems' channels still follows it
-by hand. RadioReference matches for a frequency shared by several systems are ranked by distance from the
+by hand. List matches for a frequency shared by several systems are ranked by distance from the
 phone (the sites export's Lat/Lon, with the app's *Share position* on) and then by `--rr-county`, so a
 Pinellas carrier is not labelled with an Indiana utility's site that shares the frequency; a site more
 than 80 km away is never auto-followed or counted as heard.
@@ -714,7 +697,7 @@ the US; check state law for a receiver in a vehicle.
 **Auto mode** (a plain Listen on a carrier) starts `dsd-fme -fa`; the sync it reports ("Sync: +DMR",
 "+P25p1") names the protocol. If the carrier is on and no digital sync appears within 3 s, it is analog:
 the listen restarts as narrow FM. A D-STAR or NXDN sync in the 700/800/900 MHz bands is a false sync on a
-data channel and is ignored. A tap on a channel the RadioReference list knows as part of a trunked system
+data channel and is ignored. A tap on a channel your frequency list knows as part of a trunked system
 follows that system instead of probing the channel. Listen refuses bands with nothing to hear (cellular,
 GNSS, ADS-B) on the phone side.
 
@@ -782,12 +765,12 @@ What it downloads comes from the public repo's `area` release, rebuilt weekly fr
   radius, and written to `/var/lib/wavelens/area/fcc-local.json`. Elsewhere the area is still set, and
   carriers are named from the country's band table (`packs/<cc>.json`) until that country has a reader here.
 
-The bridge reads `/var/lib/wavelens/area/` at start by itself: `fcc-local.json`, and any RadioReference
-exports you put in `rr/` (trunked sites, talkgroups, county, statewide and nationwide frequency exports are
+The bridge reads `/var/lib/wavelens/area/` at start by itself: `fcc-local.json`, and any frequency
+lists you put in `rr/` (trunked sites, talkgroups, county, statewide and nationwide frequency exports are
 told apart by their headers and ordered most local first; the counties in range rank a statewide export).
 Nothing is listed in `WAVELENS_ARGS`. `--fcc-pack` and `--rr-pack` still work and take precedence. A
-companion with no area set loads no local data. RadioReference data is never downloaded or published by any
-of this: those exports are the owner's own.
+companion with no area set loads no local data. Those lists are never downloaded or published by any
+of this: they are the owner's own.
 
 ## Local FCC license pack — who owns that carrier
 

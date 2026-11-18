@@ -15,7 +15,8 @@ writing Wavelens lines (see ../README.md) to stdin.
                                                          # several ranges take turns on one dongle; pin it by serial
   ./wavelens_bridge.py --dump1090 localhost:30003        # ADS-B aircraft from dump1090 / readsb (SBS port)
   ./wavelens_bridge.py --kismet-json /tmp/kismet.json    # Kismet export from a monitor-mode Wi-Fi adapter
-  ./wavelens_bridge.py --fcc-pack fcc-local.json ...     # label licensed carriers by name (see ../tools/fcc_local_pack.py)
+  ./wavelens_bridge.py --licence-pack fcc-local.json ... # label licensed carriers by name (see ../tools/fcc_local_pack.py;
+                                                         --fcc-pack is the older name for the same setting)
   ./wavelens_bridge.py                                   # raw: stdin already in Wavelens line format
 
 Several at once:  rtl_433 -F json | ./wavelens_bridge.py --rtl433 --hackrf-sweep --dump1090 localhost:30003
@@ -127,7 +128,7 @@ PACK_PROBLEMS: "list[str]" = []
 
 
 def load_local_packs(fcc_arg, rr_args, rr_county_args, found):
-    """(FccPack or None, RrPack or None, [problem, ...]) from --fcc-pack / --rr-pack and the area folder.
+    """(FccPack or None, RrPack or None, [problem, ...]) from --licence-pack / --rr-pack and the area folder.
 
     A local pack names what the radio hears; it is never needed to hear it. So a file that will not load,
     whether named by hand in WAVELENS_ARGS or found in the area folder, is logged and left out, and the
@@ -139,10 +140,11 @@ def load_local_packs(fcc_arg, rr_args, rr_county_args, found):
             continue
         try:
             fcc = FccPack(path)
-            print(f"bridge: FCC pack loaded, {len(fcc.entries)} licensed frequencies from {path}", file=sys.stderr)
+            src = f" ({fcc.source})" if fcc.source else ""
+            print(f"bridge: licence pack loaded{src}, {len(fcc.entries)} licensed frequencies from {path}", file=sys.stderr)
         except Exception as e:  # noqa: BLE001
             why = "is not on this Pi" if isinstance(e, FileNotFoundError) else f"could not be read ({type(e).__name__}: {e})"
-            problems.append(f"licence pack {path} {why}" + (" (named by --fcc-pack in the settings)" if named else ""))
+            problems.append(f"licence pack {path} {why}" + (" (named by --licence-pack in the settings)" if named else ""))
     rr_paths = []
     for path, named in [(p, True) for p in rr_args] + [(p, False) for p in found.get("rr") or []]:
         if os.path.realpath(path) in {os.path.realpath(p) for p in rr_paths}:
@@ -1478,10 +1480,11 @@ def rr_controls_ranked(limit: int = 6):
             break
     return out
 
-# ---------------------------------------------------------------- local FCC license pack
+# ---------------------------------------------------------------- local licence pack (FCC in the US, ACMA in Australia, …)
 
 class FccPack:
-    """Frequency → licensee lookup built by ../tools/fcc_local_pack.py.
+    """Frequency → licensee lookup from a country's public licence records (built by ../tools/fcc_local_pack.py
+    for the US). The class keeps its first name; nothing in it is specific to the FCC.
 
     A hit at 453.21 MHz becomes "Licensed: Example County Sheriff's Office · WQZZ001 · public
     safety" with a category hint from the licensee's name and radio service. When the phone
@@ -1495,6 +1498,7 @@ class FccPack:
         self.entries = d.get("entries", [])
         self.keys = [e["mhz"] for e in self.entries]           # sorted by the builder
         self.area = d.get("area", {})
+        self.source = " ".join(str(d.get("source") or "").split())[:120]   # who published the records; shown in the log
 
     def lookup(self, mhz: float, tol_khz: float = 12.5):
         """Entries whose assigned frequency (or band) covers mhz ± tol. Nearest-first when a position is known."""
@@ -6730,11 +6734,13 @@ def main() -> None:
                     help="seconds on each range when several --rtl-power ranges are given (default 15)")
     ap.add_argument("--dump1090", metavar="HOST:PORT", help="relay aircraft from a dump1090/readsb SBS port")
     ap.add_argument("--kismet-json", metavar="PATH", help="relay Wi-Fi devices from a Kismet JSON export")
-    ap.add_argument("--fcc-pack", metavar="PATH", help="local FCC license pack from tools/fcc_local_pack.py; labels licensed carriers")
+    ap.add_argument("--licence-pack", "--license-pack", "--fcc-pack", dest="fcc_pack", metavar="PATH",
+                    help="local licence pack (public licence records for your area: FCC in the US, built by "
+                         "tools/fcc_local_pack.py); labels licensed carriers by name. --fcc-pack is the older name and still works")
     ap.add_argument("--rr-pack", metavar="CSV", action="append", default=[],
                     help="a RadioReference frequency export (CSV); repeatable, most local first (county, then statewide, then "
                          "nationwide). Names hits by agency, description, alpha tag and mode, on both sides of a repeater pair. "
-                         "Preferred over --fcc-pack where it has the frequency")
+                         "Preferred over --licence-pack where it has the frequency")
     ap.add_argument("--rr-county", metavar="NAME", action="append", default=[],
                     help="county (repeatable) whose rows in a statewide export rank ahead of other counties'")
     ap.add_argument("--pager-any-band", action="store_true",
@@ -6742,7 +6748,7 @@ def main() -> None:
                          "implausible decodes are still dropped")
     ap.add_argument("--area-dir", metavar="DIR", default=os.environ.get("WAVELENS_AREA_DIR", "/var/lib/wavelens/area"),
                     help="the area folder, read at start with nothing to list: fcc-local.json (written by wavelens-area for "
-                         "the postcode set on this companion) and RadioReference exports in rr/*.csv. --fcc-pack and "
+                         "the postcode set on this companion) and RadioReference exports in rr/*.csv. --licence-pack and "
                          "--rr-pack still work and come first. 'none' turns it off")
     ap.add_argument("--echo", action="store_true", help="print every line sent to the phone on stderr (see it with journalctl -u wavelens-bridge -f)")
     ap.add_argument("--region", default=os.environ.get("WAVELENS_REGION", ""),
