@@ -72,9 +72,12 @@ static void subghzInit();
   #define LED_ON  HIGH
   #define LED_OFF LOW
 #endif
-// Which chip this image was built for ("esp32", "esp32s3", "esp32c3", "esp32c5", "esp32c6"): sent in the
-// hello so the phone and the Pi only ever push this board the matching update.
+// Which image this is ("esp32", "esp32s3", "esp32c3", "esp32c5", "esp32c6"): sent in the hello so the phone
+// and the Pi only ever push this board the matching update. A build with a module fitted names itself apart
+// (-DWL_CHIP="esp32c5-cc1101"), so a plain C5 image, which has no CC1101 code, is never offered to it.
+#ifndef WL_CHIP
 #define WL_CHIP     CONFIG_IDF_TARGET
+#endif
 #define SVC_UUID    "57617665-6c65-6e73-0100-000000000001"
 #define TX_UUID     "57617665-6c65-6e73-0100-000000000002"
 #define RX_UUID     "57617665-6c65-6e73-0100-000000000003"

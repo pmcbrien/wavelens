@@ -561,5 +561,49 @@ def vehicle():
     d.save("vehicle-mount.svg")
 
 
+# ---------------------------------------------------------------- ESP32-C5 + CC1101 wiring (FR #111)
+
+def c5_cc1101():
+    """Wiring for [env:esp32c5-cc1101]: a CC1101 module on a Waveshare ESP32-C5-Zero (or any ESP32-C5 board)."""
+    d = D(1000, 600, "ESP32-C5 + CC1101: wiring for the esp32c5-cc1101 firmware")
+    d.text(24, 56, "Six signal wires and power. Pins are GPIO numbers as printed on the board, chosen to avoid the C5's boot, USB and UART pins.", 12, MUTED)
+    # the two boards
+    d.box(60, 90, 250, 380, "ESP32-C5-Zero", ["(or C5-DevKitC-1, any ESP32-C5)", "", "USB-C: power, flashing, Pi"], stroke=DATA)
+    d.box(690, 90, 250, 380, "CC1101 module", ["8-pin, 433 MHz version", "check your module's pin labels:", "pin order differs between makers"], stroke=RF)
+    wires = [  # (C5 side, CC1101 side, colour, direction note)
+        ("3V3", "VCC", POWER, "3.3 V only (never 5 V)"),
+        ("GND", "GND", INK, ""),
+        ("GPIO 6", "SCK", DATA, "SPI clock"),
+        ("GPIO 4", "MOSI (SI)", DATA, "SPI data to the CC1101"),
+        ("GPIO 5", "MISO (SO / GDO1)", DATA, "SPI data back"),
+        ("GPIO 10", "CSN (CS)", DATA, "chip select"),
+        ("GPIO 9", "GDO0", RF, "interrupt"),
+        ("GPIO 8", "GDO2", RF, "received data (rtl_433)"),
+    ]
+    y0, dy = 200, 32
+    for i, (a, b, col, why) in enumerate(wires):
+        y = y0 + i * dy
+        d.parts.append(f"<circle cx='310' cy='{y}' r='4' fill='{col}'/><circle cx='690' cy='{y}' r='4' fill='{col}'/>")
+        d.parts.append(f"<line x1='314' y1='{y}' x2='686' y2='{y}' stroke='{col}' stroke-width='2.2'/>")
+        d.text(298, y + 4, a, 12, col, "700", "end", mono=True)
+        d.text(702, y + 4, b, 12, col, "700", "start", mono=True)
+        if why:
+            d.text(500, y - 5, why, 10, MUTED, "400", "middle")
+    # antenna and power
+    d.parts.append(f"<line x1='940' y1='150' x2='975' y2='150' stroke='{RF}' stroke-width='2'/><line x1='975' y1='150' x2='975' y2='100' stroke='{RF}' stroke-width='2'/>")
+    d.text(975, 92, "433 MHz antenna", 11, RF, "600", "end")
+    d.note(60, 490, 430, [
+        "Avoid on the C5: GPIO 2, 3, 7, 25-28 (boot straps), 11 / 12 (UART0),",
+        "13 / 14 (USB). GPIO 0, 1 are also free if you need to move a pin; then",
+        "change the RF_MODULE_* flags in platformio.ini and build it yourself.",
+    ])
+    d.note(510, 490, 430, [
+        "Receive only: the firmware never tells the CC1101 to transmit.",
+        "Flash: pmcbrien.github.io/wavelens/flash, the C5 + CC1101 button.",
+        "New: built by CI, not yet checked on a real board.",
+    ])
+    d.save("c5-cc1101.svg")
+
+
 if __name__ == "__main__":
-    overview(); esp32(); pi(); pi_hackrf(); carputer(); arduino(); vehicle()
+    overview(); esp32(); pi(); pi_hackrf(); carputer(); arduino(); vehicle(); c5_cc1101()

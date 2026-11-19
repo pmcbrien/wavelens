@@ -1,0 +1,65 @@
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1000 600' width='1000' height='600' font-family='Inter, Helvetica, Arial, sans-serif'>
+<defs><marker id='arr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#9aa5b1'/></marker><marker id='arrb' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#7c3aed'/></marker><marker id='arrr' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b45309'/></marker><marker id='arrp' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#b91c1c'/></marker><marker id='arrd' viewBox='0 0 10 10' refX='9' refY='5' markerWidth='7' markerHeight='7' orient='auto-start-reverse'><path d='M0,0 L10,5 L0,10 z' fill='#1d4ed8'/></marker></defs>
+<rect width='1000' height='600' fill='#ffffff'/>
+<text x='24' y='34' font-size='20' font-weight='700' fill='#1f2933'>ESP32-C5 + CC1101: wiring for the esp32c5-cc1101 firmware</text>
+<text x='24' y='56' font-size='12' font-weight='400' fill='#6b7280' text-anchor='start'>Six signal wires and power. Pins are GPIO numbers as printed on the board, chosen to avoid the C5&#39;s boot, USB and UART pins.</text>
+<rect x='60' y='90' width='250' height='380' rx='8' fill='#f8fafc' stroke='#1d4ed8' stroke-width='1.5'/>
+<text x='72' y='112' font-size='13' font-weight='700' fill='#1d4ed8' text-anchor='start'>ESP32-C5-Zero</text>
+<text x='72' y='130' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>(or C5-DevKitC-1, any ESP32-C5)</text>
+<text x='72' y='144' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'></text>
+<text x='72' y='158' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>USB-C: power, flashing, Pi</text>
+<rect x='690' y='90' width='250' height='380' rx='8' fill='#f8fafc' stroke='#b45309' stroke-width='1.5'/>
+<text x='702' y='112' font-size='13' font-weight='700' fill='#b45309' text-anchor='start'>CC1101 module</text>
+<text x='702' y='130' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>8-pin, 433 MHz version</text>
+<text x='702' y='144' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>check your module&#39;s pin labels:</text>
+<text x='702' y='158' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>pin order differs between makers</text>
+<circle cx='310' cy='200' r='4' fill='#b91c1c'/><circle cx='690' cy='200' r='4' fill='#b91c1c'/>
+<line x1='314' y1='200' x2='686' y2='200' stroke='#b91c1c' stroke-width='2.2'/>
+<text x='298' y='204' font-size='12' font-weight='700' fill='#b91c1c' text-anchor='end' font-family='ui-monospace, Menlo, Consolas, monospace'>3V3</text>
+<text x='702' y='204' font-size='12' font-weight='700' fill='#b91c1c' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>VCC</text>
+<text x='500' y='195' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>3.3 V only (never 5 V)</text>
+<circle cx='310' cy='232' r='4' fill='#1f2933'/><circle cx='690' cy='232' r='4' fill='#1f2933'/>
+<line x1='314' y1='232' x2='686' y2='232' stroke='#1f2933' stroke-width='2.2'/>
+<text x='298' y='236' font-size='12' font-weight='700' fill='#1f2933' text-anchor='end' font-family='ui-monospace, Menlo, Consolas, monospace'>GND</text>
+<text x='702' y='236' font-size='12' font-weight='700' fill='#1f2933' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>GND</text>
+<circle cx='310' cy='264' r='4' fill='#1d4ed8'/><circle cx='690' cy='264' r='4' fill='#1d4ed8'/>
+<line x1='314' y1='264' x2='686' y2='264' stroke='#1d4ed8' stroke-width='2.2'/>
+<text x='298' y='268' font-size='12' font-weight='700' fill='#1d4ed8' text-anchor='end' font-family='ui-monospace, Menlo, Consolas, monospace'>GPIO 6</text>
+<text x='702' y='268' font-size='12' font-weight='700' fill='#1d4ed8' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>SCK</text>
+<text x='500' y='259' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>SPI clock</text>
+<circle cx='310' cy='296' r='4' fill='#1d4ed8'/><circle cx='690' cy='296' r='4' fill='#1d4ed8'/>
+<line x1='314' y1='296' x2='686' y2='296' stroke='#1d4ed8' stroke-width='2.2'/>
+<text x='298' y='300' font-size='12' font-weight='700' fill='#1d4ed8' text-anchor='end' font-family='ui-monospace, Menlo, Consolas, monospace'>GPIO 4</text>
+<text x='702' y='300' font-size='12' font-weight='700' fill='#1d4ed8' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>MOSI (SI)</text>
+<text x='500' y='291' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>SPI data to the CC1101</text>
+<circle cx='310' cy='328' r='4' fill='#1d4ed8'/><circle cx='690' cy='328' r='4' fill='#1d4ed8'/>
+<line x1='314' y1='328' x2='686' y2='328' stroke='#1d4ed8' stroke-width='2.2'/>
+<text x='298' y='332' font-size='12' font-weight='700' fill='#1d4ed8' text-anchor='end' font-family='ui-monospace, Menlo, Consolas, monospace'>GPIO 5</text>
+<text x='702' y='332' font-size='12' font-weight='700' fill='#1d4ed8' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>MISO (SO / GDO1)</text>
+<text x='500' y='323' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>SPI data back</text>
+<circle cx='310' cy='360' r='4' fill='#1d4ed8'/><circle cx='690' cy='360' r='4' fill='#1d4ed8'/>
+<line x1='314' y1='360' x2='686' y2='360' stroke='#1d4ed8' stroke-width='2.2'/>
+<text x='298' y='364' font-size='12' font-weight='700' fill='#1d4ed8' text-anchor='end' font-family='ui-monospace, Menlo, Consolas, monospace'>GPIO 10</text>
+<text x='702' y='364' font-size='12' font-weight='700' fill='#1d4ed8' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>CSN (CS)</text>
+<text x='500' y='355' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>chip select</text>
+<circle cx='310' cy='392' r='4' fill='#b45309'/><circle cx='690' cy='392' r='4' fill='#b45309'/>
+<line x1='314' y1='392' x2='686' y2='392' stroke='#b45309' stroke-width='2.2'/>
+<text x='298' y='396' font-size='12' font-weight='700' fill='#b45309' text-anchor='end' font-family='ui-monospace, Menlo, Consolas, monospace'>GPIO 9</text>
+<text x='702' y='396' font-size='12' font-weight='700' fill='#b45309' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>GDO0</text>
+<text x='500' y='387' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>interrupt</text>
+<circle cx='310' cy='424' r='4' fill='#b45309'/><circle cx='690' cy='424' r='4' fill='#b45309'/>
+<line x1='314' y1='424' x2='686' y2='424' stroke='#b45309' stroke-width='2.2'/>
+<text x='298' y='428' font-size='12' font-weight='700' fill='#b45309' text-anchor='end' font-family='ui-monospace, Menlo, Consolas, monospace'>GPIO 8</text>
+<text x='702' y='428' font-size='12' font-weight='700' fill='#b45309' text-anchor='start' font-family='ui-monospace, Menlo, Consolas, monospace'>GDO2</text>
+<text x='500' y='419' font-size='10' font-weight='400' fill='#6b7280' text-anchor='middle'>received data (rtl_433)</text>
+<line x1='940' y1='150' x2='975' y2='150' stroke='#b45309' stroke-width='2'/><line x1='975' y1='150' x2='975' y2='100' stroke='#b45309' stroke-width='2'/>
+<text x='975' y='92' font-size='11' font-weight='600' fill='#b45309' text-anchor='end'>433 MHz antenna</text>
+<rect x='60' y='490' width='430' height='58' rx='6' fill='#f3f4f6' stroke='#9aa5b1' stroke-width='1'/>
+<text x='70' y='508' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Avoid on the C5: GPIO 2, 3, 7, 25-28 (boot straps), 11 / 12 (UART0),</text>
+<text x='70' y='522' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>13 / 14 (USB). GPIO 0, 1 are also free if you need to move a pin; then</text>
+<text x='70' y='536' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>change the RF_MODULE_* flags in platformio.ini and build it yourself.</text>
+<rect x='510' y='490' width='430' height='58' rx='6' fill='#f3f4f6' stroke='#9aa5b1' stroke-width='1'/>
+<text x='520' y='508' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Receive only: the firmware never tells the CC1101 to transmit.</text>
+<text x='520' y='522' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>Flash: pmcbrien.github.io/wavelens/flash, the C5 + CC1101 button.</text>
+<text x='520' y='536' font-size='11' font-weight='400' fill='#6b7280' text-anchor='start'>New: built by CI, not yet checked on a real board.</text>
+</svg>
