@@ -15,7 +15,7 @@ It never connects to, pairs with or transmits to anything. It has **no network a
 
 <p align="center">
   <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-promo.mp4"><img src="docs/promo/wavelens-promo-poster.jpg" width="92%" alt="Night drive: Wavelens warns the driver of a drone overhead"></a><br>
-  <sub>Drone overhead, body cam ahead, a phone that keeps reappearing behind you, and a $199 Spotter on the dash that hears a plate reader a block sooner. <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-promo.mp4">Watch the 30-second spot</a>.</sub>
+  <sub>Drone overhead, body cam ahead, a phone that keeps reappearing behind you, and a $49 Spotter on the dash that hears a plate reader a block sooner. <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-promo.mp4">Watch the 30-second spot</a>.</sub>
 </p>
 
 ## Videos
@@ -27,7 +27,7 @@ Thirty seconds each, no jargon. Click a poster to play.
 | <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-layers.mp4"><img src="docs/promo/wavelens-layers-poster.jpg" alt="What a phone can't hear"></a><br><sub><b>What a phone can't hear.</b> The phone, then Spotter, then Scanner, each hearing more. 20 s.</sub> | <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-companion-promo.mp4"><img src="docs/promo/wavelens-companion-promo-poster.jpg" alt="Companion radios"></a><br><sub><b>Companion radios.</b> A second radio with a real antenna, and the three ready-made tiers. 30 s.</sub> |
 | <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-area.mp4"><img src="docs/promo/wavelens-area-poster.jpg" alt="Set up for where you drive"></a><br><sub><b>Set up for where you drive.</b> One line at checkout; the device arrives configured for your area. 15 s.</sub> | <a href="https://github.com/pmcbrien/wavelens/raw/main/docs/promo/wavelens-spotter.mp4"><img src="docs/promo/wavelens-spotter-poster.jpg" alt="Spotter in 15 seconds" width="45%"></a><br><sub><b>Spotter in 15 seconds.</b> Plug in, two blinks, Find, Pair, listening.</sub> |
 
-**Buy one ready to go:** Spotter $199 · Full Spectrum $499, programmed and set up for your area. [wavelensapp.us/#shop](https://wavelensapp.us/#shop)
+**Buy one ready to go:** Spotter $49 · Super Spotter $99 · Full Spectrum $699, programmed and set up for your area. [wavelensapp.us/#shop](https://wavelensapp.us/#shop)
 
 <p align="center">
   <a href="https://youtu.be/09LMsqHtMFQ"><img src="https://img.youtube.com/vi/09LMsqHtMFQ/mqdefault.jpg" width="45%" alt="How Wavelens uses the location foreground-service permission"></a>
