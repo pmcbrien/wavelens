@@ -571,6 +571,12 @@ static void rfTick(uint32_t) {}
 // platformio.ini.
 
 #ifdef HAS_SUBGHZ
+// A CC1101 in async direct mode sends its data on GDO0 only (RadioLib leaves GDO2 high-impedance). Reading
+// GDO2 needs CC1101_DATA_ON_GDO2, or the receiver pin floats: no decodes, and its noise storms the edge
+// interrupt (on a single-core C3 / C5 / C6 that starves the Bluetooth link).
+#if defined(RF_CC1101) && defined(RF_MODULE_GDO0) && (RF_MODULE_RECEIVER_GPIO != RF_MODULE_GDO0) && !defined(CC1101_DATA_ON_GDO2)
+#error "CC1101 receiver pin is not GDO0: add -DCC1101_DATA_ON_GDO2 or set RF_MODULE_RECEIVER_GPIO to the GDO0 pin"
+#endif
 #include <rtl_433_ESP.h>
 #ifndef SUBGHZ_MHZ
 #define SUBGHZ_MHZ 433.92
