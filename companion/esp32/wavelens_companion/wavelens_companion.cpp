@@ -599,10 +599,58 @@ static void subghzCb(char* json) {
   enqueue(line);
 }
 
+// SUBGHZ_GATE_ISR: only take the receiver pin's edge interrupt while a signal is on air.
+// rtl_433_ESP keeps that interrupt on all the time. A CC1101 in async mode puts sliced noise on the pin
+// whenever nothing is transmitting, so the handler runs tens of thousands of times a second for nothing. A
+// dual-core chip absorbs that; on a single-core C3 / C5 / C6 it takes the core away from Bluetooth (a phone
+// connected, got no data, and the link dropped after 40 s with "LL response timeout"). The library's receiver
+// task already reads the chip's RSSI every tick and opens a capture when it crosses its threshold, so this
+// task watches the same two numbers and unmasks the pin for just that long. The library is left untouched:
+// the handler stays attached, only the pin's interrupt is masked. Cost: the first millisecond or two of a
+// burst is missed, and the library's pre-trigger history has nothing to record (build with
+// PRETRIGGER_ENABLED=0). Sensors repeat their frame, so decodes survive that.
+#ifdef SUBGHZ_GATE_ISR
+#include <driver/gpio.h>
+#define SUBGHZ_GATE_HOLD_MS 60     // the library bridges 40 ms dropouts inside a signal; stay open past that
+#define SUBGHZ_GATE_MAX_MS  3000   // a carrier that never ends (or a wrong threshold) must not bring the storm back
+static volatile bool subghzRx = false;             // the decoders own the chip (false while a sweep has it)
+static void subghzGateTask(void*) {
+  bool open = false, lockout = false;
+  uint32_t lastHot = 0, openedAt = 0;
+  for (;;) {
+    vTaskDelay(1);
+    if (!subghzRx) { open = false; lockout = false; continue; }   // enable / disableReceiver own the pin
+    uint32_t now = millis();
+    bool hot = rtl_433_ESP::currentRssi > rtl_433_ESP::rssiThreshold;
+    if (hot) lastHot = now; else lockout = false;
+    if (!open && hot && !lockout) {
+      gpio_intr_enable((gpio_num_t)RF_MODULE_RECEIVER_GPIO); open = true; openedAt = now;
+    } else if (open && (now - lastHot > SUBGHZ_GATE_HOLD_MS || now - openedAt > SUBGHZ_GATE_MAX_MS)) {
+      gpio_intr_disable((gpio_num_t)RF_MODULE_RECEIVER_GPIO); open = false;
+      lockout = hot;                                // still hot after the cap: wait for it to end first
+    }
+  }
+}
+#endif
+
+static void subghzPause() {                         // hand the chip to something else (the spectrum sweep)
+#ifdef SUBGHZ_GATE_ISR
+  subghzRx = false;
+#endif
+  subghz.disableReceiver();
+}
+
 static void subghzInit() {
   subghz.initReceiver(RF_MODULE_RECEIVER_GPIO, SUBGHZ_MHZ);
   subghz.setCallback(subghzCb, subghzBuf, sizeof subghzBuf);
   subghz.enableReceiver();
+#ifdef SUBGHZ_GATE_ISR
+  gpio_intr_disable((gpio_num_t)RF_MODULE_RECEIVER_GPIO);   // attached by enableReceiver; masked until a signal
+  subghzRx = true;
+  static TaskHandle_t gate = nullptr;
+  if (!gate) xTaskCreate(subghzGateTask, "subghz_gate", 2048, nullptr, 2, &gate);   // same priority as the library's receiver task
+  Serial.println("subghz: edge interrupt gated on signal");   // tells this build apart in a serial log
+#endif
 }
 static void subghzTick() { if (mode == M_BOTH || mode == M_RF) subghz.loop(); }
 #else
@@ -653,7 +701,7 @@ static void specStart(float lo, float hi) {
   specLo = lo; specHi = hi; specN = n; specIdx = 0;
   if (!specRadioUp) {
 #ifdef HAS_SUBGHZ
-    subghz.disableReceiver();                   // the chip is ours while the sweep runs
+    subghzPause();                              // the chip is ours while the sweep runs
 #endif
 #ifdef RF_CC1101
     int st = specRadio.begin();
