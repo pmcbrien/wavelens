@@ -4702,6 +4702,29 @@ def scan_start(chans: list, mode: str, name: str, sq, ranges: "list[str] | None"
     scan_tune(0, now)
 
 
+def scan_apply_lockout(now: float) -> None:
+    """The lockout list changed during a band scan: drop its channels from the scan, and leave the one playing
+    at once if it was just locked out. Locking out the scan's last channel ends the scan."""
+    keep = [m for m in SCAN["chans"] if not locked_out(m)]
+    if len(keep) == len(SCAN["chans"]):
+        return
+    playing = SCAN["chans"][SCAN["i"]] if SCAN["chans"] else None
+    if not keep:
+        scan_stop()
+        listen_stop("every channel of the band scan is locked out", cancel_hunt=True)
+        listen_status("band scan stopped: every channel is locked out")
+        return
+    old = SCAN["chans"]
+    # the app's once-a-minute renewal is parsed without the locked-out channels too: same key, so it renews
+    SCAN["chans"], SCAN["key"] = keep, (tuple(keep), SCAN["mode"])
+    if playing is not None and locked_out(playing):
+        # the next channel after it in scan order that is still in the scan
+        after = [m for m in old[SCAN["i"] + 1:] + old[:SCAN["i"]] if m in keep]
+        scan_tune(keep.index(after[0]) if after else 0, now)
+    else:
+        SCAN["i"] = keep.index(playing) if playing in keep else 0
+
+
 def scan_stop() -> None:
     SCAN.update(on=False, key=None, ranges=[])
 
@@ -6547,6 +6570,8 @@ def run_peripheral(name: str) -> None:
                         del LISTEN["recent"][k]
                 if LISTEN["follow"] and LISTEN["req"] is not None and locked_out(LISTEN["mhz"]):
                     follow_leave(time.time(), f"{LISTEN['mhz']:.4f} MHz locked out")
+                if SCAN["on"]:
+                    scan_apply_lockout(time.time())
                 emit({"t": "status", "msg": f"lockout: {len(lst)} frequencies Follow will skip", "band": state["band"],
                       "mode": state["mode"], "lockout": lst})
             elif str(cmd.get("v") or "") == "hold":

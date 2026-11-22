@@ -114,6 +114,24 @@ class BandScan(unittest.TestCase):
         B.scan_start(MARINE, "fm", "Marine", 30)                   # an older app sends no ranges: unchanged
         self.assertEqual(B.sweep_ranges(usual), usual)
 
+    def test_lockout_during_a_scan(self):
+        B.scan_start(MARINE, "fm", "Marine", 30)                 # playing 156.8
+        B.LISTEN["lockout"] = [156.8]
+        B.scan_apply_lockout(self.now)
+        self.assertEqual(B.SCAN["chans"], [156.3, 156.45])
+        self.assertEqual(self.tuned[-1][0], 156.3)                # left the locked-out channel at once
+        B.LISTEN["lockout"] = [156.8, 156.45]
+        B.scan_apply_lockout(self.now)
+        self.assertEqual(B.SCAN["chans"], [156.3])
+        self.assertEqual(len(self.tuned), 2)                      # 156.3 was not locked out: stays on it
+        got = B.scan_parse({"mhz": MARINE, "mode": "fm", "name": "Marine"})   # the app's renewal
+        B.scan_start(got[0], got[1], got[2], 30)
+        self.assertEqual(len(self.tuned), 2)                      # renewed, not restarted
+        B.LISTEN["lockout"] = [156.8, 156.45, 156.3]
+        B.scan_apply_lockout(self.now)
+        self.assertFalse(B.SCAN["on"])                            # nothing left to scan
+        B.LISTEN["lockout"] = []
+
     def test_renewal_does_not_restart_the_scan(self):
         B.scan_start(MARINE, "fm", "Marine", 30)
         self.tick(B.SCAN_DWELL_S + 0.1)
