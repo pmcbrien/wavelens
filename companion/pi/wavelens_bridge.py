@@ -2932,15 +2932,30 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm:
     def wait_free():
         while busy():
             time.sleep(0.3)
+    configured = list(specs)
+    changed = lambda key: tuple(sweep_ranges(configured)) != key    # a band scan started or ended
     if len(specs) == 1:
-        cmd = f"rtl_power -f {specs[0]}{dev} -i {sweep_interval_s(specs[0])} {(' -g ' + str(gain)) if gain else ''}{(' -p ' + str(ppm)) if ppm else ''} -"
         while True:
+            now_specs = sweep_ranges(configured)
+            if len(now_specs) != 1:
+                if not feed_rtl_power_turns(sw, now_specs, configured, device, dev, busy, wait_free, dwell_s, ppm, gain):
+                    return
+                continue
+            key = tuple(now_specs)
+            cmd = f"rtl_power -f {now_specs[0]}{dev} -i {sweep_interval_s(now_specs[0])} {(' -g ' + str(gain)) if gain else ''}{(' -p ' + str(ppm)) if ppm else ''} -"
             wait_free()
-            sw.settle_until = time.time() + SETTLE_S + sweep_interval_s(specs[0])
-            if not run_once(cmd, sw.row, stop_when=busy, stall_s=RTL_STALL_S, on_stall=lambda: usb_reset(device)):
+            sw.settle_until = time.time() + SETTLE_S + sweep_interval_s(now_specs[0])
+            if not run_once(cmd, sw.row, stop_when=lambda: busy() or changed(key), stall_s=RTL_STALL_S,
+                            on_stall=lambda: usb_reset(device)):
                 return
             time.sleep(2)
-        return
+    feed_rtl_power_turns(sw, specs, configured, device, dev, busy, wait_free, dwell_s, ppm, gain, forever=True)
+
+
+def feed_rtl_power_turns(sw, specs, configured, device, dev, busy, wait_free, dwell_s, ppm, gain, forever=False) -> bool:
+    """Several ranges taking turns on one dongle (see feed_rtl_power). Returns True when the ranges to sweep
+    change (a band scan starting or ending), unless forever, which keeps going with whatever the ranges are
+    now; False when rtl_power cannot run at all."""
     def in_cc_band(spec: str) -> bool:
         try:
             lo, hi = _mhz(spec.split(":")[0]), _mhz(spec.split(":")[1].split("@")[0])
@@ -2948,6 +2963,7 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm:
             return False
         return any(lo <= b_hi and hi >= b_lo for _, b_lo, b_hi, _ in CC_BANDS)
     SPEC["dyn"] = True
+    specs = list(specs)
 
     def spectrum_window() -> None:
         """The window a Scanner / Spectrum screen is looking at, when no configured range covers it: a short
@@ -2964,7 +2980,14 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm:
                  sw.row, planned=True, stop_when=busy, stall_s=RTL_STALL_S, on_stall=lambda: usb_reset(device))
         time.sleep(0.5)
     while True:
+        now_specs = sweep_ranges(configured)
+        if not forever and tuple(now_specs) != tuple(specs):
+            return True
+        specs = now_specs
+        key = tuple(specs)
         for spec in specs:
+            if tuple(sweep_ranges(configured)) != key:
+                break                    # a band scan started or ended: sweep its ranges from the next turn
             spectrum_window()
             wait_free()
             hunting = HUNT.get("sweeping") and any(in_cc_band(sp) for sp in specs)
@@ -2976,8 +2999,9 @@ def feed_rtl_power(specs: "list[str]", device: str = "", dwell_s: int = 15, ppm:
             # pass already gives the three readings per bin that sweep_steady needs.
             dwell = int(SETTLE_S + i * 5) if hunting else max(dwell_s, 2 * i)
             if not run_once(f"rtl_power -f {spec}{dev} -i {i} {(' -g ' + str(gain)) if gain else ''}{(' -p ' + str(ppm)) if ppm else ''} -e {dwell}s -",
-                            sw.row, planned=True, stop_when=busy, stall_s=RTL_STALL_S, on_stall=lambda: usb_reset(device)):
-                return
+                            sw.row, planned=True, stop_when=lambda: busy() or tuple(sweep_ranges(configured)) != key,
+                            stall_s=RTL_STALL_S, on_stall=lambda: usb_reset(device)):
+                return False
             time.sleep(0.5)         # let the dongle close before the next range opens it
 
 
@@ -4595,7 +4619,8 @@ def trunk_resume() -> bool:
 # the next channel. Parking on one channel of the band played static (or nothing) while the rest of the band
 # was busy. A continuous broadcast (weather radio) just keeps the dongle. Needs a squelch: at 0 every channel
 # "has audio" (its noise), so the scan uses at least SCAN_MIN_SQ.
-SCAN = {"on": False, "chans": [], "mode": "fm", "i": 0, "name": "", "until": 0.0, "key": None, "asked_at": 0.0}
+SCAN = {"on": False, "chans": [], "mode": "fm", "i": 0, "name": "", "until": 0.0, "key": None, "asked_at": 0.0,
+        "ranges": []}           # rtl_power ranges the sweep dongle keeps to while the band scan runs
 SCAN_DWELL_S = 1.8          # rtl_fm is up in about half a second; give the squelch the rest to open
 SCAN_HANG_S = 3.0           # a channel that had a voice keeps the dongle this long after its squelch closes
 SCAN_MIN_SQ = 30            # rtl_fm squelch floor while scanning (the --listen-squelch default)
@@ -4621,7 +4646,41 @@ def scan_parse(cmd: dict):
     return out, mode, str(cmd.get("name") or "")[:40]
 
 
-def scan_start(chans: list, mode: str, name: str, sq) -> None:
+SCAN_RANGES_MAX = 8
+
+
+def scan_ranges(cmd: dict, chans: list) -> "list[str]":
+    """The rtl_power ranges a band scan sweeps instead of the usual ones, so the sweep and the picture stay on
+    the chosen band. The app may send the band's edges ("ranges": [[lo, hi], ...] MHz); a wide one is cut into
+    pieces of at most SPEC_EXTRA_MAX_MHZ that take turns. Without edges: a narrow window round each group of
+    channels. Clipped to what an RTL-SDR tunes."""
+    rng = []
+    for r in (cmd.get("ranges") or [])[:SCAN_RANGES_MAX]:
+        try:
+            lo, hi = sorted((float(r[0]), float(r[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+        lo, hi = max(lo, RTL_TUNE[0]), min(hi, RTL_TUNE[1])
+        while hi - lo >= 0.1 and len(rng) < SCAN_RANGES_MAX * 2:
+            top = min(hi, lo + SPEC_EXTRA_MAX_MHZ)
+            rng.append((lo, top))
+            lo = top
+    if not rng:
+        for m in sorted(chans):
+            if rng and m - rng[-1][1] <= 2.0:
+                rng[-1] = (rng[-1][0], m + 0.5)
+            else:
+                rng.append((m - 0.5, m + 0.5))
+        rng = [(max(lo, RTL_TUNE[0]), min(hi, RTL_TUNE[1])) for lo, hi in rng[:SCAN_RANGES_MAX]]
+    return [f"{lo:.4f}M:{hi:.4f}M:12.5k" for lo, hi in rng if hi - lo >= 0.1]
+
+
+def sweep_ranges(configured: "list[str]") -> "list[str]":
+    """What a sweep dongle sweeps right now: the band scan's ranges while one runs, else its configured ones."""
+    return list(SCAN["ranges"]) if SCAN["on"] and SCAN["ranges"] else list(configured)
+
+
+def scan_start(chans: list, mode: str, name: str, sq, ranges: "list[str] | None" = None) -> None:
     """Start (or renew) a band scan. The app re-sends its command about once a minute: the same band again
     only renews it, so the scan is not dragged back to its first channel every minute."""
     now = time.time()
@@ -4637,13 +4696,14 @@ def scan_start(chans: list, mode: str, name: str, sq) -> None:
     TRUNK["tries"], TRUNK["cc_at"] = [], 0.0
     if HUNT["on"]:
         HUNT["cancel"] = True
-    SCAN.update(on=True, chans=list(chans), mode=mode, i=0, name=name, until=now + SCAN_TTL_S, key=key, asked_at=0.0)
+    SCAN.update(on=True, chans=list(chans), mode=mode, i=0, name=name, until=now + SCAN_TTL_S, key=key, asked_at=0.0,
+                ranges=list(ranges or []))
     listen_status(f"scanning {name or 'the band'}: {len(chans)} channel(s), stopping on any voice")
     scan_tune(0, now)
 
 
 def scan_stop() -> None:
-    SCAN.update(on=False, key=None)
+    SCAN.update(on=False, key=None, ranges=[])
 
 
 def scan_tune(i: int, now: float) -> None:
@@ -6474,7 +6534,7 @@ def run_peripheral(name: str) -> None:
                 if got is None:
                     listen_status("band scan: no channel to scan (all locked out, or outside 24-1766 MHz)")
                 else:
-                    scan_start(got[0], got[1], got[2], cmd.get("sq"))
+                    scan_start(got[0], got[1], got[2], cmd.get("sq"), scan_ranges(cmd, got[0]))
             elif str(cmd.get("v") or "") == "lockout":
                 # The phone's list of frequencies Follow must never tune (it resends it on every connect).
                 try:

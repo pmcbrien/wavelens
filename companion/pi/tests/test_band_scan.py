@@ -90,6 +90,30 @@ class BandScan(unittest.TestCase):
         self.tick(1.0)
         self.assertEqual(self.tuned[-1][0], 156.3)
 
+    def test_ranges_from_band_edges(self):
+        # military air, 225-400 MHz: cut into pieces no wider than an on-request sweep window
+        r = B.scan_ranges({"ranges": [[225, 400]]}, [243.0, 282.8])
+        self.assertEqual(r[0], "225.0000M:265.0000M:12.5k")
+        self.assertEqual(r[-1], "385.0000M:400.0000M:12.5k")
+        self.assertEqual(len(r), 5)
+        # ham: two edges given, two ranges; nonsense entries skipped
+        self.assertEqual(B.scan_ranges({"ranges": [[144, 148], [420, 450], ["x"], [1, 2]]}, [146.52]),
+                         ["144.0000M:148.0000M:12.5k", "420.0000M:450.0000M:12.5k"])
+
+    def test_ranges_from_channels_when_no_edges(self):
+        r = B.scan_ranges({}, [156.8, 156.3, 157.1, 446.0])
+        self.assertEqual(r, ["155.8000M:157.6000M:12.5k", "445.5000M:446.5000M:12.5k"])
+
+    def test_sweep_keeps_to_the_band_scan(self):
+        usual = ["150M:174M:12.5k", "851M:869M:12.5k"]
+        self.assertEqual(B.sweep_ranges(usual), usual)
+        B.scan_start(MARINE, "fm", "Marine", 30, ["155.8000M:162.1000M:12.5k"])
+        self.assertEqual(B.sweep_ranges(usual), ["155.8000M:162.1000M:12.5k"])
+        B.scan_stop()
+        self.assertEqual(B.sweep_ranges(usual), usual)            # back to the usual ranges
+        B.scan_start(MARINE, "fm", "Marine", 30)                   # an older app sends no ranges: unchanged
+        self.assertEqual(B.sweep_ranges(usual), usual)
+
     def test_renewal_does_not_restart_the_scan(self):
         B.scan_start(MARINE, "fm", "Marine", 30)
         self.tick(B.SCAN_DWELL_S + 0.1)
