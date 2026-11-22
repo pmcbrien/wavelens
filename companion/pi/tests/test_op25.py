@@ -138,6 +138,68 @@ class OP25Test(unittest.TestCase):
         B.OP25_APPS = "/nonexistent"
         self.assertFalse(B.op25_wanted("trunkq"))             # not installed
 
+    def test_unbench_and_return_from_dsd_fme(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "rx.py"), "w").close()
+            B.OP25_APPS = d
+            os.environ.pop("WAVELENS_TRUNK_DECODER", None)
+            B.OP25.update(fails=0, benched_until=time.time() + 600, fell_back=True, stalls=[])
+            standin = FakeProc()
+            standin.decoder = "dsd-fme"
+            B.LISTEN["proc"], B.LISTEN["mode"] = standin, "trunkq"
+            self.assertFalse(B.op25_should_return(time.time()))   # still benched: stays on dsd-fme
+            with open(os.devnull, "w") as quiet:
+                err, sys.stderr = sys.stderr, quiet
+                try:
+                    B.op25_unbench("the listening dongle is back")
+                finally:
+                    sys.stderr = err
+            self.assertTrue(B.op25_wanted("trunkq"))
+            self.assertTrue(B.op25_should_return(time.time()))    # switch back between calls
+            standin.call_at = time.time()
+            self.assertFalse(B.op25_should_return(time.time()))   # not in the middle of a call
+            standin.call_at = 0.0
+            standin.decoder = "APCO25"
+            self.assertFalse(B.op25_should_return(time.time()))   # already on APCO25
+            B.LISTEN["proc"] = None
+        B.OP25.update(fails=0, benched_until=0.0, fell_back=False, stalls=[])
+
+    def test_repeated_silence_gives_the_frequency_up(self):
+        calls = []
+        saved = {k: getattr(B, k) for k in ("OP25_STALL_S", "listen_resolve", "cc_forget", "trunk_next_system",
+                                            "listen_status", "listen_stop", "OP25_NO_SYSID_S")}
+        B.OP25_STALL_S, B.OP25_NO_SYSID_S = 0.6, 999.0
+        B.listen_resolve = lambda mode, why, mhz=None: calls.append(("restart", why))
+        B.cc_forget = lambda mhz: calls.append(("forget", mhz))
+        B.trunk_next_system = lambda now, force=False: calls.append(("next", force)) or True
+        B.listen_status = lambda msg: None
+        B.listen_stop = lambda *a, **k: calls.append(("stop",))
+        B.OP25["stalls"] = []
+        B.LISTEN.update(mhz=857.9625, mode="trunkq")
+        try:
+            with open(os.devnull, "w") as quiet:
+                err, sys.stderr = sys.stderr, quiet
+                try:
+                    for n in range(B.OP25_STALL_LIMIT):
+                        B.LISTEN["gen"] = 20 + n
+                        p = FakeProc()
+                        ANSWER["msgs"] = [trunk(100 + 10 * n)]
+                        t = threading.Thread(target=B.op25_poll, args=(p, 20 + n), daemon=True)
+                        t.start()
+                        time.sleep(0.8)
+                        ANSWER["msgs"] = [trunk(105 + 10 * n)]   # counts up once, then goes quiet
+                        t.join(timeout=5)
+                        self.assertFalse(t.is_alive())
+                finally:
+                    sys.stderr = err
+        finally:
+            for k, v in saved.items():
+                setattr(B, k, v)
+        # the first silences restart the decoder; the last gives the frequency up instead
+        self.assertEqual([c[0] for c in calls], ["restart"] * (B.OP25_STALL_LIMIT - 1) + ["forget", "next"])
+        self.assertEqual(calls[-2], ("forget", 857.9625))
+        self.assertEqual(B.OP25["stalls"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

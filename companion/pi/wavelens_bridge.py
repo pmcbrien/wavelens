@@ -4927,7 +4927,26 @@ OP25_HTTP_PORT = 23473
 OP25_DIR = "/run/wavelens/op25"
 OP25_MODES = {"trunkq": "cqpsk", "trunk": "c4fm"}
 OP25_START_S = 25.0                        # GNU Radio builds its flowgraph and opens the dongle in this
-OP25 = {"fails": 0, "benched_until": 0.0}
+OP25 = {"fails": 0, "benched_until": 0.0, "fell_back": False, "stalls": []}
+OP25_STALL_LIMIT = 3          # silent restarts on one frequency within OP25_STALL_WINDOW_S before giving it up
+OP25_STALL_WINDOW_S = 300.0
+
+
+def op25_unbench(why: str) -> None:
+    """Let the APCO25 decoder be tried again at once. Its bench is for a decoder that will not start; once
+    the cause is gone (the listening dongle reconnected, a fresh USB reset) it should not wait 10 minutes."""
+    if OP25["benched_until"] > time.time() or OP25["fails"]:
+        print(f"bridge: listen: APCO25 decoder can be used again ({why})", file=sys.stderr)
+    OP25["benched_until"], OP25["fails"], OP25["stalls"] = 0.0, 0, []
+
+
+def op25_should_return(now: float) -> bool:
+    """dsd-fme took over a trunked listen because APCO25 would not start, and APCO25 may be used again:
+    true when the switch back can happen without cutting into a call."""
+    proc = LISTEN.get("proc")
+    return bool(OP25["fell_back"] and proc is not None and proc.poll() is None
+                and getattr(proc, "decoder", "") != "APCO25" and LISTEN.get("mode") in OP25_MODES
+                and op25_wanted(LISTEN["mode"]) and now - getattr(proc, "call_at", 0.0) > 5.0)
 
 
 def trunk_decoder() -> str:
@@ -5004,7 +5023,25 @@ def op25_poll(proc, gen: int) -> None:
             # It was decoding, and now nothing: no control-channel messages and no call for OP25_STALL_S.
             # A live P25 control channel sends several messages a second, so this is a dongle that stopped
             # delivering samples (a USB drop OP25 does not notice), not a quiet system. Restart it.
-            print(f"bridge: listen: APCO25 decoder silent for {OP25_STALL_S:.0f} s on {LISTEN['mhz']:.4f} MHz "
+            mhz, now = LISTEN["mhz"], time.time()
+            OP25["stalls"] = [(f, t) for f, t in OP25["stalls"] if now - t < OP25_STALL_WINDOW_S] + [(mhz, now)]
+            if sum(1 for f, _ in OP25["stalls"] if abs(f - mhz) < 0.001) >= OP25_STALL_LIMIT:
+                # Silent again and again on the same frequency: it is not a working control channel here, and
+                # restarting the decoder every 20 s reinitialises the dongle each time, which can lock an
+                # RTL2832 up until it is unplugged (22 Nov: 'rtlsdr_demod_read_reg failed', then no USB
+                # answer at all). Give the frequency up and try the next candidate, or hunt again.
+                OP25["stalls"] = []
+                print(f"bridge: listen: APCO25 decoder silent {OP25_STALL_LIMIT} times on {mhz:.4f} MHz in "
+                      f"{OP25_STALL_WINDOW_S / 60:.0f} min; not a working control channel here, trying the next",
+                      file=sys.stderr)
+                cc_forget(mhz)
+                listen_status(f"trunked: {mhz:.4f} MHz keeps going silent; trying the next")
+                if not trunk_next_system(now, force=True):
+                    listen_stop("control channel keeps going silent", cancel_hunt=True)
+                    if LISTEN["follow"] and not HUNT["on"]:
+                        threading.Thread(target=cc_hunt, args=([],), daemon=True).start()
+                return
+            print(f"bridge: listen: APCO25 decoder silent for {OP25_STALL_S:.0f} s on {mhz:.4f} MHz "
                   f"(no control channel, no call); restarting it", file=sys.stderr)
             heard_at = 0.0
             listen_resolve(LISTEN["mode"], "APCO25 decoder stopped decoding")
@@ -5102,7 +5139,7 @@ def start_op25(mhz: float, mode: str, gen: int, blocked: tuple, held: int = 0):
         if p.poll() is not None:
             break
         if getattr(p, "http_at", 0.0):
-            OP25["fails"] = 0
+            OP25["fails"], OP25["fell_back"] = 0, False
             print(f"bridge: listen: APCO25 decoding {mhz:.4f} MHz ({OP25_MODES[mode]}), up in {time.time() - t0:.0f} s",
                   file=sys.stderr)
             return p
@@ -5111,6 +5148,7 @@ def start_op25(mhz: float, mode: str, gen: int, blocked: tuple, held: int = 0):
     if LISTEN["gen"] != gen:
         return None
     OP25["fails"] += 1
+    OP25["fell_back"] = True
     if OP25["fails"] >= 3:
         OP25["benched_until"], OP25["fails"] = time.time() + 600.0, 0
     print(f"bridge: listen: APCO25 decoder did not come up on {mhz:.4f} MHz; using dsd-fme"
@@ -6102,6 +6140,7 @@ def usb_rescue(now: float, status: "str | None" = None, run=None) -> bool:
         run(f"uhubctl -l {shlex.quote(h)} -a on")
     USB_RESCUE["tries"].append(now)
     USB_RESCUE["seen_at"] = 0.0
+    op25_unbench("USB power-cycled")
     return True
 
 
@@ -6123,12 +6162,18 @@ def hotplug_watch() -> None:
             if listen_dongle_reenumerated(addr, now, dev):
                 print(f"bridge: hotplug: listening dongle {dev} dropped off USB and came back "
                       f"({addr[dev]} -> {now[dev]}); restarting the decoder on it", file=sys.stderr)
+                op25_unbench("the listening dongle reconnected")
                 if LISTEN["req"] is not None:
                     listen_resolve(LISTEN["mode"], "the listening dongle reconnected")
             addr = now
             if tick % 5 == 0:
                 hotplug_step(set(now), hackrf_on_usb())
                 usb_rescue(time.time())
+            if tick % 15 == 0 and op25_should_return(time.time()):
+                # dsd-fme stood in while APCO25 would not start; on a simulcast system it chops the audio,
+                # so go back to APCO25 between calls once it may be used again
+                print("bridge: listen: switching the trunked listen back to the APCO25 decoder", file=sys.stderr)
+                listen_resolve(LISTEN["mode"], "the APCO25 decoder is available again")
         except Exception as e:
             print(f"bridge: hotplug: {e}", file=sys.stderr)
 
@@ -6157,6 +6202,7 @@ def hotplug_step(now_rtl: "set[str]", hk: bool) -> None:
             AUTO["listen_home"] = None
             LISTEN["dev"] = sn
             print(f"bridge: hotplug: {sn} is back; listening returns to it", file=sys.stderr)
+            op25_unbench("the listening dongle is back")
             emit({"t": "status", "msg": f"RTL-SDR {sn} is back: listening on it again", "band": state["band"], "mode": state["mode"]})
             if LISTEN["req"] is not None:
                 listen_resolve(LISTEN["mode"], "the listening dongle is back")
