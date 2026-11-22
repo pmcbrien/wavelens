@@ -41,6 +41,7 @@ import html
 import http.cookies
 import json
 import os
+import pathlib
 import re
 import secrets
 import shlex
@@ -1538,8 +1539,46 @@ def page(title, body, active="", nav=True, flash=None):
 <div class="meta">{esc(hostname())}<br>v{esc(installed_version())}</div></header>
 {f'<nav>{tabs}</nav>' if nav else ''}
 <main><h1>{esc(title)}</h1>{flash_html}{body}</main>
-<footer>Wavelens companion admin · receive-only · nothing leaves this Pi except updates you ask for</footer>
+<footer>Wavelens companion admin · receive-only · nothing leaves this Pi except updates you ask for · <a href="/licences">Open-source licences</a></footer>
 </body></html>"""
+
+
+# Open-source software on this Scanner, for the licences page. (key, name, what it does, licence,
+# folder in the Wavelens checkout, licence file in that folder, upstream project).
+PUBLIC_REPO = "https://github.com/pmcbrien/wavelens"
+SOURCE_CONTACT = "wavelensapp@gmail.com"
+OSS = [
+    ("apco25", "APCO25", "P25 trunking decoder (a modified OP25)", "GNU GPL version 3",
+     "companion/apco25", "LICENSE", "https://github.com/boatbod/op25"),
+    ("dsd-fme", "dsd-fme", "digital voice decoder: DMR, P25 phase 1, NXDN", "ISC, with GPL-licensed files",
+     "companion/vendor/dsd-fme", "COPYRIGHT", "https://github.com/lwvmobile/dsd-fme"),
+    ("mbelib", "mbelib", "voice codecs used by dsd-fme", "ISC (patent notice in its README)",
+     "companion/vendor/mbelib", "README.md", "https://github.com/lwvmobile/mbelib"),
+    ("rtl-sdr-blog", "RTL-SDR Blog driver", "driver for the RTL-SDR Blog V4 dongle", "GNU GPL version 2",
+     "companion/vendor/rtl-sdr-blog", "COPYING", "https://github.com/rtlsdrblog/rtl-sdr-blog"),
+    ("bluezero", "bluezero", "Python Bluetooth library the bridge uses", "MIT",
+     "companion/vendor/bluezero", "", "https://pypi.org/project/bluezero/"),
+]
+
+
+def source_dir():
+    """The Wavelens checkout this Pi was installed from (written by install-service.sh)."""
+    try:
+        return pathlib.Path(open("/etc/wavelens/source").read().strip() or "/opt/wavelens")
+    except OSError:
+        return pathlib.Path("/opt/wavelens")
+
+
+def oss_licence_text(key):
+    """The licence file of one component, from the checkout on this Pi; None if it is not there."""
+    for k, _, _, _, folder, lic, _ in OSS:
+        if k == key and lic:
+            f = source_dir() / folder / lic
+            try:
+                return f.read_text(errors="replace")
+            except OSError:
+                return None
+    return None
 
 
 def csrf_ok(given, expected):
@@ -2017,6 +2056,13 @@ class Handler(BaseHTTPRequestHandler):
             return routes[path](sess)
         if path.startswith("/power/"):
             return self.page_power_confirm(sess, path[7:])
+        if path == "/licences":
+            return self.page_licences(sess)
+        if path.startswith("/licences/"):
+            text = oss_licence_text(path[len("/licences/"):])
+            if text is None:
+                return self.send_html(page("Not found", "<p>That licence file is not on this Pi. The public repository has it.</p>", nav=True), 404)
+            return self.send_text(text, f"{path[len('/licences/'):]}-licence.txt")
         if path == "/frequencies" or path.startswith("/frequencies/"):
             return self.get_frequencies(sess, path, {k: v[0] for k, v in q.items()})
         if path == "/api/logs":
@@ -2146,6 +2192,32 @@ open this page. If you forget it: <code>sudo wavelens-admin --reset-password</co
         self.redirect("/login", cookie=self.cookie("x", expire=True))
 
     # ---- /account --------------------------------------------------------------------------
+    def page_licences(self, sess):
+        src = source_dir()
+        rows = "".join(
+            f"<tr><td><b>{esc(n)}</b><br><span class=\"mut\">{esc(what)}</span></td><td>{esc(lic)}</td>"
+            f"<td><a href=\"{esc(PUBLIC_REPO)}/tree/main/{esc(folder)}\">source</a>"
+            + (f" · <a href=\"/licences/{esc(k)}\">licence text</a>" if l else "")
+            + f" · <a href=\"{esc(up)}\">original project</a></td></tr>"
+            for k, n, what, lic, folder, l, up in OSS)
+        body = f"""<div class="card"><h2>Open-source software on this Scanner</h2>
+<p>The Scanner runs open-source software alongside the Wavelens bridge. Each is used under its own licence, which
+gives you the right to get its source code, change it and reinstall it on this Pi.</p>
+<table><tr><th>Software</th><th>Licence</th><th>Source</th></tr>{rows}</table>
+<p class="note">The source for the exact versions on this unit is in the Wavelens public repository,
+<a href="{esc(PUBLIC_REPO)}">{esc(PUBLIC_REPO)}</a>, and on this Pi in <code>{esc(str(src))}</code>. APCO25 is a
+modified version of OP25; what was changed is in its NOTICE.md.</p></div>
+<div class="card"><h2>Operating system</h2>
+<p>Raspberry Pi OS (Debian) and the packages installed from it, among them GNU Radio, rtl-sdr, rtl_433 and BlueZ,
+are under their own licences, listed on this Pi in <code>/usr/share/doc/&lt;package&gt;/copyright</code>. Their
+source is published by Debian (<a href="https://sources.debian.org">sources.debian.org</a>) and Raspberry Pi
+(<a href="https://archive.raspberrypi.com">archive.raspberrypi.com</a>).</p></div>
+<div class="card"><h2>Written offer</h2>
+<p>For at least three years after we last ship this model, we will give anyone who asks a copy of the complete
+corresponding source code of any GPL-licensed software on this unit, for no more than the cost of providing it.
+Write to <a href="mailto:{esc(SOURCE_CONTACT)}">{esc(SOURCE_CONTACT)}</a>.</p></div>"""
+        self.render(sess, "Open-source licences", body, "")
+
     def page_account(self, sess):
         body = f"""<div class="card"><h2>Change password</h2><form method="post" action="/account">{csrf_field(sess)}
 <label>Current password</label><input type="password" name="old" autocomplete="current-password">
