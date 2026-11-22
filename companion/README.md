@@ -692,11 +692,11 @@ frequency — the usual convention, not a guarantee); **Motorola Type II / Smart
 the bridge's own decoder** (`pi/smartnet.py`: `rtl_fm` discriminator audio → 3600-baud FSK bits →
 preamble, 4×19 deinterleave, parity correction, 10-bit CRC → OSWs → grants; the same dongle plays each
 grant's analog voice channel and returns; `--moto-band` 800 | 800r | 800s | 900 | obt:BASE:SPACING:OFFSET).
-**OP25 for trunked P25** (new, being proven): `pi/install-op25.sh` builds boatbod's OP25 into `/opt/op25`, and
-the bridge then follows trunked P25 with OP25's CQPSK demodulator instead of dsd-fme (much cleaner on
-simulcast); same call fields, holds, ignores and filters. If OP25 can't start, that listen falls back to
-dsd-fme; DMR, NXDN, EDACS and conventional digital always use dsd-fme. `WAVELENS_TRUNK_DECODER=auto|op25|dsd-fme`
-in `/etc/default/wavelens-bridge` (default `auto`). OP25's IMBE vocoder is patented in some countries; the
+**APCO25 decoder for trunked P25**: provision.sh with `WAVELENS_DIGITAL_VOICE=1` (or `pi/install-op25.sh`)
+builds it into `/opt/op25`, and the bridge then follows trunked P25 with its CQPSK demodulator instead of dsd-fme
+(much cleaner on simulcast); same call fields, holds, ignores and filters. If it can't start, that listen falls
+back to dsd-fme; DMR, NXDN, EDACS and conventional digital always use dsd-fme. `WAVELENS_TRUNK_DECODER=auto|op25|dsd-fme`
+in `/etc/default/wavelens-bridge` (default `auto`). Its IMBE vocoder is patented in some countries; the
 installer asks first. LTR has no control channel to follow. Unencrypted public-safety trunked traffic is lawful to receive in
 the US; check state law for a receiver in a vehicle.
 

@@ -4853,6 +4853,7 @@ def op25_files(mhz: float, mode: str, blocked: tuple, held: int = 0) -> str:
 
 
 OP25_STALL_S = 20.0
+OP25_NO_SYSID_S = 25.0      # frames decoding this long with no system ID and no grant: not a control channel
 
 
 def op25_stalled(heard_at: float, call_at: float, now: float) -> bool:
@@ -4867,16 +4868,34 @@ def op25_poll(proc, gen: int) -> None:
     body = json.dumps([{"command": "update", "arg1": 0, "arg2": 0}]).encode()
     tsbks0 = None
     heard_at = 0.0                            # last time OP25 showed life: control messages counting up, or a call
+    first_heard = 0.0                         # when frames first decoded on this frequency
+    sysid_seen = False
     while proc.poll() is None and LISTEN["gen"] == gen:
         time.sleep(0.5)
+        if first_heard and not sysid_seen and not getattr(proc, "call_at", 0.0) \
+                and time.time() - first_heard > OP25_NO_SYSID_S:
+            # Frames decode, but in all this time no system ID and no channel grant: a control channel sends
+            # both every second. This is a busy voice channel of the system (its link-control words count
+            # as messages, and look like a control channel to the hunt), where calls are only ever joined
+            # half-way and no grant is heard. Forget it and try the next candidate, or hunt again.
+            mhz = LISTEN["mhz"]
+            print(f"bridge: listen: {mhz:.4f} MHz decodes but sends no system ID or grants in "
+                  f"{OP25_NO_SYSID_S:.0f} s: a voice channel, not the control channel; trying the next", file=sys.stderr)
+            cc_forget(mhz)
+            listen_status(f"trunked: {mhz:.4f} MHz is a voice channel, not a control channel; trying the next")
+            if not trunk_next_system(time.time(), force=True):
+                listen_stop("not a control channel", cancel_hunt=True)
+                if LISTEN["follow"] and not HUNT["on"]:
+                    threading.Thread(target=cc_hunt, args=([],), daemon=True).start()
+            return
         if op25_stalled(heard_at, getattr(proc, "call_at", 0.0), time.time()):
             # It was decoding, and now nothing: no control-channel messages and no call for OP25_STALL_S.
             # A live P25 control channel sends several messages a second, so this is a dongle that stopped
             # delivering samples (a USB drop OP25 does not notice), not a quiet system. Restart it.
-            print(f"bridge: listen: OP25 silent for {OP25_STALL_S:.0f} s on {LISTEN['mhz']:.4f} MHz "
+            print(f"bridge: listen: APCO25 decoder silent for {OP25_STALL_S:.0f} s on {LISTEN['mhz']:.4f} MHz "
                   f"(no control channel, no call); restarting it", file=sys.stderr)
             heard_at = 0.0
-            listen_resolve(LISTEN["mode"], "OP25 stopped decoding")
+            listen_resolve(LISTEN["mode"], "APCO25 decoder stopped decoding")
             return
         try:
             req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
@@ -4896,11 +4915,14 @@ def op25_poll(proc, gen: int) -> None:
                 for k, v in m.items():
                     if isinstance(v, dict) and isinstance(v.get("tsbks"), int):
                         tsbks = (tsbks or 0) + v["tsbks"]
+                        if isinstance(v.get("sysid"), int) and v["sysid"] not in (-1, 0):
+                            sysid_seen = True
             elif jt == "change_freq":
                 tgid, freq = m.get("tgid"), float(m.get("freq") or 0.0)
         if tsbks is not None:
             if tsbks0 is not None and tsbks > tsbks0:
                 heard_at = now
+                first_heard = first_heard or now
                 proc.sync, proc.sync_at, proc.ctrl_at = "P25p1", now, now
                 proc.alive_at = getattr(proc, "alive_at", 0.0) or now
             tsbks0 = tsbks
@@ -4934,7 +4956,7 @@ def start_op25(mhz: float, mode: str, gen: int, blocked: tuple, held: int = 0):
     try:
         tsv = op25_files(mhz, mode, blocked, held)
     except OSError as e:
-        print(f"bridge: listen: OP25 files not written ({e}); using dsd-fme", file=sys.stderr)
+        print(f"bridge: listen: APCO25 decoder files not written ({e}); using dsd-fme", file=sys.stderr)
         return None
     dev = LISTEN["dev"] or "0"
     argv = ["python3", "rx.py", "--args", f"rtl={dev}", "-S", "960000", "-q", str(int(LISTEN["ppm"] or 0))]
@@ -4945,13 +4967,13 @@ def start_op25(mhz: float, mode: str, gen: int, blocked: tuple, held: int = 0):
     try:
         p = subprocess.Popen(argv, cwd=OP25_APPS, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     except (FileNotFoundError, OSError) as e:
-        print(f"bridge: listen: OP25 did not start ({e}); using dsd-fme", file=sys.stderr)
+        print(f"bridge: listen: APCO25 decoder did not start ({e}); using dsd-fme", file=sys.stderr)
         return None
     p.err_tail, p.err_log = deque(maxlen=3), deque(maxlen=15)
     p.sync, p.sync_at, p.call, p.call_at = "", 0.0, "", 0.0
     p.voice_at, p.enc_now, p.enc_at = 0.0, False, 0.0
     p.frames = {"voice": 0, "bad": 0, "ctrl": 0}
-    p.decoder = "OP25"
+    p.decoder = "APCO25"
 
     def drain(proc=p):
         for ln in proc.stderr:
@@ -4960,7 +4982,7 @@ def start_op25(mhz: float, mode: str, gen: int, blocked: tuple, held: int = 0):
                 proc.err_tail.append(ln)
                 proc.err_log.append(ln)
                 if re.search(r"(?i)traceback|error|fail|usb_claim|unable|exception", ln):
-                    log_line(f"OP25: {ln}")
+                    log_line(f"APCO25: {ln}")
     threading.Thread(target=drain, daemon=True).start()
     threading.Thread(target=op25_poll, args=(p, gen), daemon=True).start()
     t0 = time.time()
@@ -4969,7 +4991,7 @@ def start_op25(mhz: float, mode: str, gen: int, blocked: tuple, held: int = 0):
             break
         if getattr(p, "http_at", 0.0):
             OP25["fails"] = 0
-            print(f"bridge: listen: OP25 decoding {mhz:.4f} MHz ({OP25_MODES[mode]}), up in {time.time() - t0:.0f} s",
+            print(f"bridge: listen: APCO25 decoding {mhz:.4f} MHz ({OP25_MODES[mode]}), up in {time.time() - t0:.0f} s",
                   file=sys.stderr)
             return p
         time.sleep(0.25)
@@ -4979,7 +5001,7 @@ def start_op25(mhz: float, mode: str, gen: int, blocked: tuple, held: int = 0):
     OP25["fails"] += 1
     if OP25["fails"] >= 3:
         OP25["benched_until"], OP25["fails"] = time.time() + 600.0, 0
-    print(f"bridge: listen: OP25 did not come up on {mhz:.4f} MHz; using dsd-fme"
+    print(f"bridge: listen: APCO25 decoder did not come up on {mhz:.4f} MHz; using dsd-fme"
           + (f" (benched for 10 min)" if OP25["benched_until"] > time.time() else "")
           + "; its last lines: " + (" | ".join(p.err_log) or "none"), file=sys.stderr)
     return None
@@ -5340,7 +5362,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
         else:
             LISTEN["blocked"], LISTEN["held"], LISTEN["blocked_at"] = blocked, held, time.time()
             if held:
-                print(f"bridge: listen: holding TG {held}: OP25 follows only its calls", file=sys.stderr)
+                print(f"bridge: listen: holding TG {held}: the APCO25 decoder follows only its calls", file=sys.stderr)
             if blocked:
                 print(f"bridge: listen: {len(blocked)} talkgroup(s) outside the filter or always encrypted are not followed", file=sys.stderr)
             procs.append(op25)
@@ -5433,7 +5455,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
     LISTEN["proc"] = p
     LISTEN["starting"] = False
     LISTEN["tuned_at"] = LISTEN["last_audio"] = time.time()
-    print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})" + (" · OP25" if op25 is not None else ""), file=sys.stderr)
+    print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})" + (" · APCO25" if op25 is not None else ""), file=sys.stderr)
     listen_status(f"listening on {mhz:.4f} MHz ({mode.upper()}); the RTL-SDR sweep is paused")
     enc = Ima()
     in_rate = out_rate if sock is None else LISTEN_RATE

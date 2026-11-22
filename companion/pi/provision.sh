@@ -19,7 +19,7 @@
 #                              database exists (today the US), so hits read "Example County Road Commission"
 #                              rather than "151 MHz carrier". Any time later: sudo wavelens-area set US 49749,
 #                              or the admin page's Area tab. Without it the Scanner loads no local data.
-#   WAVELENS_DIGITAL_VOICE=1   build digital voice too: dsd-fme (P25 phase 1, DMR, NXDN) and OP25 (the P25 decoder
+#   WAVELENS_DIGITAL_VOICE=1   build digital voice too: dsd-fme (P25 phase 1, DMR, NXDN) and the APCO25 decoder (the P25 decoder
 #                              that copes with simulcast county systems). Both include voice codecs that are
 #                              patented in some countries; setting it to 1 says you have read
 #                              https://github.com/lwvmobile/mbelib#readme and that building them is allowed where
@@ -29,7 +29,7 @@
 # What it does: apt packages (rtl-sdr, rtl_433, BlueZ, NetworkManager, avahi, esptool, git), the Python bridge
 # dependency (bluezero), a checkout of the public repo at /opt/wavelens, hostname "wavelens" (so the admin page is
 # http://wavelens.local:8080), install-service.sh (bridge + updater + nightly timer + admin page), and the kernel
-# TV-driver blacklist, and with WAVELENS_DIGITAL_VOICE=1 digital voice (install-dsd.sh, then install-op25.sh).
+# TV-driver blacklist, and with WAVELENS_DIGITAL_VOICE=1 digital voice (install-dsd.sh, then the APCO25 decoder).
 # Everything here is receive-only. Needs internet on the Pi while it runs.
 set -eu
 [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
@@ -163,17 +163,17 @@ fi
 echo "== digital voice (P25, DMR, NXDN)"
 if [ -z "$VOICE" ]; then
     if [ -t 0 ]; then
-        echo "  dsd-fme and OP25 decode P25 / DMR voice. Their voice codecs are patented in some countries:"
+        echo "  dsd-fme and the APCO25 decoder decode P25 / DMR voice. Their voice codecs are patented in some countries:"
         echo "  https://github.com/lwvmobile/mbelib#readme"
         read -r -p "  Read it, and building them is allowed where you are? Build them now (15-40 min)? [y/N] " ok
         [ "${ok,,}" = "y" ] && VOICE=1 || VOICE=0
     else
         VOICE=0
-        echo "  skipped (piped install: rerun with WAVELENS_DIGITAL_VOICE=1 to build dsd-fme and OP25)"
+        echo "  skipped (piped install: rerun with WAVELENS_DIGITAL_VOICE=1 to build dsd-fme and the APCO25 decoder)"
     fi
 fi
 if [ "$VOICE" = "1" ]; then
-    # Each build is its own step: a failed OP25 still leaves dsd-fme, which the bridge then uses for P25 too.
+    # Each build is its own step: a failed APCO25 decoder still leaves dsd-fme, which the bridge then uses for P25 too.
     if command -v dsd-fme >/dev/null 2>&1; then
         echo "  dsd-fme already installed"
     else
@@ -181,7 +181,7 @@ if [ "$VOICE" = "1" ]; then
             || warn "dsd-fme did not build. Rerun: sudo $SRC/companion/pi/install-dsd.sh"
     fi
     WAVELENS_YES=1 bash "$SRC/companion/pi/install-op25.sh" \
-        || warn "OP25 did not build; P25 uses dsd-fme meanwhile. Rerun: sudo $SRC/companion/pi/install-op25.sh"
+        || warn "The APCO25 decoder did not build; P25 uses dsd-fme meanwhile. Rerun: sudo $SRC/companion/pi/install-op25.sh"
     systemctl restart wavelens-bridge 2>/dev/null || true
 fi
 
@@ -203,5 +203,5 @@ echo "Done. Version $(cat /usr/local/lib/wavelens/VERSION 2>/dev/null || echo ?)
 echo "  admin page:  http://$HOST.local:8080  (set the password on first visit)"
 echo "  bridge log:  journalctl -u wavelens-bridge -f"
 [ -n "$POSTCODE" ] || echo "  area:        sudo wavelens-area set US 49749   (COUNTRY POSTCODE; or the admin page's Area tab)"
-[ "$VOICE" = "1" ] || echo "  digital voice (P25/DMR):  sudo env WAVELENS_DIGITAL_VOICE=1 $SRC/companion/pi/provision.sh   (dsd-fme + OP25; read the codec notice first)"
+[ "$VOICE" = "1" ] || echo "  digital voice (P25/DMR):  sudo env WAVELENS_DIGITAL_VOICE=1 $SRC/companion/pi/provision.sh   (dsd-fme + APCO25 decoder; read the codec notice first)"
 echo "  pair it:     Wavelens app → More → Companion radio → Find → Pair"

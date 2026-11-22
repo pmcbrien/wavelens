@@ -88,7 +88,7 @@ WAVELENS_APP_CONTROL=1
 # installs what it finds (never while a phone is connected) and rolls back by itself if the new bridge won't start.
 WAVELENS_AUTO_UPDATE=0
 
-# Which decoder follows trunked P25 systems: auto (OP25 when installed by install-op25.sh, else dsd-fme),
-# op25, or dsd-fme. OP25 copes much better with simulcast (most county systems); if it cannot start, the
+# Which decoder follows trunked P25 systems: auto (the APCO25 decoder when installed, else dsd-fme),
+# op25 (the APCO25 decoder), or dsd-fme. The APCO25 decoder copes much better with simulcast (most county systems); if it cannot start, the
 # bridge uses dsd-fme for that listen. DMR, NXDN, EDACS and conventional digital always use dsd-fme.
 WAVELENS_TRUNK_DECODER=auto
