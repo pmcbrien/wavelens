@@ -160,7 +160,17 @@ install_files() {   # from $SRC into $LIB (same list as install-service.sh)
     install -m 0644 "$p/wavelens-bridge.service" /etc/systemd/system/
     [ -f "$p/wavelens-admin.service" ] && install -m 0644 "$p/wavelens-admin.service" /etc/systemd/system/
     [ -f "$p/wavelens-update.service" ] && install -m 0644 "$p/wavelens-update.service" "$p/wavelens-update.timer" /etc/systemd/system/
+    # Pairing without a prompt: the Python agent replaces bt-agent (missing on cards without bluez-tools, and
+    # beaten by the desktop panel's agent on a Pi with a screen). Units installed with WAVELENS_BT_AUTOPAIR=0
+    # (/etc/wavelens/bt-autopair says 0) or where the owner disabled the service are left as they are.
+    local bt=0
+    if [ "$(cat /etc/wavelens/bt-autopair 2>/dev/null)" != "0" ] && [ -f "$p/wavelens-bt-agent.service" ]; then
+        if [ ! -f /etc/systemd/system/wavelens-bt-agent.service ] || systemctl is-enabled -q wavelens-bt-agent 2>/dev/null; then
+            install -m 0644 "$p/wavelens-bt-agent.service" /etc/systemd/system/ && bt=1
+        fi
+    fi
     systemctl daemon-reload
+    if [ "$bt" = 1 ]; then systemctl enable -q wavelens-bt-agent 2>/dev/null; systemctl restart wavelens-bt-agent 2>/dev/null || true; fi
 }
 
 fetch_firmware() {   # the Spotter firmware that matches this release, for the admin page's USB flasher; best effort

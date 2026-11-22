@@ -74,19 +74,23 @@ esac
 systemctl enable -q avahi-daemon 2>/dev/null || true
 systemctl restart avahi-daemon 2>/dev/null || true
 
-# Bluetooth pairing without a prompt (see wavelens-bt-agent.service). Needs bt-agent from the bluez-tools
-# package, which provision.sh installs; without it the service is left out and pairing works as before.
-if [ "${WAVELENS_BT_AUTOPAIR:-1}" != "0" ] && [ -f wavelens-bt-agent.service ]; then
-    if command -v bt-agent >/dev/null 2>&1; then
+# Bluetooth pairing without a prompt (see wavelens-bt-agent.service): our own agent, wavelens_bt_agent.py,
+# on python3-dbus and python3-gi like the bridge. It used to be bt-agent from bluez-tools, which a card
+# without that package silently went without, and which lost to the desktop panel's agent on a Pi with a
+# screen, so the pairing code waited for a confirm nobody saw.
+echo "${WAVELENS_BT_AUTOPAIR:-1}" > /etc/wavelens/bt-autopair      # remembered, so wavelens-update keeps the choice
+if [ "${WAVELENS_BT_AUTOPAIR:-1}" != "0" ] && [ -f wavelens-bt-agent.service ] && [ -f wavelens_bt_agent.py ]; then
+    if python3 -c "import dbus, gi.repository.GLib" 2>/dev/null; then
+        install -m 0755 wavelens_bt_agent.py /usr/local/lib/wavelens/
         install -m 0644 wavelens-bt-agent.service /etc/systemd/system/
         BT_AGENT=1
     else
-        echo "bt-agent not found (sudo apt install bluez-tools, then run this again): Bluetooth pairing without a prompt is off"
+        echo "python3-dbus / python3-gi missing (sudo apt install python3-dbus python3-gi, then run this again): Bluetooth pairing without a prompt is off"
     fi
 fi
 
 systemctl daemon-reload
-if [ "${BT_AGENT:-0}" = "1" ]; then systemctl enable -q --now wavelens-bt-agent || echo "wavelens-bt-agent did not start: journalctl -u wavelens-bt-agent"; fi
+if [ "${BT_AGENT:-0}" = "1" ]; then systemctl enable -q wavelens-bt-agent && systemctl restart wavelens-bt-agent || echo "wavelens-bt-agent did not start: journalctl -u wavelens-bt-agent"; fi
 systemctl enable wavelens-bridge
 systemctl enable --now wavelens-update.timer
 [ -f /etc/systemd/system/wavelens-admin.service ] && systemctl enable --now wavelens-admin && systemctl restart wavelens-admin || true

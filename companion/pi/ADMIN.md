@@ -161,6 +161,7 @@ name somebody chose; `WAVELENS_HOSTNAME=name` picks one and `WAVELENS_HOSTNAME=k
 **Wi-Fi** tab can rename it later.
 
 The installer also enables `wavelens-bt-agent`, which accepts a phone's or computer's Bluetooth pairing
-request without a prompt, because the Pi has no screen to confirm on. Anyone in Bluetooth range can pair; the
+request without a prompt, because the Pi has no screen to confirm on. On Raspberry Pi OS with the desktop it
+also keeps itself the default agent, so the panel's "confirm the pairing code" popup does not appear. Anyone in Bluetooth range can pair; the
 bridge already accepts connections from any phone running the app. Off: `sudo systemctl disable --now
 wavelens-bt-agent`, or install with `WAVELENS_BT_AUTOPAIR=0`.
