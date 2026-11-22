@@ -8,8 +8,12 @@
 # until you confirm you have.
 set -e
 printf '\nmbelib patent notice: https://github.com/lwvmobile/mbelib#readme\n'
-read -r -p "Have you read it, and is building it allowed where you are? [y/N] " ok
-[ "${ok,,}" = "y" ] || { echo "not building"; exit 2; }
+if [ -n "${WAVELENS_YES:-}" ]; then
+    echo "(accepted: WAVELENS_YES is set, e.g. by provision.sh with WAVELENS_DIGITAL_VOICE=1)"
+else
+    read -r -p "Have you read it, and is building it allowed where you are? [y/N] " ok
+    [ "${ok,,}" = "y" ] || { echo "not building"; exit 2; }
+fi
 
 sudo apt-get update
 sudo apt-get install -y libpulse-dev libsndfile1-dev libfftw3-dev liblapack-dev socat libusb-1.0-0-dev \

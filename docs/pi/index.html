@@ -64,6 +64,9 @@
     </select>
     <p class="hint" id="bloghint">Only the RTL-SDR Blog V4 needs it, and only on a Raspberry Pi OS whose own driver is older than 2.0. Building it adds about five minutes. Other dongles (RTL-SDR Blog V3, Nooelec NESDR, plain RTL2838) use the driver that comes with the OS.</p>
 
+    <label for="voice"><input type="checkbox" id="voice" checked aria-describedby="voicehint" style="width:auto;display:inline;margin-right:6px">Digital voice: P25, DMR and NXDN (dsd-fme and OP25)</label>
+    <p class="hint" id="voicehint">What the scanner needs to hear police, fire and EMS on most county systems. OP25 handles simulcast P25 systems, where several towers send the same signal. Adds 15 to 40 minutes. Both include voice codecs that are patented in some countries: leaving this ticked says you have read <a href="https://github.com/lwvmobile/mbelib#readme">the mbelib notice</a> and that building them is allowed where you are.</p>
+
     <pre id="cmd" aria-label="Install command"></pre>
     <button type="button" id="copy">Copy command</button><span id="copied" role="status"></span>
 
@@ -75,12 +78,13 @@
     <li>Checks the Pi model, power supply and internet, and tells you what it found.</li>
     <li>Installs the radio tools (<code>rtl-sdr</code>, <code>rtl_433</code>), Bluetooth and the Scanner's bridge, updater and admin page from the <a href="https://github.com/pmcbrien/wavelens/tree/main/companion/pi">public repository</a>.</li>
     <li>Stops the kernel's TV driver from taking the dongle, names the Pi, and starts the Scanner as a service.</li>
+    <li>With <em>Digital voice</em> ticked, builds dsd-fme and OP25 so P25 and DMR calls can be heard.</li>
     <li>Lists the dongles it can see at the end. It is safe to run again, to repair or after re-imaging the card.</li>
   </ul>
   <p class="ver">Read it before you run it: <a href="https://github.com/pmcbrien/wavelens/blob/main/companion/pi/provision.sh">provision.sh</a>.</p>
 
   <h2>Digital voice</h2>
-  <p>P25, DMR and NXDN voice is a separate, longer build with a patent notice you have to read and accept, so it is not part of the one-line install. After step 3: <code>sudo /opt/wavelens/companion/pi/install-dsd.sh</code></p>
+  <p>With <em>Digital voice</em> ticked, the command also builds dsd-fme (P25, DMR, NXDN) and OP25, which the Scanner uses for P25 trunked systems. Without OP25, a simulcast county system can lock and show calls starting but play no audio. Left it unticked, or re-imaged the card? Run the command again with the box ticked, or on the Pi: <code>sudo env WAVELENS_DIGITAL_VOICE=1 /opt/wavelens/companion/pi/provision.sh</code></p>
 
   <h2>If something is off</h2>
   <ul>
@@ -97,6 +101,7 @@
   var URL_ = "https://raw.githubusercontent.com/pmcbrien/wavelens/main/companion/pi/provision.sh";
   var host = document.getElementById("host"), blog = document.getElementById("blog");
   var country = document.getElementById("country"), postcode = document.getElementById("postcode");
+  var voice = document.getElementById("voice");
   var COUNTRY_OK = /^[A-Z]{2}$/, POSTCODE_OK = /^[A-Z0-9]([A-Z0-9-]{0,10}[A-Z0-9])?$/;
   var cmd = document.getElementById("cmd"), copy = document.getElementById("copy"), copied = document.getElementById("copied");
   var HOST_OK = /^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$/;
@@ -117,6 +122,7 @@
     if (h !== "wavelens") env.push("WAVELENS_HOSTNAME=" + h);
     if (b === "1" || b === "0") env.push("WAVELENS_RTLSDR_BLOG=" + b);
     if (p) { env.push("WAVELENS_COUNTRY=" + (c || "US")); env.push("WAVELENS_POSTCODE=" + p); }
+    env.push("WAVELENS_DIGITAL_VOICE=" + (voice.checked ? "1" : "0"));
     cmd.textContent = "curl -fsSL " + URL_ + " | sudo " + (env.length ? "env " + env.join(" ") + " " : "") + "bash";
     var admin = "http://" + h + ".local:8080";
     document.getElementById("adminurl").textContent = admin;
@@ -126,6 +132,7 @@
   blog.addEventListener("change", build);
   country.addEventListener("input", build);
   postcode.addEventListener("input", build);
+  voice.addEventListener("change", build);
   copy.addEventListener("click", function () {
     var text = cmd.textContent;
     function done() { copied.textContent = "Copied. Paste it into the Pi's terminal."; }
