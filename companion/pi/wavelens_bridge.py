@@ -4808,8 +4808,12 @@ def kill_strays() -> None:
 # rtl_tcp), sends 8 kHz mono audio over UDP and answers a JSON poll on its HTTP terminal with the call on the
 # air: talkgroup, unit, encryption, NAC and the control channel's message count. That fills the same fields
 # dsd-fme's log does, so holds, mutes, the category filter and the phone's call line work unchanged.
-# Installed by install-op25.sh in /opt/op25. WAVELENS_TRUNK_DECODER: auto (OP25 when installed), op25, dsd-fme.
-OP25_APPS = os.environ.get("WAVELENS_OP25_APPS", "/opt/op25/op25/gr-op25_repeater/apps")
+# Installed by install-apco25.sh in /opt/apco25 (older Pis: /opt/op25). WAVELENS_TRUNK_DECODER: auto (OP25 when installed), op25, dsd-fme.
+# APCO25 (companion/apco25, installed by install-apco25.sh) in /opt/apco25; Pis set up before it moved
+# into the repository have the same decoder in /opt/op25.
+OP25_APPS = os.environ.get("WAVELENS_OP25_APPS") or next(
+    (d for d in ("/opt/apco25/op25/gr-op25_repeater/apps", "/opt/op25/op25/gr-op25_repeater/apps")
+     if os.path.isfile(os.path.join(d, "rx.py"))), "/opt/apco25/op25/gr-op25_repeater/apps")
 OP25_UDP_PORT = 23472
 OP25_HTTP_PORT = 23473
 OP25_DIR = "/run/wavelens/op25"

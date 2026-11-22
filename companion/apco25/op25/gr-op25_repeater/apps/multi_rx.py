@@ -1,0 +1,1119 @@
+#!/bin/sh
+# Copyright 2011, 2012, 2013, 2014, 2015, 2016, 2017 Max H. Parke KA1RBI
+# Copyright 2020-2026 Graham J. Norbury - gnorbury@bondcar.com
+# 
+# This file is part of OP25
+# 
+# OP25 is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3, or (at your option)
+# any later version.
+# 
+# OP25 is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+# or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public
+# License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with OP25; see the file COPYING. If not, write to the Free
+# Software Foundation, Inc., 51 Franklin Street, Boston, MA
+# 02110-1301, USA.
+
+"true" '''\'
+DEFAULT_PYTHON2=/usr/bin/python
+DEFAULT_PYTHON3=/usr/bin/python3
+if [ -f op25_python ]; then
+    OP25_PYTHON=$(cat op25_python)
+else
+    OP25_PYTHON="/usr/bin/python"
+fi
+
+if [ -x $OP25_PYTHON ]; then
+    echo Using Python $OP25_PYTHON >&2
+    exec $OP25_PYTHON "$0" "$@"
+elif [ -x $DEFAULT_PYTHON2 ]; then
+    echo Using Python $DEFAULT_PYTHON2 >&2
+    exec $DEFAULT_PYTHON2 "$0" "$@"
+elif [ -x $DEFAULT_PYTHON3 ]; then
+    echo Using Python $DEFAULT_PYTHON3 >&2
+    exec $DEFAULT_PYTHON3 "$0" "$@"
+else
+    echo Unable to find Python >&2
+fi
+exit 127
+'''
+import io
+import os
+import sys
+import threading
+import time
+import json
+import traceback
+import osmosdr
+import importlib
+
+from gnuradio import audio, eng_notation, gr, filter, blocks, fft, analog, digital
+from gnuradio.eng_option import eng_option
+from math import pi
+from optparse import OptionParser
+
+import gnuradio.op25 as op25
+import gnuradio.op25_repeater as op25_repeater
+import p25_demodulator_dev as p25_demodulator
+import op25_nbfm
+import op25_iqsrc
+import op25_wavsrc
+from log_ts import log_ts
+from helper_funcs import *
+
+from gr_gnuplot import constellation_sink_c
+from gr_gnuplot import fft_sink_c
+from gr_gnuplot import symbol_sink_f
+from gr_gnuplot import eye_sink_f
+from gr_gnuplot import mixer_sink_c
+from gr_gnuplot import fll_sink_c
+
+sys.path.append('tdma')
+import lfsr
+
+os.environ['IMBE'] = 'soft'
+
+_def_symbol_rate = 4800
+_def_capture_file = "capture.bin"
+
+# The P25 receiver
+#
+
+class device(object):
+    def __init__(self, config):
+        speeds = [250000, 1000000, 1024000, 1800000, 1920000, 2000000, 2048000, 2400000, 2560000]
+
+        self.name = config['name']
+        self.args = config['args']
+        self.tunable = bool(from_dict(config, 'tunable', False))
+
+        sys.stderr.write('device: %s\n' % config)
+        if config['args'] == 'iqsrc':
+            self.src = op25_iqsrc.op25_iqsrc_c(str(config['name']), config)
+            self.ppm = float(from_dict(config, 'ppm', "0.0"))
+            self.tunable = False
+            if self.src.is_dsd():
+                self.frequency = self.src.get_center_freq()
+                self.sample_rate = self.src.get_sample_rate()
+                self.offset = 600000
+            else:
+                self.frequency = int(from_dict(config, 'frequency', 800000000))
+                self.sample_rate = config['rate']
+                self.offset = int(from_dict(config, 'offset', 0))
+            self.fractional_corr = int((int(round(self.ppm)) - self.ppm) * (self.frequency/1e6))
+            self.usable_bw = float(from_dict(config, 'usable_bw_pct', 1.0))
+
+        elif config['args'] == 'wavsrc':
+            self.src = op25_wavsrc.op25_wavsrc_f(str(config['name']), config)
+            self.sample_rate = self.src.get_sample_rate()
+            self.ppm = float(from_dict(config, 'ppm', "0.0"))
+            self.frequency = int(from_dict(config, 'frequency', 800000000))
+            self.offset = 0
+            self.fractional_corr = 0
+            self.tunable = False
+
+        elif config['args'] == 'symbols':
+            self.src = None
+            self.sample_rate = config['rate']
+            self.frequency = int(from_dict(config, 'frequency', 800000000))
+            self.usable_bw = float(from_dict(config, 'usable_bw_pct', 1.0))
+            self.offset = int(from_dict(config, 'offset', 0))
+            self.ppm = float(from_dict(config, 'ppm', "0.0"))
+            self.fractional_corr = int((int(round(self.ppm)) - self.ppm) * (self.frequency/1e6))
+
+        else:
+            if config['args'].startswith('rtl') and config['rate'] not in speeds:
+                sys.stderr.write('WARNING: requested sample rate %d for device %s may not\n' % (config['rate'], config['name']))
+                sys.stderr.write("be optimal.  You may want to use one of the following rates\n")
+                sys.stderr.write('%s\n' % speeds)
+            sys.stderr.write('Device name: "%s", osmosdr args: "%s"\n' % (self.name, str(config['args'])))
+            #dev_list = osmosdr.device.find(osmosdr.device_t("nofake"))
+            #for dev_t in dev_list:
+            #    sys.stderr.write("gr-osmosdr device: %s\n" % dev_t.to_string())
+            self.src = osmosdr.source(str(config['args']))
+
+            if 'gain_mode' in config:
+                gain_mode = from_dict(config, 'gain_mode', False)
+                if gain_mode:
+                    self.src.set_gain_mode(True, 0)
+                else:
+                    self.src.set_gain_mode(True, 0)  # UGH! Ugly workaround for gr-osmosdr airspy bug
+                    self.src.set_gain_mode(False, 0)
+                sys.stderr.write("gr-osmosdr driver gain_mode: %s\n" % self.src.get_gain_mode())
+
+            for tup in config['gains'].split(','):
+                name, gain = tup.split(':')
+                self.src.set_gain(int(gain), str(name))
+
+            self.ppm = float(from_dict(config, 'ppm', "0.0"))
+            self.src.set_freq_corr(int(round(self.ppm)))
+
+            self.src.set_sample_rate(config['rate'])
+            #self.sample_rate = config['rate']
+            self.sample_rate = self.src.get_sample_rate() # actual rate may not be the same as the requested rate!
+
+            self.offset = int(from_dict(config, 'offset', 0))
+
+            self.frequency = int(from_dict(config, 'frequency', 800000000))
+            self.fractional_corr = int((int(round(self.ppm)) - self.ppm) * (self.frequency/1e6))
+            self.src.set_center_freq(self.frequency + self.offset)
+            self.usable_bw = float(from_dict(config, 'usable_bw_pct', 1.0))
+
+    def get_ppm(self):
+        return self.ppm
+
+    def set_debug(self, dbglvl):
+        pass
+
+class channel(object):
+    def __init__(self, config, dev, verbosity, msgq_id, rx_q, tb):
+        sys.stderr.write('channel (dev %s): %s\n' % (dev.name, config))
+        self.verbosity = verbosity
+        ch_name = str(from_dict(config, 'name', ""))
+        self.name = ("[%d] %s" % (msgq_id, ch_name)) if ch_name != "" else ("[%d]" % msgq_id) 
+        self.device = dev
+        self.frequency = int(from_dict(config, "frequency", dev.frequency))
+        self.msgq_id = msgq_id
+        self.tb = tb
+        self.raw_sink = None
+        self.raw_file = None
+        self.throttle = None
+        self.nbfm = None
+        self.nbfm_mode = 0
+        self.crypt_keys_file    = str(from_dict(config, "crypt_keys", ""))
+        self.crypt_keys = {}
+        self.error = None
+        self.chan_idle = False
+        self.sinks = {}
+        self.tdma_state = False
+        self.xor_cache = {}
+        self.config = config
+        self.symbol_rate = int(from_dict(config, 'symbol_rate', _def_symbol_rate))
+        self.channel_rate = self.symbol_rate
+        self.ws_instance = get_ws_instance(from_dict(config, 'destination', ""))
+        if dev.args == 'wavsrc':
+            self.demod = p25_demodulator.p25_demod_fb(
+                             msgq_id = self.msgq_id,
+                             debug = self.verbosity,
+                             input_rate=dev.sample_rate,
+                             filter_type = config['filter_type'],
+                             excess_bw=config['excess_bw'],
+                             symbol_rate = self.symbol_rate)
+        elif config['demod_type'] == "fsk": # Motorola 3600bps
+            filter_type = from_dict(config, 'filter_type', 'fsk2mm')
+            if filter_type[:4] != 'fsk2':   # has to be 'fsk2' or derivative such as 'fsk2mm'
+                filter_type = 'fsk2mm'
+            self.demod = p25_demodulator.p25_demod_cb(
+                             msgq_id = self.msgq_id,
+                             debug = self.verbosity,
+                             input_rate = dev.sample_rate,
+                             demod_type = 'fsk4',
+                             filter_type = filter_type,
+                             usable_bw = self.device.usable_bw,
+                             excess_bw = float(from_dict(config, 'excess_bw', 0.2)),
+                             relative_freq = ((dev.frequency + dev.offset + dev.fractional_corr) - self.frequency),
+                             offset = dev.offset,
+                             if_rate = config['if_rate'],
+                             symbol_rate = self.symbol_rate)
+        else:                             # P25, DMR, NXDN and everything else
+            self.demod = p25_demodulator.p25_demod_cb(
+                             msgq_id = self.msgq_id,
+                             debug = self.verbosity,
+                             input_rate = dev.sample_rate,
+                             demod_type = config['demod_type'],
+                             filter_type = config['filter_type'],
+                             usable_bw = self.device.usable_bw,
+                             excess_bw = float(from_dict(config, 'excess_bw', 0.2)),
+                             relative_freq = ((dev.frequency + dev.offset + dev.fractional_corr) - self.frequency),
+                             offset = dev.offset,
+                             if_rate = config['if_rate'],
+                             symbol_rate = self.symbol_rate)
+        self.decoder = op25_repeater.frame_assembler(str(config['destination']), verbosity, msgq_id, rx_q)
+
+        # Load crypt keys if present
+        if self.crypt_keys_file != "":
+            sys.stderr.write("%s [%d] reading channel crypt_keys file: %s\n" % (log_ts.get(), self.msgq_id, self.crypt_keys_file))
+            self.crypt_keys = get_key_dict(self.crypt_keys_file, self.msgq_id)
+            for keyid in self.crypt_keys.keys():
+                self.decoder.control(json.dumps({'tuner': self.msgq_id, 'cmd': 'crypt_key', 'keyid': int(keyid), 'algid': int(self.crypt_keys[keyid]['algid']), 'key': self.crypt_keys[keyid]['key']}))
+        
+        # Load crypt_behavior from channel if it exists
+        crypt_behavior = from_dict(config, 'crypt_behavior', None)
+        if crypt_behavior is not None:
+            self.decoder.control(json.dumps({'tuner': self.msgq_id, 'cmd': 'crypt_behavior', 'behavior': int(crypt_behavior)})) 
+            sys.stderr.write("%s [%d] crypt behavior: %d\n" % (log_ts.get(), self.msgq_id, int(crypt_behavior)))
+        
+        # Relative-tune the demodulator
+        if not self.demod.set_relative_frequency((dev.frequency + dev.offset + dev.fractional_corr) - self.frequency):
+            sys.stderr.write("%s [%d] Unable to initialize demod to freq: %d, using device freq: %d\n" % (log_ts.get(), self.msgq_id, self.frequency, dev.frequency))
+            self.frequency = dev.frequency
+
+        # Load the DMR Basic Privacy key, if specified
+        if 'bp_key' in config and (config['bp_key'] != ""):
+            self.decoder.control(json.dumps({'tuner': self.msgq_id, 'cmd': 'set_slotkey', 'slotkey': int(config['bp_key'], 0)}))
+
+        enable_analog = str(from_dict(config, 'enable_analog', "auto")).lower()
+        if enable_analog == "off":
+            self.nbfm_mode = 0;
+        elif enable_analog == "on":
+            self.nbfm_mode = 2;
+        else:
+            self.nbfm_mode = 1;
+        
+        if self.nbfm_mode > 0:
+            self.nbfm = op25_nbfm.op25_nbfm_c(str(config['destination']), verbosity, config, msgq_id, rx_q)
+            if self.demod.connect_nbfm(self.nbfm):
+                if self.nbfm_mode == 2:
+                    self.nbfm.control(True)
+            else:
+                self.nbfm = None
+
+        if ('plot' not in list(config.keys())) or (config['plot'] == ""):
+            return
+
+        for plot in config['plot'].split(','):
+            if plot == 'datascope':
+                self.toggle_eye_plot()
+            elif plot == 'symbol':
+                self.toggle_symbol_plot()
+            elif plot == 'fft':
+                self.toggle_fft_plot()
+            elif plot == 'constellation':
+                self.toggle_constellation_plot()
+            elif plot == 'mixer':
+                self.toggle_mixer_plot()
+            elif plot == 'fll':
+                self.toggle_fll_plot()
+            else:
+                sys.stderr.write('unrecognized plot type %s\n' % plot)
+                return
+
+    def set_debug(self, dbglvl):
+        self.verbosity = dbglvl
+        if self.decoder is not None:
+            self.decoder.set_debug(dbglvl)
+        if self.nbfm is not None:
+            self.nbfm.set_debug(dbglvl)
+        if self.demod is not None:
+            self.demod.set_debug(dbglvl)
+
+    def toggle_capture(self):
+        if self.raw_sink is None:   # turn on raw symbol capture
+            sink_file = str(from_dict(self.config, "raw_output", "ch"+str(self.msgq_id)+"-"+_def_capture_file))
+            sys.stderr.write("%s Saving raw symbols to file: %s\n" % (log_ts.get(), sink_file))
+            self.tb.lock()
+            self.raw_sink = blocks.file_sink(gr.sizeof_char, sink_file)
+            self.tb.connect(self.demod, self.raw_sink)
+            self.tb.unlock()
+        else:                       # turn off raw symbol capture
+            sys.stderr.write("%s Ending raw symbol capture\n" % log_ts.get())
+            self.tb.lock()
+            self.tb.disconnect(self.demod, self.raw_sink)
+            self.tb.unlock()
+            self.raw_sink = None
+
+    def set_plot_destination(self, plot): # only required for http terminal
+        if plot is None or plot not in self.sinks or self.tb.terminal_type is None:
+            return
+        if self.tb.terminal_type == "http":
+            self.sinks[plot][0].gnuplot.set_interval(self.tb.http_plot_interval)
+            self.sinks[plot][0].gnuplot.set_output_dir(self.tb.http_plot_directory)
+        else:
+            self.sinks[plot][0].gnuplot.set_interval(self.tb.curses_plot_interval)
+
+    def toggle_plot(self, plot_type):
+        if plot_type == 1:
+            self.toggle_fft_plot()
+        elif plot_type == 2:
+            self.toggle_constellation_plot()
+        elif plot_type == 3:
+            self.toggle_symbol_plot()
+        elif plot_type == 4:
+            self.toggle_eye_plot()
+        elif plot_type == 5:
+            self.toggle_mixer_plot()
+        elif plot_type == 6:
+            self.toggle_fll_plot()
+
+    def close_plots(self):
+        for plot in list(self.sinks.keys()):
+            self.sinks[plot][1]()
+
+    def toggle_eye_plot(self):
+        if 'eye' not in self.sinks:
+            sink = eye_sink_f(plot_name=("Ch:%s" % self.name), chan=self.msgq_id, out_q=self.tb.ui_in_q)
+            sink.set_sps(self.config['if_rate'] / self.symbol_rate)
+            self.sinks['eye'] = (sink, self.toggle_eye_plot)
+            self.set_plot_destination('eye')
+            self.tb.lock()
+            self.demod.connect_fm_demod()                   # add fm demod to flowgraph if not already present
+            self.demod.connect_bb('symbol_filter', sink)
+            self.tb.unlock()
+        else:
+            (sink, fn) = self.sinks.pop('eye')
+            self.tb.lock()
+            self.demod.disconnect_bb(sink)
+            self.demod.disconnect_fm_demod()                # remove fm demod from flowgraph if no longer needed
+            self.tb.unlock()
+            sink.kill()
+
+    def toggle_fll_plot(self):
+        if 'fll' not in self.sinks:
+            sink = fll_sink_c(plot_name=("Ch:%s" % self.name), chan=self.msgq_id, out_q=self.tb.ui_in_q)
+            self.sinks['fll'] = (sink, self.toggle_mixer_plot)
+            self.set_plot_destination('fll')
+            sink.set_width(self.config['if_rate'])
+            self.tb.lock()
+            self.demod.connect_complex('fll', sink)
+            self.tb.unlock()
+        else:
+            (sink, fn) = self.sinks.pop('fll')
+            self.tb.lock()
+            self.demod.disconnect_complex(sink)
+            self.tb.unlock()
+            sink.kill()
+
+    def toggle_symbol_plot(self):
+        if 'symbol' not in self.sinks:
+            sink = symbol_sink_f(plot_name=("Ch:%s" % self.name), chan=self.msgq_id, out_q=self.tb.ui_in_q)
+            self.sinks['symbol'] = (sink, self.toggle_symbol_plot)
+            self.set_plot_destination('symbol')
+            self.tb.lock()
+            self.demod.connect_float(sink)
+            self.tb.unlock()
+        else:
+            (sink, fn) = self.sinks.pop('symbol')
+            self.tb.lock()
+            self.demod.disconnect_float(sink)
+            self.tb.unlock()
+            sink.kill()
+
+    def toggle_fft_plot(self):
+        if 'fft' not in self.sinks:
+            sink = fft_sink_c(plot_name=("Ch:%s" % self.name), chan=self.msgq_id, out_q=self.tb.ui_in_q)
+            self.sinks['fft'] = (sink, self.toggle_fft_plot)
+            self.set_plot_destination('fft')
+            sink.set_offset(self.device.offset)
+            sink.set_center_freq(self.device.frequency)
+            sink.set_relative_freq(self.device.frequency - self.frequency)
+            sink.set_width(self.device.sample_rate)
+            self.tb.lock()
+            self.demod.connect_complex('src', sink)
+            self.tb.unlock()
+        else:
+            (sink, fn) = self.sinks.pop('fft')
+            self.tb.lock()
+            self.demod.disconnect_complex(sink)
+            self.tb.unlock()
+            sink.kill()
+
+    def toggle_mixer_plot(self):
+        if 'mixer' not in self.sinks:
+            sink = mixer_sink_c(plot_name=("Ch:%s" % self.name), chan=self.msgq_id, out_q=self.tb.ui_in_q)
+            self.sinks['mixer'] = (sink, self.toggle_mixer_plot)
+            self.set_plot_destination('mixer')
+            sink.set_width(self.config['if_rate'])
+            self.tb.lock()
+            self.demod.connect_complex('agc', sink)
+            self.tb.unlock()
+        else:
+            (sink, fn) = self.sinks.pop('mixer')
+            self.tb.lock()
+            self.demod.disconnect_complex(sink)
+            self.tb.unlock()
+            sink.kill()
+
+    def toggle_constellation_plot(self):
+        if str(self.config['demod_type']).lower() != "cqpsk":
+            return
+        if 'constellation' not in self.sinks:
+            sink = constellation_sink_c(plot_name=("Ch:%s" % self.name), chan=self.msgq_id, out_q=self.tb.ui_in_q)
+            self.sinks['constellation'] = (sink, self.toggle_constellation_plot)
+            self.set_plot_destination('constellation')
+            self.tb.lock()
+            self.demod.connect_complex('costas', sink)
+            self.tb.unlock()
+        else:
+            (sink, fn) = self.sinks.pop('constellation')
+            self.tb.lock()
+            self.demod.disconnect_complex(sink)
+            self.tb.unlock()
+            sink.kill()
+
+    def set_freq(self, freq):
+        if self.frequency == freq:
+            return True
+
+        old_freq = self.frequency
+        self.frequency = freq
+
+        if not self.demod.set_relative_frequency(self.device.offset + self.device.frequency + self.device.fractional_corr - freq): # First attempt relative tune
+            if self.device.tunable:                                                                  # then hard tune if allowed
+                self.device.frequency = self.frequency
+                if self.device.src is not None:
+                    self.device.src.set_center_freq(self.frequency + self.device.offset)
+                self.device.fractional_corr = int((int(round(self.device.ppm)) - self.device.ppm) * (self.device.frequency/1e6))        # Calc frac ppm using new freq
+                self.demod.set_relative_frequency(self.device.offset + self.device.frequency + self.device.fractional_corr - freq)
+                if self.verbosity >= 9:
+                    sys.stderr.write("%s [%d] Hardware tune: dev_freq(%d), dev_off(%d), dev_frac(%d), tune_freq(%d)\n" % (log_ts.get(), self.msgq_id, self.device.frequency, self.device.offset, self.device.fractional_corr, (self.device.frequency - (self.device.offset + self.device.frequency + self.device.fractional_corr - freq))))
+            else:                                                                                    # otherwise fail and reset to prev freq
+                self.demod.set_relative_frequency(self.device.offset + self.device.frequency + self.device.fractional_corr - old_freq)
+                self.frequency = old_freq
+                if self.verbosity:
+                    sys.stderr.write("%s [%d] Unable to tune %s to frequency %f\n" % (log_ts.get(), self.msgq_id, self.name, (freq/1e6)))
+                return False
+        else:
+            if self.verbosity >= 9:
+                sys.stderr.write("%s [%d] Relative tune: dev_freq(%d), dev_off(%d), dev_frac(%d), tune_freq(%d)\n" % (log_ts.get(), self.msgq_id, self.device.frequency, self.device.offset, self.device.fractional_corr, (self.device.frequency - (self.device.offset + self.device.frequency + self.device.fractional_corr - freq))))
+        if 'fft' in self.sinks:
+                self.sinks['fft'][0].set_center_freq(self.device.frequency)
+                self.sinks['fft'][0].set_relative_freq(self.device.frequency - freq)
+        if self.verbosity >= 9:
+            sys.stderr.write("%s [%d] Tuning to frequency %f\n" % (log_ts.get(), self.msgq_id, (freq/1e6)))
+        #self.demod.reset()          # reset gardner-costas tracking loop NOTE: tuning appears to be faster without this step
+        self.decoder.control(json.dumps({'tuner': self.msgq_id, 'cmd': 'sync_reset'}))
+        return True
+
+    def adj_tune(self, adjustment): # ideally this would all be done at the device level but the demod belongs to the channel object
+        self.device.ppm -= get_fractional_ppm(self.device.frequency, adjustment)
+        if self.device.src is not None:
+            self.device.src.set_freq_corr(int(round(self.device.ppm)))
+            self.device.src.set_center_freq(self.device.frequency + self.device.offset)
+        self.device.fractional_corr = int((int(round(self.device.ppm)) - self.device.ppm) * (self.device.frequency/1e6))
+        self.demod.set_relative_frequency(self.device.offset + self.device.frequency + self.device.fractional_corr - self.frequency)
+        self.demod.reset()          # reset gardner-costas tracking loop
+
+    def configure_p25_tdma(self, params):
+        set_tdma = False
+        if 'tdma' in params and params['tdma'] is not None:
+            set_tdma = True
+            self.decoder.control(json.dumps({'tuner': self.msgq_id, 'cmd': 'set_slotid', 'slotid': params['tdma']}))
+        self.demod.set_tdma(set_tdma)
+        if set_tdma == self.tdma_state:
+            return
+        self.tdma_state = set_tdma
+        if set_tdma:
+            self.decoder.control(json.dumps({'tuner': self.msgq_id, 'cmd': 'set_xormask', 'xormask': self.xor_cache[self.get_hash(params)]}))
+            rate = 6000
+        else:
+            rate = self.channel_rate
+
+        self.symbol_rate = rate
+        self.demod.set_omega(rate)
+        if 'eye' in self.sinks:
+            self.sinks['eye'][0].set_sps(self.config['if_rate'] / rate)
+
+    def get_hash(self, params):
+        hash = '%x%x%x' % (params['nac'], params['sysid'], params['wacn'])
+        if hash not in self.xor_cache:
+            self.xor_cache[hash] = lfsr.p25p2_lfsr(params['nac'], params['sysid'], params['wacn']).xor_chars
+            if self.verbosity >= 5:
+                sys.stderr.write("%s [%d] Caching TDMA xor mask for NAC: 0x%x, SYSID: 0x%x, WACN: 0x%x\n" % (log_ts.get(), self.msgq_id, params['nac'], params['sysid'], params['wacn']))
+        return hash
+
+    def set_rate(self, rate):
+        self.symbol_rate = rate
+        self.demod.set_omega(rate)
+        if 'eye' in self.sinks:
+            self.sinks['eye'][0].set_sps(self.config['if_rate'] / rate)
+
+    def control(self, params):
+        if 'cmd' in params:
+            if self.verbosity >= 10:
+                sys.stderr.write("%s [%d] channel control: cmd=%s, params=%s\n" % (log_ts.get(), self.msgq_id, params['cmd'], params))
+            if params['cmd'] == "set_slotid":
+                self.chan_idle = True if (params['slotid'] == 4) else False
+            elif params['cmd'] == "set_xormask":
+                self.decoder.control(json.dumps({'tuner': self.msgq_id, 'cmd': 'set_xormask', 'xormask': self.xor_cache[self.get_hash(params)]}))
+                return
+        self.decoder.control(json.dumps(params))
+        self.demod.control(not self.chan_idle)
+
+    def kill(self):
+        for sink in self.sinks:
+            self.sinks[sink][0].kill()
+
+    def error_tracking(self):
+        if self.chan_idle:
+            self.error = None
+            return
+        self.error = self.demod.get_freq_error()
+
+    def get_error(self):
+        return self.error
+
+class rx_block (gr.top_block):
+
+    # Initialize the receiver
+    #
+    def __init__(self, verbosity, config):
+        self.config = config
+        self.verbosity = verbosity
+        self.devices = []
+        self.channels = []
+        self.terminal = None
+        self.terminal_type = None
+        self.terminal_config = None
+        self.interactive = True
+        self.audio = None
+        self.audio_instances = {}
+        self.metadata = None
+        self.meta_streams = {}
+        self.trunking = None
+        self.du_watcher = None
+        self.rx_q = gr.msg_queue(100)
+        self.ui_in_q = gr.msg_queue(100)
+        self.ui_out_q = gr.msg_queue(100)
+        self.ui_timeout = 5.0
+        self.ui_last_update = 0.0
+
+        gr.top_block.__init__(self)
+        self.device_id_by_name = {}
+
+        if "audio" in config:
+            self.configure_audio(config['audio'])
+
+        if "metadata" in config:
+            self.configure_metadata(config['metadata'])
+
+        if "trunking" in config:
+            self.configure_trunking(config['trunking'])
+        else:
+            self.config['trunking'] = {"module": "tk_p25.py", "chans": []}
+            self.configure_trunking(self.config['trunking']) # add default module for P25 Conventional terminal support
+
+        self.configure_devices(config['devices'])
+        self.configure_channels(config['channels'])
+
+        if self.trunking is not None: # post-initialization after channels and devices created
+            self.trunk_rx.post_init()
+
+        if "terminal" in config:
+            self.configure_terminal(config['terminal'])
+
+    def set_debug(self, dbglvl):
+        self.verbosity = dbglvl
+        for ch in self.channels:
+            ch.set_debug(dbglvl)
+        for dev in self.devices:
+            dev.set_debug(dbglvl)
+        if self.trunking is not None and self.trunk_rx is not None:
+            self.trunk_rx.set_debug(dbglvl)
+        if self.metadata is not None:
+            for stream in self.meta_streams:
+                self.meta_streams[stream][0].set_debug(dbglvl)
+
+    def set_interactive(self, session_type):
+        self.interactive = session_type
+
+    def get_interactive(self):
+        return self.interactive
+
+    def configure_audio(self, config):
+        audio_mod = str(from_dict(config, 'module', ""))
+        if audio_mod == "":    # tolerate empty/missing module: audio disabled
+            sys.stderr.write("Audio module not specified; audio output disabled\n")
+            return
+        if audio_mod.endswith('.py'):
+            audio_mod = audio_mod[:-3]
+        try:
+            self.audio = importlib.import_module(audio_mod)
+        except (ImportError, ModuleNotFoundError) as e:
+            self.audio = None
+            sys.stderr.write("Error: unable to import audio module: %s\n%s\n" % (config['module'], e))
+
+        idx = 0
+        for instance in config['instances']:
+            if 'instance_name' in instance and instance['instance_name'] != "":
+                instance_name = instance['instance_name']
+                if instance_name in self.audio_instances:
+                    sys.stderr.write("Ignoring duplicate audio instance #%d [%s]\n" % (idx, instance_name))
+                    break
+                audio_port = int(from_dict(instance,'udp_port', 23456))
+                audio_device = str(from_dict(instance,'device_name', "default"))
+                audio_gain = float(from_dict(instance,'audio_gain', "0.0"))
+                audio_2chan = True if int(from_dict(instance,'number_channels', 1)) == 2 else False
+                sys.stderr.write("Configuring audio instance #%d [%s]\n" % (idx, instance_name))
+                try:
+                    audio_s = self.audio.audio_thread("127.0.0.1", audio_port, audio_device, audio_2chan, audio_gain, instance_name=instance_name)
+                    self.audio_instances[instance_name] = audio_s
+                except Exception as e:
+                    sys.stderr.write("Error configuring audio instance #%d; %s\n" % (idx, e))
+                    self.audio_instances[instance_name] = None
+            else:
+                sys.stderr.write("Ignoring unnamed audio instance #%d\n" % idx)
+            idx += 1
+
+    def configure_terminal(self, config):
+        term_mod = str(from_dict(config, 'module', ""))
+        if term_mod == "":     # tolerate empty/missing module: no terminal
+            sys.stderr.write("Terminal module not specified; terminal disabled\n")
+            return
+        if term_mod.endswith('.py'):
+            term_mod = term_mod[:-3]
+        try:
+            terminal = importlib.import_module(term_mod)
+        except (ImportError, ModuleNotFoundError) as e:
+            terminal = None
+            sys.stderr.write("Error: unable to import terminal module: %s\n%s\n" % (config['module'], e))
+            return
+        term_type = str(from_dict(config,'terminal_type', "curses"))
+        self.terminal = terminal.op25_terminal(self.ui_in_q, self.ui_out_q, term_type)
+        self.terminal_type = self.terminal.get_terminal_type()
+        self.terminal_config = config
+        self.curses_plot_interval = float(from_dict(config, 'curses_plot_interval', 0.0))
+        self.http_plot_interval = float(from_dict(config, 'http_plot_interval', 1.0))
+        self.http_plot_directory = str(from_dict(config, 'http_plot_directory', "../www/images"))
+        self.ui_timeout = float(from_dict(config, 'terminal_timeout', 5.0))
+
+    def configure_trunking(self, config):
+        tk_mod = str(from_dict(config, 'module', 'tk_p25.py'))
+
+        if tk_mod.endswith('.py'):
+            tk_mod = tk_mod[:-3]
+        try:
+            self.trunking = importlib.import_module(tk_mod)
+        except (ImportError, ModuleNotFoundError) as e:
+            sys.stderr.write("Error: unable to import trunking module: %s\n%s\n" % (config['module'], e))
+            self.trunking = None
+
+        if self.trunking is not None:
+            self.trunk_rx = self.trunking.rx_ctl(frequency_set = self.change_freq, nbfm_ctrl = self.nbfm_control, fa_ctrl = self.fa_control, debug = self.verbosity, chans = config['chans'])
+            self.du_watcher = du_queue_watcher(self.rx_q, self.trunk_rx.process_qmsg)
+            sys.stderr.write("Enabled trunking module: %s\n" % config['module'])
+
+    def configure_metadata(self, config):
+        meta_mod = str(from_dict(config, 'module', ""))
+        if meta_mod == "":     # tolerate empty/missing module: metadata disabled
+            sys.stderr.write("Metadata module not specified; metadata streaming disabled\n")
+            return
+        if meta_mod.endswith('.py'):
+            meta_mod = meta_mod[:-3]
+        try:
+            self.metadata = importlib.import_module(meta_mod)
+        except (ImportError, ModuleNotFoundError) as e:
+            self.metadata = None
+            sys.stderr.write("Error: unable to import metadata module: %s\n%s\n" % (config['module'], e))
+
+        idx = 0
+        for stream in config['streams']:
+            if 'stream_name' in stream and stream['stream_name'] != "":
+                stream_name = stream['stream_name']
+                if stream_name in self.meta_streams:
+                    sys.stderr.write("Ignoring duplicate metadata stream #%d [%s]\n" % (idx, stream_name))
+                    break
+                try:
+                    meta_q = gr.msg_queue(10)
+                    meta_s = self.metadata.meta_server(meta_q, stream, debug=self.verbosity)
+                    self.meta_streams[stream_name] = (meta_s, meta_q)
+                    sys.stderr.write("Configuring metadata stream #%d [%s]: %s\n" % (idx, stream_name, stream['icecastServerAddress'] + "/" + stream['icecastMountpoint']))
+                except Exception as e:
+                    sys.stderr.write("Error configuring metadata stream #%d; %s\n" % (idx, e))
+            else:
+                sys.stderr.write("Ignoring unnamed metadata stream #%d\n" % idx)
+            idx += 1
+
+    def configure_devices(self, config):
+        self.devices = []
+        for cfg in config:
+            self.device_id_by_name[cfg['name']] = len(self.devices)
+            self.devices.append(device(cfg))
+
+    def find_device(self, chan):
+        if 'device' in chan and (chan['device'] != "") and (chan['device'] in self.device_id_by_name):
+            dev_id = self.device_id_by_name[chan['device']]
+            if dev_id < len(self.devices):
+                return self.devices[dev_id]
+            
+        if 'frequency' in chan and (chan['frequency'] != ""):
+            for dev in self.devices:
+                d = abs(chan['frequency'] - dev.frequency)
+                nf = dev.sample_rate / 2
+                if d + 6250 <= nf:
+                    return dev
+        return None
+
+    def find_channel(self, msgq_id):
+        return self.channels[msgq_id]
+
+    def configure_channels(self, config):
+        self.channels = []
+        for cfg in config:
+            dev = self.find_device(cfg)
+            if (dev is None) and 'frequency' in cfg:
+                sys.stderr.write("* * * Frequency %d not within spectrum band of any device - ignoring!\n" % cfg['frequency'])
+                continue
+            elif dev is None:
+                sys.stderr.write("* * * Channel '%s' not attached to any device - ignoring!\n" % cfg['name'])
+                continue
+            elif dev.tunable:
+                for ch in self.channels:
+                    if ch.device == dev:
+                        sys.stderr.write("* * * Channel '%s' cannot share a tunable device - ignoring!\n" % cfg['name'])
+                        dev = None
+                        break
+                if dev == None:
+                    continue    
+            meta_s, meta_q = None, None
+            if self.metadata is not None and 'meta_stream_name' in cfg and cfg['meta_stream_name'] != "" and cfg['meta_stream_name'] in self.meta_streams:
+                meta_s, meta_q = self.meta_streams[cfg['meta_stream_name']]
+            if self.trunking is not None:
+                msgq_id = len(self.channels)
+                chan = channel(cfg, dev, self.verbosity, msgq_id, self.rx_q, self)
+                self.channels.append(chan)
+                self.trunk_rx.add_receiver(msgq_id, config=cfg, meta_q=meta_q, freq=chan.frequency)
+            else:
+                msgq_id = -1 - len(self.channels)
+                chan = channel(cfg, dev, self.verbosity, msgq_id, self.rx_q, self)
+                self.channels.append(chan)
+            if ("raw_input" in cfg) and (cfg['raw_input'] != ""):
+                sys.stderr.write("%s Reading raw symbols from file: %s\n" % (log_ts.get(), cfg['raw_input']))
+                chan.raw_file = blocks.file_source(gr.sizeof_char, str(cfg['raw_input']), False)
+                if ("raw_seek" in cfg) and (cfg['raw_seek'] != 0):
+                    chan.raw_file.seek(int(cfg['raw_seek']) * 4800, 0)
+                chan.throttle = blocks.throttle(gr.sizeof_char, chan.symbol_rate)
+                chan.throttle.set_max_noutput_items(int(chan.symbol_rate/50));
+                self.connect(chan.raw_file, chan.throttle)
+                self.connect(chan.throttle, chan.decoder)
+                self.set_interactive(False) # this is non-interactive 'replay' session 
+            else:
+                self.connect(dev.src, chan.demod, chan.decoder)
+                if ("raw_output" in cfg) and (cfg['raw_output'] != ""):
+                    sys.stderr.write("%s Saving raw symbols to file: %s\n" % (log_ts.get(), cfg['raw_output']))
+                    chan.raw_sink = blocks.file_sink(gr.sizeof_char, str(cfg['raw_output']))
+                    self.connect(chan.demod, chan.raw_sink)
+
+    def scan_channels(self):
+        for chan in self.channels:
+            sys.stderr.write('scan %s: error %d\n' % (chan.config['frequency'], chan.demod.get_freq_error()))
+
+    def change_freq(self, params):
+        tuner = params['tuner']
+        if (tuner < 0) or (tuner > len(self.channels)):
+            if self.verbosity:
+                sys.stderr.write("%s No %s channel available for tuning\n" % (log_ts.get(), params['tuner']))
+            return False
+
+        chan = self.channels[tuner]
+        if 'sigtype' in params and params['sigtype'] == "P25": # P25 specific config
+            chan.configure_p25_tdma(params)
+
+        if not chan.set_freq(params['freq']):
+            chan.control({'tuner': chan.msgq_id, 'cmd': 'set_slotid', 'slotid': 0})
+            return False
+
+        if 'slot' in params:
+            chan.control({'tuner': chan.msgq_id, 'cmd': 'set_slotid', 'slotid': params['slot']})
+
+        if 'rate' in params:
+            chan.set_rate(params['rate'])
+
+        if 'chan' in params:
+            self.trunk_rx.receivers[tuner].current_chan = params['chan']
+
+        if 'state' in params:
+            self.trunk_rx.receivers[tuner].current_state = params['state']
+
+        if 'type' in params:
+            self.trunk_rx.receivers[tuner].current_type = params['type']
+
+        if 'time' in params:
+            self.trunk_rx.receivers[tuner].tune_time = params['time']
+
+        return True
+
+    def fa_control(self, params):
+        tuner = params['tuner']
+        chan = self.channels[tuner]
+        if chan is not None:
+            chan.control(params)
+
+    def nbfm_control(self, msgq_id, action):
+        if (msgq_id >= 0 and msgq_id < len(self.channels)) and self.channels[msgq_id].nbfm is not None:
+            self.channels[msgq_id].nbfm.control(action)
+
+    def process_qmsg(self, msg):            # Handle UI requests
+        RX_COMMANDS = 'skip lockout hold whitelist reload'.split()
+        if msg is None:
+            return True
+        s = msg.to_string()
+        if self.verbosity >= 11:
+            sys.stderr.write("%s process_qmsg: ui_cmd=%s\n" % (log_ts.get(), s))
+        ui_rsp = []
+        if type(s) is not str and isinstance(s, bytes):
+            # should only get here if python3
+            s = s.decode()
+        try:    # See if we can treat the incoming message as JSON format (from HTTP UI)
+            d = json.loads(s)
+            s = d['command'] if "command" in d and d['command'] is not None else ""
+            m_uuid = d['uuid'] if "uuid" in d and d['uuid'] is not None else "no-uuid"
+        except (json.JSONDecodeError): # otherwise fall back to string format (Curses)
+            m_uuid = "no-uuid"
+
+        if s == 'quit':
+            return True
+        elif s == 'update':                             # UI initiated update request
+            self.ui_last_update = time.time()
+            if self.trunking is None or self.trunk_rx is None:
+                return False
+            js = json.loads(self.trunk_rx.to_json())    # extract data from trunking module
+            js['uuid'] = m_uuid
+            ui_rsp.append(js)
+            ui_rsp.append(self.ui_freq_update())
+            ui_rsp.append(self.ui_calllog_update())
+            ui_rsp.append(self.ui_plot_update())
+        elif s == 'toggle_plot':
+            if not self.get_interactive():
+                sys.stderr.write("%s Cannot start plots for non-realtime (replay) sessions\n" % log_ts.get())
+                return
+            plot_type = int(msg.arg1())
+            msgq_id = int(msg.arg2())
+            self.find_channel(msgq_id).toggle_plot(plot_type)
+            ui_rsp.append({'json_type': "ok", 'uuid': m_uuid})
+        elif s == 'adj_tune':
+            freq = msg.arg1()
+            msgq_id = int(msg.arg2())
+            self.find_channel(msgq_id).adj_tune(freq)
+            ui_rsp.append({'json_type': "ok", 'uuid': m_uuid})
+        elif s == 'set_debug':
+            dbglvl = int(msg.arg1())
+            self.set_debug(dbglvl)
+            ui_rsp.append({'json_type': "ok", 'uuid': m_uuid})
+        elif s == 'get_terminal_config':
+            if self.terminal is not None and self.terminal_config is not None:
+                js = self.terminal_config
+                js['json_type'] = "terminal_config"
+                js['uuid'] = m_uuid
+                ui_rsp.append(js)
+            else:
+                return False
+        elif s == 'get_full_config':
+            js = self.config
+            js['json_type'] = "full_config"
+            js['uuid'] = m_uuid
+            ui_rsp.append(js)
+        elif s == 'set_full_config':
+            ui_rsp.append({'json_type': "ok", 'uuid': m_uuid})
+            pass
+        elif s == 'get_ws_instances':
+            js = {}
+            js['json_type'] = "ws_instances"
+            js['uuid'] = m_uuid
+            for chan in self.channels:
+                js[chan.msgq_id] = chan.ws_instance
+            ui_rsp.append(js)
+        elif s == 'dump_tgids':
+            self.trunk_rx.dump_tgids()
+            ui_rsp.append({'json_type': "ok", 'uuid': m_uuid})
+        elif s == 'capture':
+            if not self.get_interactive():
+                sys.stderr.write("%s Cannot start capture for non-realtime (replay) sessions\n" % log_ts.get())
+                return
+            msgq_id = int(msg.arg2())
+            self.find_channel(msgq_id).toggle_capture()
+            ui_rsp.append({'json_type': "ok", 'uuid': m_uuid})
+        elif s == 'dump_buffer':
+            for chan in self.channels:
+                chan.decoder.control(json.dumps({'tuner': chan.msgq_id, 'cmd': 'dump_buffer'}))
+            ui_rsp.append({'json_type': "ok", 'uuid': m_uuid})
+        elif s == 'watchdog':
+            if self.ui_last_update > 0 and (time.time() > (self.ui_last_update + self.ui_timeout)):
+                self.ui_last_update = 0
+                if self.verbosity > 10:
+                    sys.stderr.write("%s UI Timeout\n" % log_ts.get())
+                for chan in self.channels:
+                    chan.close_plots()
+            # Experimental automatic fine tuning 
+            # TODO: find a better way to invoke
+            for chan in self.channels:
+                chan.error_tracking()
+        elif s in RX_COMMANDS:
+            if self.trunking is not None and self.trunk_rx is not None:
+                self.trunk_rx.ui_command(s, msg.arg1(), msg.arg2())
+            ui_rsp.append({'json_type': "ok", 'uuid': m_uuid})
+
+        if len(ui_rsp) > 0:
+            msg = gr.message().make_from_string(json.dumps(ui_rsp), -4, 0, 0)
+            if not self.ui_in_q.full_p():
+                self.ui_in_q.insert_tail(msg)           # send info back to UI as long as queue not full
+
+        return False
+
+    def ui_calllog_update(self):
+        if self.trunking is None or self.trunk_rx is None:
+            return { }
+        js = json.loads(self.trunk_rx.get_call_log())
+        return js
+
+    def ui_freq_update(self):
+        if self.trunking is None or self.trunk_rx is None:
+            return { }
+        params = json.loads(self.trunk_rx.get_chan_status())   # extract data from all channels
+        for rx_id in params['channels']:                       # iterate and convert stream name to url
+            params[rx_id]['ppm'] = self.find_channel(int(rx_id)).device.get_ppm()
+            params[rx_id]['capture'] = False if self.find_channel(int(rx_id)).raw_sink is None else True
+            params[rx_id]['error'] = self.find_channel(int(rx_id)).get_error()
+            s_name = params[rx_id]['stream']
+            if s_name not in self.meta_streams:
+                continue
+            meta_s, meta_q = self.meta_streams[s_name]
+            params[rx_id]['stream_url'] = meta_s.get_url()
+        return params
+
+    def ui_plot_update(self):
+        if self.terminal_type is None or self.terminal_type != "http":
+            return { }
+
+        filenames = []
+        for chan in self.channels:
+            for sink in chan.sinks:
+                fn = chan.sinks[sink][0].gnuplot.filename
+                if fn is not None and os.access(os.path.join(self.http_plot_directory, fn), os.R_OK):
+                    filenames.append(fn)
+        d = {'json_type': 'rx_update', 'files': filenames}
+        return d
+
+    def kill(self):
+        for chan in self.channels:
+            chan.decoder.control(json.dumps({'tuner': chan.msgq_id, 'cmd': 'stop'}))
+            chan.kill()
+
+        for instance in self.audio_instances:
+            if self.audio_instances[instance] is not None:
+                self.audio_instances[instance].stop()
+
+        for meta_s in self.meta_streams:
+            if self.meta_streams[meta_s] is not None:
+                self.meta_streams[meta_s][0].stop()
+
+        if self.terminal is not None:
+            self.terminal.end_terminal()
+
+    def stop(self):
+        sys.stderr.write("%s rx_block::stop() flowgraph stop called\n" % log_ts.get())
+        self.kill()
+        time.sleep(0.5) # allow a little time for processes and ports to end gracefully
+        gr.top_block.stop(self)
+
+# data unit receive queue
+#
+class du_queue_watcher(threading.Thread):
+
+    def __init__(self, msgq,  callback, **kwds):
+        threading.Thread.__init__ (self, **kwds)
+        self.daemon = True
+        self.msgq = msgq
+        self.callback = callback
+        self.keep_running = True
+        self.start()
+
+    def run(self):
+        try:
+            while(self.keep_running):
+                if not self.msgq.empty_p(): # check queue before trying to read a message to avoid deadlock at startup
+                    msg = self.msgq.delete_head()
+                    if msg is not None:
+                        self.callback(msg)
+                    else:
+                        self.keep_running = False
+                else: # empty queue
+                    time.sleep(0.01)
+        except KeyboardInterrupt:
+            self.keep_running = False
+
+    def kill(self):
+        self.keep_running = False
+
+class rx_main(object):
+    def __init__(self):
+        def byteify(input):    # thx so
+            if sys.version[0] != '2':
+                return input
+            if isinstance(input, dict):
+                return {byteify(key): byteify(value)
+                        for key, value in list(input.items())}
+            elif isinstance(input, list):
+                return [byteify(element) for element in input]
+            elif isinstance(input, str):
+                return input.encode('utf-8')
+            else:
+                return input
+
+        self.keep_running = True
+
+        # command line argument parsing
+        parser = OptionParser(option_class=eng_option)
+        parser.add_option("-c", "--config-file", type="string", default=None, help="specify config file name")
+        parser.add_option("-v", "--verbosity", type="int", default=0, help="message debug level")
+        parser.add_option("-p", "--pause", action="store_true", default=False, help="block on startup")
+        parser.add_option("-d", "--dev-mode", action="store_true", default=False, help="enable developer mode")
+        (options, args) = parser.parse_args()
+
+        #if options.dev_mode:
+        #    globals()["p25_demodulator"] = importlib.import_module("p25_demodulator_dev")
+        #else:
+        #    globals()["p25_demodulator"] = importlib.import_module("p25_demodulator")
+
+        # wait for gdb
+        sys.stderr.write("Starting OP25 (pid = %d)\n" % (os.getpid()))
+        if options.pause:
+            sys.stdout.write("Ready for GDB to attach (pid = %d)\n" % (os.getpid(),))
+            if sys.version[0] > '2':
+                input("Press 'Enter' to continue...")
+            else:
+                raw_input("Press 'Enter' to continue...")
+
+        if options.config_file == '-':
+            config = json.loads(sys.stdin.read())
+        else:
+            if options.config_file is None:
+                parser.print_help()
+                exit(1)
+            if sys.version[0] == '2':
+                config = json.loads(open(options.config_file).read())
+            else:
+                config = json.loads(open(options.config_file, encoding="utf-8-sig").read())
+        self.tb = rx_block(options.verbosity, config = byteify(config))
+        self.q_watcher = du_queue_watcher(self.tb.ui_out_q, self.process_qmsg)
+        sys.stderr.write('python version detected: %s\n' % sys.version)
+
+    def process_qmsg(self, msg):
+        if msg is None or self.tb.process_qmsg(msg):
+            self.tb.stop()
+            self.keep_running = False
+
+    def run(self):
+        try:
+            self.tb.start()
+            if self.tb.get_interactive():
+                while self.keep_running:
+                    time.sleep(1.0)
+                    msg = gr.message().make_from_string("watchdog", -2, 0, 0)
+                    if not self.tb.ui_out_q.full_p():
+                       self.tb.ui_out_q.insert_tail(msg)
+            else:
+                self.tb.wait() # curiously wait() matures when a flowgraph gets locked
+            sys.stderr.write('Flowgraph complete. Exiting\n')
+        except (KeyboardInterrupt):
+            sys.stderr.write("Ctrl-C detected\n")
+            self.tb.stop()
+            self.tb.kill()
+            self.keep_running = False
+        except Exception:
+            sys.stderr.write('main: exception occurred\n')
+            sys.stderr.write('main: exception:\n%s\n' % traceback.format_exc())
+            self.tb.stop()
+            self.tb.kill()
+            self.keep_running = False
+
+if __name__ == "__main__":
+    if sys.version[0] > '2':
+        pass
+        #sys.stderr = io.TextIOWrapper(sys.stderr.detach().detach(), write_through=True) # disable stderr buffering
+    rx = rx_main()
+    rx.run()

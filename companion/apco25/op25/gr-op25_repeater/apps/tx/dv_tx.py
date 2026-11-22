@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+
+#################################################################################
+# 
+# Multiprotocol Digital Voice TX (C) Copyright 2017 Max H. Parke KA1RBI & Joey Absi VE2KJZ
+# 
+# This file is part of OP25
+# 
+# This is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3, or (at your option)
+# any later version.
+# 
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this software; see the file COPYING.  If not, write to
+# the Free Software Foundation, Inc., 51 Franklin Street,
+# Boston, MA 02110-1301, USA.
+#################################################################################
+
+import sys
+import os
+import math
+import json
+import random
+from gnuradio import gr, audio, eng_notation
+from gnuradio import filter, blocks, analog, digital
+from gnuradio.eng_option import eng_option
+from gnuradio.fft import window
+from optparse import OptionParser
+
+import gnuradio.op25 as op25
+import gnuradio.op25_repeater as op25_repeater
+
+from math import pi
+
+from op25_c4fm_mod import p25_mod_bf
+
+RC_FILTER = {'dmr': 'rrc', 'p25': 'rc', 'ysf': 'rrc', 'dstar': None}
+
+output_gains = {
+    'dmr': 5.5,
+    'dstar': 0.95,
+    'p25': 4.5,
+    'ysf': 5.5
+}
+gain_adjust = {
+    'dmr': 3.0,
+    'dstar': 7.5,
+    'ysf': 4.0
+}
+gain_adjust_fullrate = {
+    'p25': 2.0,
+    'ysf': 3.0
+}
+mod_adjust = {  # rough values
+    'dmr': 0.35,
+    'dstar': 0.075,
+    'p25': 0.33,
+    'ysf': 0.42
+}
+
+def parse_hex_int(option_name, value, minimum, maximum):
+    if value is None:
+        return None
+    try:
+        result = int(value, 0)
+    except ValueError:
+        parser.error("%s must be a decimal or 0x-prefixed hexadecimal integer" % option_name)
+
+    if result < minimum or result > maximum:
+        parser.error("%s must be between 0x%x and 0x%x" % (option_name, minimum, maximum))
+
+    return result
+
+def load_key_entry(keyfile_path, kid):
+    try:
+        with open(keyfile_path, 'r') as f:
+            keys = json.load(f)
+    except (IOError, OSError) as e:
+        parser.error("cannot read --keyfile '%s': %s" % (keyfile_path, e))
+    except ValueError as e:
+        parser.error("--keyfile '%s' is not valid JSON: %s" % (keyfile_path, e))
+
+    kid_str = "0x%04x" % kid
+
+    entry = keys.get(kid_str)
+    if entry is None:
+        parser.error("key id %s not found in --keyfile '%s'" % (kid_str, keyfile_path))
+
+    try:
+        algid = int(entry['algid'], 0)
+        key_bytes = [int(b, 0) for b in entry['key']]
+    except (KeyError, ValueError) as e:
+        parser.error("malformed entry for %s in --keyfile: %s" % (kid_str, e))
+
+    return algid, key_bytes
+
+def parse_key_bytes(option_name, value):
+    if value is None:
+        return None
+
+    try:
+        if value.lower().startswith("0x"):
+            hex_str = value[2:]
+
+            if len(hex_str) == 0:
+                parser.error("%s must contain at least one hex digit after 0x" % option_name)
+
+            if len(hex_str) % 2 != 0:
+                hex_str = "0" + hex_str  # pad odd-length input, e.g. "0x123" -> "0x0123"
+
+            key_bytes = [int(hex_str[i:i+2], 16) for i in range(0, len(hex_str), 2)]
+        else:
+            # decimal input: convert to the minimal big-endian byte sequence
+            val = int(value, 10)
+
+            if val < 0:
+                parser.error("%s must be non-negative" % option_name)
+
+            key_bytes = []
+            while val > 0:
+                key_bytes.insert(0, val & 0xFF)
+                val >>= 8
+
+            if not key_bytes:
+                key_bytes = [0]
+    except ValueError:
+        parser.error("%s must be a decimal or 0x-prefixed hexadecimal integer" % option_name)
+
+    return key_bytes
+
+class my_top_block(gr.top_block):
+
+    """
+    Reads up to two channels of input and generates an output stream (in float format)
+
+    Input may be either from sound card or from files.
+
+    Likewise the output channel may be directed to an audio output or to a file.
+
+    the output audio is suitable for direct application to an FM modulator
+    """
+
+    def __init__(self):
+        global output_gains, gain_adjust, gain_adjust_fullrate, mod_adjust
+        gr.top_block.__init__(self)
+        parser = OptionParser(option_class=eng_option)
+
+        parser.add_option("-a", "--args", type="string", default="", help="device args")
+        parser.add_option("-A", "--alt-modulator-rate", type="int", default=50000, help="when mod rate is not a submutiple of IF rate")
+        parser.add_option("-b", "--bt", type="float", default=0.5, help="specify bt value")
+        parser.add_option("-c", "--config-file", type="string", default=None, help="specify the config file name")
+        parser.add_option("-f", "--file1", type="string", default=None, help="specify the input file slot 1")
+        parser.add_option("-F", "--file2", type="string", default=None, help="specify the input file slot 2 (DMR)")
+        parser.add_option("-g", "--gain", type="float", default=1.0, help="input gain")
+        parser.add_option("-i", "--if-rate", type="int", default=480000, help="output rate to sdr")
+        parser.add_option("-I", "--audio-input", type="string", default="", help="pcm input device name.  E.g., hw:0,0 or /dev/dsp")
+        parser.add_option("-k", "--symbol-sink", type="string", default=None, help="write symbols to file (optional)")
+        parser.add_option("-N", "--gains", type="string", default=None, help="gain settings")
+        parser.add_option("-O", "--audio-output", type="string", default="default", help="pcm output device name.  E.g., hw:0,0 or /dev/dsp")
+        parser.add_option("-o", "--output-file", type="string", default=None, help="specify the output file")
+        parser.add_option("-p", "--protocol", type="choice", default=None, choices=('dmr', 'dstar', 'p25', 'ysf'), help="specify protocol: dmr, dstar, p25, ysf")
+        parser.add_option("-q", "--frequency-correction", type="float", default=0.0, help="ppm")
+        parser.add_option("-Q", "--frequency", type="float", default=0.0, help="Hz")
+        parser.add_option("-r", "--repeat", action="store_true", default=False, help="input file repeat")
+        parser.add_option("-R", "--fullrate-mode", action="store_true", default=False, help="ysf fullrate")
+        parser.add_option("-s", "--modulator-rate", type="int", default=48000, help="must be submultiple of IF rate - see also -A")
+        parser.add_option("-S", "--alsa-rate", type="int", default=48000, help="sound source/sink sample rate")
+        parser.add_option("-t", "--test", type="string", default=None, help="test pattern symbol file")
+        parser.add_option("-v", "--verbose", type="int", default=0, help="additional output")
+        parser.add_option("--nac", type="string", default=None, help="P25 Network Access Code, accepts decimal or 0x-prefixed hexadecimal")
+        parser.add_option("--mi", type="string", default=None, help="P25 Message Indicator, accepts decimal, 0x-prefixed hexadecimal, or 'auto' to generate a random value")
+        parser.add_option("--algid", type="string", default=None, help="P25 Algorithm ID, accepts decimal or 0x-prefixed hexadecimal")
+        parser.add_option("--kid", type="string", default=None, help="P25 Key ID, accepts decimal or 0x-prefixed hexadecimal")
+        parser.add_option("--key", type="string", default=None, help="P25 Key, accepts decimal or 0x-prefixed hexadecimal")
+        parser.add_option("--keyfile", type="string", default=None, help="Set key file, --kid shall also be specified")
+        parser.add_option("--tgid",type="string", default=None, help="P25 Talkgroup ID, accepts decimal or 0x-prefixed hexadecimal")
+        parser.add_option("--src", type="string", default=None, help="P25 Source ID, accepts decimal or 0x-prefixed hexadecimal")
+        parser.add_option("--dst", type="string", default=None, help="P25 Destination ID for Direct Call, accepts decimal or 0x-prefixed hexadecimal")
+        parser.add_option("--emrg", action="store_const", const=1, default=0, help="P25 Emergency flag, activates emergency on voice call")
+        (options, args) = parser.parse_args()
+        self.options = options
+        
+
+		
+        p25_nac = parse_hex_int("--nac", options.nac, 0x000, 0xfff)
+        p25_algid = parse_hex_int("--algid", options.algid, 0x00, 0xff)
+        p25_kid = parse_hex_int("--kid", options.kid, 0x0000, 0xffff)
+        p25_key = None
+        p25_tgid = parse_hex_int("--tgid", options.tgid, 0x0000, 0xffff)
+        p25_src = parse_hex_int("--src", options.src, 0x000000, 0xffffff)
+        p25_dst = parse_hex_int("--dst", options.dst, 0x000000, 0xffffff)
+        
+        if options.mi is not None and options.mi.lower() == "auto":
+            p25_mi = random.getrandbits(64)
+            if options.verbose >= 1:
+                sys.stderr.write("P25 MI (auto-generated): 0x%016x\n" % p25_mi)
+        else:
+            p25_mi = parse_hex_int("--mi", options.mi, 0x0000000000000000, 0xffffffffffffffff)
+        
+        if options.keyfile:
+            if p25_kid is None:
+                parser.error("--keyfile requires --kid to select which key to load")
+
+            p25_algid, p25_key = load_key_entry(options.keyfile, p25_kid)
+        
+        if options.key is not None:
+            p25_key = parse_key_bytes("--key", options.key)
+
+        max_inputs = 1
+
+        if options.protocol is None:
+            print('protocol [-p] option missing')
+            sys.exit(0)
+
+        if options.protocol == 'ysf' or options.protocol == 'dmr' or options.protocol == 'dstar':
+            assert options.config_file # dstar, dmr and ysf require config file ("-c FILENAME" option)
+
+        output_gain = output_gains[options.protocol]
+
+        if options.test: # input file is in symbols of size = char
+            ENCODER = blocks.file_source(gr.sizeof_char, options.test, options.repeat)
+        elif options.protocol == 'dmr':
+            max_inputs = 2
+            ENCODER  = op25_repeater.ambe_encoder_sb(options.verbose)
+            ENCODER2 = op25_repeater.ambe_encoder_sb(options.verbose)
+            ENCODER2.set_gain_adjust(gain_adjust['dmr'])
+            DMR = op25_repeater.dmr_bs_tx_bb(options.verbose, options.config_file)
+            self.connect(ENCODER, (DMR, 0))
+            self.connect(ENCODER2, (DMR, 1))
+        elif options.protocol == 'dstar':
+            ENCODER = op25_repeater.dstar_tx_sb(options.verbose, options.config_file)
+        elif options.protocol == 'p25':
+            ENCODER = op25_repeater.vocoder(True, # False=Decode,True=Encode
+                                  False,          # Verbose flag
+                                  0,              # flex amount
+                                  "",             # udp ip address
+                                  0,              # udp port
+                                  False)          # dump raw u vectors
+            p25_params = {
+                'cmd': 'set_p25_params'
+            }
+
+            if p25_nac is not None:
+                p25_params['nac'] = p25_nac
+            if p25_mi is not None:
+                p25_params['mi'] = p25_mi
+            if p25_algid is not None:
+                p25_params['algid'] = p25_algid
+            if p25_kid is not None:
+                p25_params['kid'] = p25_kid
+            if p25_key is not None:
+                p25_params['key'] = p25_key
+            if options.keyfile is not None:
+                p25_params['autokey'] = p25_kid, p25_algid, p25_key
+            if p25_tgid is not None:
+                p25_params['tgid'] = p25_tgid
+            if p25_src is not None:
+                p25_params['src'] = p25_src    
+            if p25_dst is not None:
+                p25_params['dst'] = p25_dst
+                p25_params['lco'] = 3
+            p25_params['verbosity'] = options.verbose
+            p25_params['svcopt'] = (options.emrg << 7) | 0b000100 # Emergency (1 bit), Protected (1 bit), Duplex (1 bit), Mode (1 bit), Reserved (1 bit), Prio (3 bits, default 4)
+
+            if len(p25_params) > 1:
+                response = ENCODER.control(json.dumps(p25_params))
+
+            if options.verbose >= 5:
+                sys.stderr.write("P25 encoder control: %s -> %s\n"
+                % (p25_params, response))
+        elif options.protocol == 'ysf':
+            ENCODER = op25_repeater.ysf_tx_sb(options.verbose, options.config_file, options.fullrate_mode)
+            if options.fullrate_mode:
+                ENCODER.set_gain_adjust(gain_adjust_fullrate['ysf'])
+            else:
+                ENCODER.set_gain_adjust(gain_adjust['ysf'])
+        if options.protocol == 'p25' and not options.test:
+            ENCODER.set_gain_adjust(gain_adjust_fullrate[options.protocol])
+        elif not options.protocol == 'ysf' and not options.test:
+            ENCODER.set_gain_adjust(gain_adjust[options.protocol])
+        nfiles = 0
+        if options.file1:
+            nfiles += 1
+        if options.file2 and options.protocol == 'dmr':
+            nfiles += 1
+        if nfiles < max_inputs and not options.test:
+            AUDIO = audio.source(options.alsa_rate, options.audio_input)
+            lpf_taps = filter.firdes.low_pass(1.0, options.alsa_rate, 3400.0, 3400 * 0.1, window.WIN_HANN)
+            audio_rate = 8000
+            AUDIO_DECIM = filter.fir_filter_fff (int(options.alsa_rate / audio_rate), lpf_taps)
+            AUDIO_SCALE = blocks.multiply_const_ff(32767.0 * options.gain)
+            AUDIO_F2S = blocks.float_to_short()
+            self.connect(AUDIO, AUDIO_DECIM, AUDIO_SCALE, AUDIO_F2S)
+
+        if options.file1: 
+            IN1 = blocks.file_source(gr.sizeof_short, options.file1, options.repeat)
+            S2F1 = blocks.short_to_float()
+            AMP1 = blocks.multiply_const_ff(options.gain)
+            F2S1 = blocks.float_to_short()
+            self.connect(IN1, S2F1, AMP1, F2S1, ENCODER)
+        elif not options.test:
+            self.connect(AUDIO_F2S, ENCODER)
+
+        if options.protocol == 'dmr' and not options.test:
+            if options.file2:
+                IN2 = blocks.file_source(gr.sizeof_short, options.file2, options.repeat)
+                S2F2 = blocks.short_to_float()
+                AMP2 = blocks.multiply_const_ff(options.gain)
+                F2S2 = blocks.float_to_short()
+                self.connect(IN2, S2F2, AMP2, F2S2, ENCODER2)
+            else:
+                self.connect(AUDIO_F2S, ENCODER2)
+
+        MOD = p25_mod_bf(output_sample_rate = options.modulator_rate, dstar = (options.protocol == 'dstar'), bt = options.bt, rc = RC_FILTER[options.protocol])
+        AMP = blocks.multiply_const_ff(output_gain)
+
+        if options.output_file:
+            OUT = blocks.file_sink(gr.sizeof_float, options.output_file)
+        elif not options.args:
+            OUT = audio.sink(options.alsa_rate, options.audio_output)
+
+        if options.symbol_sink:
+            SYMBOL_SINK = blocks.file_sink(gr.sizeof_char, options.symbol_sink)
+        if options.protocol == 'dmr' and not options.test:
+            self.connect(DMR, MOD)
+            if options.symbol_sink:
+                self.connect(DMR, SYMBOL_SINK)
+        else:
+            self.connect(ENCODER, MOD)
+            if options.symbol_sink:
+                self.connect(ENCODER, SYMBOL_SINK)
+
+        if options.args:
+            self.setup_sdr_output(options, mod_adjust[options.protocol])
+            f1 = float(options.if_rate) / options.modulator_rate
+            i1 = int(options.if_rate / options.modulator_rate)
+            if f1 - i1 > 1e-3:
+                f1 = float(options.if_rate) / options.alt_modulator_rate
+                i1 = int(options.if_rate / options.alt_modulator_rate)
+                if f1 - i1 > 1e-3:
+                    print('*** Error, sdr rate %d not an integer multiple of alt modulator rate %d - ratio=%f' % (options.if_rate, options.alt_modulator_rate, f1))
+                    sys.exit(0)
+                a_resamp = filter.pfb.arb_resampler_fff(options.alt_modulator_rate / float(options.modulator_rate))
+                sys.stderr.write('adding resampler for rate change %d ===> %d\n' % (options.modulator_rate, options.alt_modulator_rate))
+                interp = filter.rational_resampler_fff(int(options.if_rate / options.alt_modulator_rate), 1)
+                self.connect(MOD, AMP, a_resamp, interp, self.fm_modulator, self.u)
+            else:
+                interp = filter.rational_resampler_fff(int(options.if_rate / options.modulator_rate), 1)
+                self.connect(MOD, AMP, interp, self.fm_modulator, self.u)
+        else:
+            self.connect(MOD, AMP, OUT)
+        
+        self.ENCODER = ENCODER
+
+    def setup_sdr_output(self, options, adjustment):
+        import osmosdr
+        max_dev = 12.5e3
+        k = 2 * math.pi * max_dev / options.if_rate
+
+        self.fm_modulator = analog.frequency_modulator_fc (k * adjustment)
+
+        self.u = osmosdr.sink (options.args)
+        gain_names = self.u.get_gain_names()
+        for name in gain_names:
+            range = self.u.get_gain_range(name)
+            print("gain: name: %s range: start %d stop %d step %d" % (name, range.start(), range.stop(), range.step()))
+        if options.gains:
+            for tuple in options.gains.split(","):
+                name, gain = tuple.split(":")
+                gain = int(gain)
+                print("setting gain %s to %d" % (name, gain))
+                self.u.set_gain(gain, name)
+
+        self.u.set_sample_rate(options.if_rate)
+        self.u.set_center_freq(options.frequency)
+        self.u.set_freq_corr(options.frequency_correction)
+
+if __name__ == "__main__":
+    print('Multiprotocol Digital Voice TX (C) Copyright 2026 Max H. Parke KA1RBI & Joey Absi VE2KJZ')
+    tb = my_top_block()
+    try:
+        tb.run()
+        # Only append an sTDU when the transmission came from a file
+        if tb.options.protocol == 'p25' and tb.options.file1 and not tb.options.test:
+            response = tb.ENCODER.control(json.dumps({'cmd': 'end_transmission'}))
+            if tb.options.verbose >= 5:
+                sys.stderr.write("sTDU control: %s\n" % response)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        tb.stop()
+        tb.wait()
+        if hasattr(tb, 'u'):
+            tb.u = None
+        del tb
+        print("Deleted Top Block")

@@ -1,0 +1,3524 @@
+
+// Copyright 2017, 2018 Max H. Parke KA1RBI
+// Copyright 2018, 2019, 2020, 2021 gnorbury@bondcar.com
+// JavaScript UI Updates, Michael Rose, 2025, 2026
+//
+// This file is part of OP25
+//
+// OP25 is free software; you can redistribute it and/or modify it
+// under the terms of the GNU General Public License as published by
+// the Free Software Foundation; either version 3, or (at your option)
+// any later version.
+//
+// OP25 is distributed in the hope that it will be useful, but WITHOUT
+// ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+// or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public
+// License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with OP25; see the file COPYING. If not, write to the Free
+// Software Foundation, Inc., 51 Franklin Street, Boston, MA
+// 02110-1301, USA.
+
+const lastUpdate = "12-Feb-2026 16:40";
+
+var d_debug = 1;
+// default smartColors - will be overwritten by smartColors contained in json, if present
+var smartColors = [{keywords:["fire","fd"],color:"#ff5c5c"},{keywords:["pd","police","sheriff","so"],color:"#66aaff"},{keywords:["ems","med","amr","ambulance"],color:"#ffb84d"}];
+var counter1 = 0;
+var error_val = null;
+var auto_tracking = null;
+var fine_tune = null;
+var current_tgid = null;
+var capture_active = false;
+var hold_tgid = 0;
+var http_errors = 0;
+var http_ok = 0;
+var fetch_errors = 0;
+var send_qfull = 0;
+var send_queue = [];
+var request_count = 0;
+var SEND_QLIMIT = 5;
+var c_freq = 0;
+var c_ppm = null;
+var c_system = null;
+var c_tag = null;
+var c_stream_url = null;
+var c_srctag = "";
+var c_srcaddr = 0;
+var c_grpaddr = 0;
+var c_encrypted = 0;
+var c_emergency = 0;
+var c_nac = 0;
+var c_name = "";
+var channel_list = [];
+var channel_index = 0;
+var auto_focus = true;       // when true, channel view follows the active call automatically
+var lastChannelData = null;
+var default_channel = null;
+var ws_endpoints = {};
+var ws_connections = {};
+var audioCtx = null;
+var audioChannels = {};
+var muteAudioAtStartup = false;
+const WS_AUDIO_SAMPLE_RATE = 8000;
+var enc_sym = "&#216;";
+var config_cache = null;
+// var presets = [];
+var site_alias = [];
+var newPresets = [];
+var noPresetsCounter = 0;
+localStorage.setItem('getConfigBtn', 0);
+
+var lg_step = 1200;  				// these are defaults, they are updated in term_config() if present.
+var sm_step = 100;
+
+
+// MAX_HISTORY_ROWS: Maximum number of entries retained in the Call History table.
+// Older rows beyond this limit should be pruned to prevent unbounded
+// table growth and UI performance degradation.
+const MAX_HISTORY_ROWS = 1000;
+
+
+// MAX_HISTORY_SECONDS: Time window (in seconds) used by appendCallHistory() to suppress duplicates.
+// If the same system + talkgroup + source appears again within this many seconds,
+// the entry is treated as already logged and will not be added again.
+const MAX_HISTORY_SECONDS 	= 5 ;
+
+
+// MAX_TG_CHARS: Maximum length of talkgroup tag text shown in the frequency table.
+// Tags longer than this should be truncated to keep the table readable
+// and prevent layout stretching.
+const MAX_TG_CHARS = 20;
+
+
+// remember sysid:tgid:tgtags for when a tgid shows up without its tag.
+var TG_TAG_CACHE = {}; // { "1A2": { "1234": "PD Dispatch", ... }, ... }
+
+// stores the time a tg was last seen so duplicates are avoided in the call history table
+var callHistorySeen = new Map(); // key -> lastSeenMs
+var callLogSeen = new Map();     // key -> lastSeenMs, for Voice Grant (Python) dedup
+
+// stores sort params for the seen talkgroup table popup
+var SEEN_TG_SORT = { col: null, asc: true };
+var SEEN_TG_SORT_COL = 0;   // default: System
+var SEEN_TG_SORT_DIR = 1;   // 1 = asc, -1 = desc
+
+// ---- SubReg sort state (no sorting until user clicks) ----
+var subSortKey = null;  // time | system | tgid | tgtag | id | ag
+var subSortDir = 1;     // 1 asc, -1 desc
+var SUB_SEARCH_SORT = { col: null, dir: "asc" }; // popup-only sort state
+
+const mediaQuery = window.matchMedia("(min-width: 1500px)");
+mediaQuery.addEventListener("change", handleColumnLayoutChange);
+
+document.addEventListener("DOMContentLoaded", function() {
+
+	document.getElementById("lastUiUpdate").innerText = lastUpdate;
+	
+    var displaySystem    = document.getElementById("displaySystem");
+    var displayFreq      = document.getElementById("displayFreq");
+
+    var displayTalkgroup = document.getElementById("displayTalkgroup");
+    var displayTgid      = document.getElementById("displayTgid");
+
+    var displaySource    = document.getElementById("displaySource");
+    var displaySourceId  = document.getElementById("displaySourceId");
+
+    var displayEnc       = document.getElementById("displayEnc");
+    var displayEmg       = document.getElementById("displayEmg");    
+    
+    var displayChannel	 = document.getElementById("displayChannel");
+    var displayService	 = document.getElementById("displayService");
+
+	const heightInput = document.getElementById("callHeightControl");
+	const scrollDiv = document.querySelector(".call-history-scroll");
+	
+	if (heightInput && scrollDiv) {
+	heightInput.addEventListener("input", () => {
+	  const newHeight = parseInt(heightInput.value, 10);
+	  if (!isNaN(newHeight) && newHeight >= 200 && newHeight <= 1000) {
+		scrollDiv.style.height = `${newHeight}px`;
+	  }
+	});
+	}
+	    	
+	loadSettingsFromLocalStorage();	
+	
+	const sizeInput = document.getElementById("plotSizeControl");
+  
+	sizeInput.addEventListener("input", () => {
+	const newWidth = parseInt(sizeInput.value, 10);
+	if (!isNaN(newWidth) && newWidth >= 100 && newWidth <= 1000) {
+	  document.querySelectorAll(".plot-image").forEach(img => {
+		img.style.width = `${newWidth}px`;
+	  });
+	}
+	});
+  
+	handleColumnLayoutChange(mediaQuery);	
+	  
+	updatePlotButtonStyles();
+	
+	document.getElementById("callHistorySource").addEventListener("change", saveSettingsToLocalStorage);	
+	document.getElementById("callHeightControl").addEventListener("input", saveSettingsToLocalStorage);
+	document.getElementById("plotSizeControl").addEventListener("input", saveSettingsToLocalStorage);
+	document.getElementById("smartColorToggle").addEventListener("change", saveSettingsToLocalStorage);
+	document.getElementById("radioIdFreqTable").addEventListener("change", saveSettingsToLocalStorage);	
+	document.getElementById("channelsTableToggle").addEventListener("change", saveSettingsToLocalStorage);	
+	document.getElementById("showBandPlan").addEventListener("change", saveSettingsToLocalStorage);	
+	document.getElementById("trackSubsToggle").addEventListener("change", saveSettingsToLocalStorage);
+	document.getElementById("subMode").addEventListener("change", saveSettingsToLocalStorage);
+	document.getElementById("muteAudioAtStartup").addEventListener("change", function() {
+		muteAudioAtStartup = this.checked;
+		saveSettingsToLocalStorage();
+	});
+
+	document.addEventListener('click', function initAudioCtx() {
+		if (!muteAudioAtStartup && !audioCtx) {
+			audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: WS_AUDIO_SAMPLE_RATE });
+			Object.keys(audioChannels).forEach(function(ch) { audio_play(ch); });
+		}
+	}, { once: true });
+	
+	document.getElementById("valueColorPicker").addEventListener("change", function() {
+		document.documentElement.style.setProperty('--values', this.value);
+		saveSettingsToLocalStorage();
+	});
+
+	document.getElementById("channelsTableToggle").addEventListener("change", function () {
+	  const container = document.getElementById("channels-container");
+	  const checked = this.checked;
+	
+	  if (container) {
+		container.style.display = checked ? "" : "none";
+	  }
+
+	  saveSettingsToLocalStorage();
+	});	
+
+	
+	document.getElementById("adjacentSitesToggle").addEventListener("change", function () {
+	  const container = document.getElementById("adjacentSitesContainer");
+	  const checked = this.checked;
+	
+	  if (container) {
+		container.style.display = checked ? "" : "none";
+	  }
+
+	  saveSettingsToLocalStorage();
+	});		
+	
+	document.getElementById("callHistoryToggle").addEventListener("change", function () {
+	  const container = document.getElementById("callHistoryContainer");
+	  const checked = this.checked;
+	
+	  if (container) {
+		container.style.display = checked ? "" : "none";
+	  }
+	  
+	  saveSettingsToLocalStorage();
+	});
+	
+	document.getElementById("resetColor").addEventListener("click", function() {
+		const defaultColor = "#00ffff";  // Your original default color
+		document.getElementById("valueColorPicker").value = defaultColor;
+		document.documentElement.style.setProperty('--values', defaultColor);
+		localStorage.setItem("valueColor", defaultColor);
+	});	
+	
+	// Handle click outside AND escape key
+	window.addEventListener('click', handlePopupClose);
+	window.addEventListener('keydown', handlePopupClose);
+	
+	function handlePopupClose(event) {
+	  const popupContainers = [
+		{ container: 'popupContainer', content: '.popup-content' },
+		{ container: 'settingsPopupContainer', content: '.settings-popup-content' },
+		{ container: 'aboutPopupContainer', content: '.about-popup-content' }
+	  ];
+	
+	  popupContainers.forEach(({ container, content }) => {
+		const popup = document.getElementById(container);
+		const popupContent = document.querySelector(content);
+	
+		// Handle click outside
+		if (event.type === 'click') {
+		  if (popup && popup.classList.contains('show') && popupContent && !popupContent.contains(event.target)) {
+			togglePopup(container, false);
+		  }
+		}
+	
+		// Handle escape key
+		if (event.type === 'keydown' && event.key === 'Escape') {
+		  if (popup && popup.classList.contains('show')) {
+			togglePopup(container, false);
+		  }
+		}
+	  });
+	}
+});  // end DOM ready / DOMContentLoaded
+
+
+function do_onload() {
+    send_command("get_terminal_config", 0, 0);
+    setInterval(do_update, 1000);
+    send_command("get_full_config", 0, 0);
+    send_command("get_ws_instances", 0, 0);
+}
+
+function is_digit(s) {
+    if (s >= "0" && s <= "9")
+        return true;
+    else
+        return false;
+}
+
+function term_config(d) {  // json_type: "terminal_config"
+
+	if (d['smart_colors'] !== undefined)
+		smartColors = d['smart_colors'];
+	
+    var updated = 0;
+	
+	// Determine UI version required (rx.py => force to legacy terminal for compatibility reasons)
+    if ((d["terminal_interface"] != undefined) && (d["terminal_interface"] == "legacy")) {
+        window.location.replace("legacy-index.html");
+    }
+
+	// Update tuning step values if present	
+    if ((d["tuning_step_large"] != undefined) && (d["tuning_step_large"] != lg_step)) {
+        lg_step = d["tuning_step_large"];
+    }
+    if ((d["tuning_step_small"] != undefined) && (d["tuning_step_small"] != sm_step)) {
+        sm_step = d["tuning_step_small"];
+    }
+    
+    if ((d["default_channel"] != undefined) && (d["default_channel"] != "")) {
+        default_channel = d["default_channel"];
+    }
+
+}
+
+
+function rx_update(d) {
+
+	var plotsCount = d["files"].length;
+	document.getElementById('plotsCount').innerText = plotsCount;
+
+    plotfiles = [];
+    
+    if ((d["files"] != undefined) && (d["files"].length > 0)) {
+        for (var i=0; i < d["files"].length; i++) {
+            if (channel_list.length > 0) {
+                expr = new RegExp("plot\-" + channel_list[channel_index] + "\-");
+            }
+            else {
+                expr = new RegExp("plot\-0\-");
+            }
+
+            if (expr.test(d["files"][i])) {
+                plotfiles.push(d["files"][i]);
+            }
+        }
+
+        for (var i=0; i < 6; i++) {
+            var img = document.getElementById("img" + i);
+            if (i < plotfiles.length) {
+                if (img['src'] != plotfiles[i]) {
+                    img['src'] = plotfiles[i];
+                    img.style["display"] = "";
+                }
+            }
+            else {
+                img.style["display"] = "none";
+            }
+        }
+    }
+    else {
+        var img = document.getElementById("img0");
+        img.style["display"] = "none";
+    }
+    
+    updatePlotButtonStyles();
+    
+    if (d["error"] != undefined) {
+        error_val = d["error"];
+    } else {
+        error_val = null;
+    }
+    
+    if (d["fine_tune"] != undefined)
+        fine_tune = d["fine_tune"];
+}
+
+// frequency, system, and talkgroup display
+
+function change_freq(d) {
+
+    c_freq = d['freq'];
+    c_system = d['system'];
+    current_tgid = d['tgid'];
+    c_tag = d['tag'];
+    displayTalkgroup.innerText = c_tag;
+    c_stream_url = d['stream_url'];
+    channel_status();
+}
+
+function channel_update(d) {
+
+	lastChannelData = d;
+	channel_table(d);   // updates the channels table
+
+    if (d['channels'] != undefined) {
+        channel_list = d['channels'];
+
+        if (channel_list.length > 0) {
+            // if this is the first update, find the default_channel if specified
+            if (default_channel != null && default_channel != "") {
+                for (ch_id = 0; ch_id < channel_list.length; ch_id++) {
+                    if (d[ch_id]['name'] == default_channel) {
+                        channel_index = ch_id;
+                        break;
+                    }
+                }
+                default_channel = null;
+            }
+
+            // Auto-focus: prefer slot with an active call, fall back to hold, then CC.
+            // Voice pool channels occupy indices 1+ in channel_list (CC is always index 0).
+            // Pass 1: slot with current_tgid set — radio is actively transmitting right now.
+            // Pass 2: slot with merged tgid set — call just ended but still in hold period.
+            // Pass 3: all idle — show CC (slot 0).
+            // Skipped entirely when auto_focus=false (toggled off via the AUTO button).
+            if (auto_focus) {
+                var _auto_voice = false;
+                for (var _vi = 1; _vi < channel_list.length; _vi++) {
+                    var _vid = channel_list[_vi];
+                    if (d[_vid] && d[_vid]['current_tgid'] !== null && d[_vid]['current_tgid'] !== undefined) {
+                        channel_index = _vi;
+                        _auto_voice = true;
+                        break;
+                    }
+                }
+                if (!_auto_voice) {
+                    for (var _vi = 1; _vi < channel_list.length; _vi++) {
+                        var _vid = channel_list[_vi];
+                        if (d[_vid] && d[_vid]['tgid'] !== null && d[_vid]['tgid'] !== undefined) {
+                            channel_index = _vi;
+                            _auto_voice = true;
+                            break;
+                        }
+                    }
+                }
+                if (!_auto_voice) {
+                    channel_index = 0;
+                }
+            }
+
+            // display channel information
+            var c_id = channel_list[channel_index];
+            c_system = d[c_id]['system'];
+            
+            c_svcopts = d[c_id]['svcopts'];
+            
+            c_name = "" + c_id + ": ";
+            if ((d[c_id]['name'] != undefined) && (d[c_id]['name'] != "")) {
+                c_name += " " + d[c_id]['name'];
+            
+            }
+            else {
+                c_name += " " + c_system;
+            }
+
+            c_freq = d[c_id]['freq'];
+			            
+            c_ppm = d[c_id]['ppm'];
+            if (d[c_id]['error'] != undefined) {
+                error_val = d[c_id]['error'];
+                document.getElementById('errorVal').innerText = error_val + " Hz";
+            } else {
+                document.getElementById('errorVal').innerText = " - ";
+                error_val = null;
+            }
+            
+//             if (d[c_id]['auto_tracking'] != undefined)
+//                 auto_tracking = d[c_id]['auto_tracking'];
+                
+            current_tgid = d[c_id]['tgid'];
+            c_tag = d[c_id]['tag'];
+            
+            c_srcaddr = d[c_id]['srcaddr'];
+            c_srctag = d[c_id]['srctag'];
+            
+            c_stream_url = d[c_id]['stream_url'];
+            capture_active = d[c_id]['capture'];
+            hold_tgid = d[c_id]['hold_tgid'];
+
+            if (d[c_id]['conventional'] === true) {
+                document.getElementById('frequenciesTable').innerHTML = '';
+                document.getElementById('adjacentSitesContainer').style.display = 'none';
+                document.getElementById('patchesContainer').style.display = 'none';
+            }
+
+        if (hold_tgid != 0) {
+            document.getElementById("btn-hold").style.color = "red";
+		} else {
+			document.getElementById("btn-hold").style.color = ""; // Resets to stylesheet
+			document.getElementById("btn-hold").textContent = "HOLD";
+		}
+                
+            c_encrypted 					= d[c_id]['encrypted'];
+            c_emergency 					= d[c_id]['emergency'];
+            
+            c_tdma 							= d[c_id]['tdma'];
+            
+            displayChannel.innerText		= c_name;
+            plotChannelDisplay.innerText	= c_name;
+            
+            displaySystem.innerText 		= c_system ? c_system : "-";
+            
+   			displayFreq.innerText 			= (parseInt(c_freq) / 1000000.0).toFixed(6);
+            if (current_tgid === null || current_tgid === undefined) {
+              displayTalkgroup.innerText = "";
+            } else {
+                displayTalkgroup.innerText 		= c_tag ? c_tag : "Talkgroup " + current_tgid;
+            }
+            displayTgid.innerText 			= current_tgid ? current_tgid : "-";
+            displaySource.innerText 		= c_srctag ? c_srctag : "ID: " + c_srcaddr;
+            
+            applySmartColorToTgidSpan();
+            
+            if ( displaySource.innerText == "ID: 0")
+            	 displaySource.innerText = " ";
+            	 
+            displaySourceId.innerText 	= c_srcaddr ? c_srcaddr : "-";
+            
+			// Encryption			
+			if (!c_encrypted) displayEnc.innerText = "-";
+			
+			if (c_encrypted == 1) {
+			  displayEnc.innerText = "Encrypted";
+			  displayEnc.style.color = "red";
+			  displayTalkgroup.innerHTML += " &nbsp;&nbsp;&nbsp; " + enc_sym;
+			} else {
+			  displayEnc.innerText = "-";
+			  displayEnc.style.color = ""; // fallback to CSS default
+			}
+			
+			if (c_encrypted == 0 && current_tgid != null) {
+			  displayEnc.innerText = "Clear";
+			  displayEnc.style.color = ""; // fallback to CSS default
+			}
+			
+			if (c_encrypted == undefined) displayEnc.innerText = "-";
+			
+			// Emergency
+			if (c_emergency == 1) {
+			  displayEmg.innerText = "EMERGENCY";
+			  displayEmg.style.color = "red";
+			} else {
+			  displayEmg.innerText = "-";
+			  displayEmg.style.color = ""; // fallback to CSS default
+			}
+            
+            if (c_svcopts == 0) c_svcopts = "-";
+            displayService.innerText = c_svcopts;
+			
+			// send voice display to call history table				
+			if (current_tgid)      
+				appendCallHistory(c_system.substring(0, 5), current_tgid, 0, displayTalkgroup.innerText, 0, displayFreq.innerText, displaySource.innerText, "", "display");
+        }
+        else {
+
+            c_name = "";
+            c_freq = 0.0;
+            c_system = "";
+            current_tgid = 0;
+            c_tag = "";
+            c_srcaddr = 0;
+            c_srctag = "";
+            c_stream_url = "";
+            c_encrypted = 0;
+            c_emergency = 0;
+        }
+        channel_status();
+		loadPresets(c_system);
+
+        ws_connect(channel_list[channel_index])
+    }
+}
+
+function channel_table(d) {
+
+	const channelInfo = document.getElementById("channelInfo");
+	
+	let html = "<table class='compact-table' style='border-collapse: collapse;'>";
+	html += "<tr><th>Ch</th><th>Name</th><th>Audio</th><th>System</th><th>Frequency</th><th colspan='2' style='width: 140px;'>Talkgroup</th><th>Mode</th><th>Hold</th><th>Capture</th><th>Error</th></tr>";
+	
+	for (const ch of d.channels) {
+		const entry = d[ch];
+		if (!entry) continue;
+
+		  let dispEnc = "";
+		  let tdh = "";
+		  let tdc = "";
+		const valueColor = document.getElementById('valueColorPicker').value;
+		const freq = entry.freq ? (entry.freq / 1e6).toFixed(6) : "-";
+		const tgid = entry.tgid ?? "&nbsp;&nbsp;-&nbsp;&nbsp;";
+		  let tag = entry.tag || "Talkgroup " + tgid;
+		const name = entry.name || "-";
+		const system = entry.system || "-";
+		  let hold = entry.hold_tgid || "-";
+		const error = entry.error || "-";
+		  let mode = entry.tdma;
+		const enc = entry.encrypted;
+		const cap = entry.capture === true ? "<span style='color: #0f0;'>On</span>" : "<span style='color: #aaa;'>Off</span>";
+		
+		// highlight the selected channel in the channels table
+		if (Number(ch) == Number(channel_list[channel_index])) {
+			tdc = " style='background-color: #333; font-weight: normal; color: " + valueColor + "'" ;
+		}
+		
+		if (mode == null)
+			mode = " ";
+			
+		if (enc)
+			dispEnc = " " + "<span style='color: " + valueColor + "'>" + enc_sym + "</span>";
+		
+		if (hold != "-")
+			tdh = " style='background-color: #500;'";
+	
+		const hasAudio = (ch in ws_endpoints) && ws_endpoints[ch] != null;
+		const isMuted = !(ch in audioChannels) || audioChannels[ch].muted;
+		const audioIcon = hasAudio
+			? (isMuted
+				? `<span title='Play audio' style='cursor:pointer;' onclick='event.stopPropagation(); audio_toggle(${ch})'>&#9654;</span>`
+				: `<span title='Stop audio' style='cursor:pointer;' onclick='event.stopPropagation(); audio_toggle(${ch})'>&#9646;&#9646;</span>`)
+			: "";
+
+		html += `<tr style='cursor:pointer;' onclick='select_channel_by_id(${ch})'>
+			<td${tdc}>${ch}</td>
+			<td>${name}</td>
+			<td style='text-align:center;'>${audioIcon}</td>
+			<td>${system}</td>
+			<td>${freq}</td>
+			<td>${tgid}</td>
+			<td style="text-align: left;">${tag}</td>
+			<td>${mode}${dispEnc}</td>			
+			<td${tdh}>${hold}</td>
+			<td>${cap}</td>
+			<td>${error}</td>
+		</tr>`;
+	}
+	
+	html += "</table>";
+		
+	channelInfo.innerHTML = html;
+	
+	applySmartColorsToChannels();
+	
+	return;
+	
+}
+
+function channel_status() {
+
+    var html;
+    var s2_cap = document.getElementById("cap_bn");
+    
+    // the speaker icon in the main display and the url in the Settings div
+    var streamButton = document.getElementById("streamButton");
+	var streamURL = document.getElementById("streamURL");
+		
+    html = "";
+
+	// displays the speaker icon when a stream url is present
+    if (c_stream_url != undefined) {
+        var streamHTML = "<a a href='" + c_stream_url + "' target='_blank'>&#128264;</a>";
+        streamButton.innerHTML = streamHTML;
+        streamURL.innerHTML = streamHTML + " " + c_stream_url
+    }
+
+    // displays the headphone icon when a websocket audio endpoint is available
+    var wsAudioButton = document.getElementById("wsAudioButton");
+    var viewed_ch = channel_list[channel_index];
+    if (viewed_ch in ws_endpoints && ws_endpoints[viewed_ch] != null) {
+        var isMuted = !(viewed_ch in audioChannels) || audioChannels[viewed_ch].muted;
+        if (isMuted) {
+            wsAudioButton.innerHTML = "<span title='Play audio' style='cursor:pointer;' onclick='audio_toggle(" + viewed_ch + ")'>&#127911;</span>";
+        } else {
+            wsAudioButton.innerHTML = "<span title='Stop audio' style='cursor:pointer;' onclick='audio_toggle(" + viewed_ch + ")'>&#127911;&#9646;&#9646;</span>";
+        }
+    } else {
+        wsAudioButton.innerHTML = "";
+    }
+
+	// TODO: c_ppm is not displayed anywhere in the new UI. What is it?
+	if (c_ppm != null) {
+        html += "<span class=\"value\"> (" + c_ppm.toFixed(3) + ")</span>";
+    }
+
+    html = "";
+	
+    if (capture_active)
+        document.getElementById('cap_bn').innerText = "Stop Capture";
+    else
+        document.getElementById('cap_bn').innerText = "Start Capture";   
+
+}
+
+// patches table
+
+function patches(d) {
+    if (d['patch_data'] == undefined || Object.keys(d['patch_data']).length < 1) {
+    	document.getElementById('patchesContainer').style.display = "none";
+        return "";
+    }
+
+	document.getElementById('patchesContainer').style.display = "";
+	
+    var is_p25 = (d['type'] == 'p25');
+    var is_smartnet = (d['type'] == 'smartnet');
+
+    // Only supported on P25 and Type II currently
+    if (!is_p25 && !is_smartnet) {
+    	document.getElementById('patchesContainer').style.display = "none";
+        return;
+    }
+
+    var html = "<table class=compact-table>";
+    html += "<tr><th colspan=99 class='th-section'>Patches</th></tr>";
+    if (is_p25) {
+        html += "<tr><th>Supergroup</th><th>Group</th></tr>";
+    } else if (is_smartnet) {
+        html += "<tr><th colspan=2>TG</th><th colspan=2>Sub TG</th><th>Mode</th></tr>";
+    }
+    var ct = 0;
+    for (var tgid in d['patch_data']) {
+        var color = "";  // "#d0d0d0";
+        if ((ct & 1) == 0)
+            color = "";  // "#c0c0c0";
+        ct += 1;
+
+        num_sub_tgids = Object.keys(d['patch_data'][tgid]).length
+        var row_num = 0;
+        for (var sub_tgid in d['patch_data'][tgid]) {
+            if (++row_num == 1) {
+                html += "<tr style=\"background-color: " + color + ";\">";
+                if (is_p25) {
+                    //html += "<td rowspan=" + num_sub_tgids + ">" + d['patch_data'][tgid][sub_tgid]['sg'] + " - " + d['patch_data'][tgid][sub_tgid]['sgtag'] + "</td>";
+                    html += "<td rowspan=" + num_sub_tgids + ">" + d['patch_data'][tgid][sub_tgid]['sg'];
+                    if (d['patch_data'][tgid][sub_tgid]['sgtag'] != null && d['patch_data'][tgid][sub_tgid]['sgtag'] != "")
+						html += " - " + d['patch_data'][tgid][sub_tgid]['sgtag'] + "</td>";
+                } else if (is_smartnet) {
+                    html += "<td rowspan=" + num_sub_tgids + ">" + d['patch_data'][tgid][sub_tgid]['tgid_dec'] + "</td><td rowspan=" + num_sub_tgids + ">" + d['patch_data'][tgid][sub_tgid]['tgid_hex'] + "</td>";
+                }
+            } else {
+                html += "<tr style=\"background-color: " + color + ";\">";
+            }
+            if (is_p25) {
+                //html += "<td>" + d['patch_data'][tgid][sub_tgid]['ga'] + " - " + d['patch_data'][tgid][sub_tgid]['gatag'] + "</td>";
+                html += "<td>" + d['patch_data'][tgid][sub_tgid]['ga'];
+                if (d['patch_data'][tgid][sub_tgid]['gatag'] != null && d['patch_data'][tgid][sub_tgid]['gatag'] != "")
+					html += " - " + d['patch_data'][tgid][sub_tgid]['gatag'] + "</td>";
+            } else if (is_smartnet) {
+                html += "<td>" + d['patch_data'][tgid][sub_tgid]['sub_tgid_dec'] + "</td><td>" + d['patch_data'][tgid][sub_tgid]['sub_tgid_hex'] + "</td>";
+                html += "<td>" + d['patch_data'][tgid][sub_tgid]['mode'] + "</td>";
+            }
+            html += "</tr>";
+        }
+    }
+
+    html += "</table>";
+
+	document.getElementById('patchesTable').innerHTML = html;
+	
+	return;
+
+} // end patch table
+
+// adjacent sites table
+
+function adjacent_sites(d) {
+	
+	let adjacentSitesToggle = document.getElementById("adjacentSitesToggle").checked;
+	
+    if (d['adjacent_data'] == undefined || Object.keys(d['adjacent_data']).length < 1) {
+	    document.getElementById('adjacentSitesContainer').style.display = "none";
+        return;
+    }
+     
+    if (adjacentSitesToggle != true)
+    	return;
+
+	document.getElementById('adjacentSitesContainer').style.display = "";
+	 
+    var is_p25 = (d['type'] == 'p25');
+    var is_smartnet = (d['type'] == 'smartnet');
+
+    // Only supported on P25 and Type II currently
+    if (!is_p25 && !is_smartnet) {
+    	document.getElementById('adjacentSitesContainer').style.display = "none";
+        return;
+    }
+
+    var html = "<table class='compact-table'";
+    html += "<tr><th colspan=99 class='th-section'>Adjacent Sites</th></tr>";
+    if (is_p25) {
+        html += "<tr><th>System</th><th>Site Name<th>RFSS</th><th>Site</th><th>Frequency</th><th>Uplink</th></tr>";
+        var ct = 0;
+        // Ordered by RFSS then site number
+        var adjacent_by_rfss = {};
+        for (var freq in d['adjacent_data']) {
+            var rfss = d['adjacent_data'][freq]["rfid"];
+            var site = d['adjacent_data'][freq]["stid"];
+            if (!(rfss in adjacent_by_rfss)) {
+                adjacent_by_rfss[rfss] = {};
+            }
+            if (!(site in adjacent_by_rfss[rfss])) {
+                adjacent_by_rfss[rfss][site] = {};
+            }
+            adjacent_by_rfss[rfss][site]['cc_rx_freq'] = (freq / 1000000.0).toFixed(6);
+            adjacent_by_rfss[rfss][site]['cc_tx_freq'] = (d['adjacent_data'][freq]["uplink"] / 1000000.0).toFixed(6);
+        }
+        
+       
+        for (var rfss in adjacent_by_rfss) {
+            for (var site in adjacent_by_rfss[rfss]) {
+                var color = "";
+                if ((ct & 1) == 0)
+                    color = "";
+                ct += 1;
+
+//                 displaySiteName = getSiteAlias(hex(d['sysid']), rfss, site);
+  				displaySiteName = getSiteAlias(d['system'], rfss, site);
+                html += "<tr style=\"background-color: " + color + ";\"><td>" + d['sysid'].toString(16).toUpperCase() + "<td style=text-align:left;>" + displaySiteName + "</td><td>" + rfss + "</td><td>" + site + "</td><td>" + adjacent_by_rfss[rfss][site]["cc_rx_freq"] + "</td><td>" + adjacent_by_rfss[rfss][site]["cc_tx_freq"] + "</td></tr>";
+            }
+        }
+    } else if (is_smartnet) {
+        html += "<tr><th>Site</th><th>Frequency</th><th>Uplink</th></tr>";
+        var ct = 0;
+        // Ordered by site number
+        var adjacent_by_site = {};
+        for (var freq in d['adjacent_data']) {
+            var site = d['adjacent_data'][freq]["stid"];
+            adjacent_by_site[site] = {};
+            adjacent_by_site[site]['cc_rx_freq'] = (freq / 1000000.0).toFixed(6);
+            adjacent_by_site[site]['cc_tx_freq'] = (d['adjacent_data'][freq]["uplink"] / 1000000.0).toFixed(6);
+        }
+        for (var site in adjacent_by_site) {
+            var color = "#d0d0d0";
+            if ((ct & 1) == 0)
+                color = "#c0c0c0";
+            ct += 1;
+            html += "<tr style=\"background-color: " + color + ";\"><td>" + site + "</td><td>" + adjacent_by_site[site]["cc_rx_freq"] + "</td><td>" + adjacent_by_site[site]["cc_tx_freq"] + "</td></tr>";
+        }
+    }
+    html += "</table><br>";
+
+// end adjacent sites table
+
+	document.getElementById('adjacentSitesTable').innerHTML = html;
+    return html;
+}
+
+function update_sub_reg(r, systemId) {
+
+  // update subscriber registrations table for the selected channel only
+
+  var cb = document.getElementById('trackSubsToggle');
+  var enabled = cb && cb.checked;
+
+  var container = document.getElementById('subContainer');
+  if (!enabled) {
+    if (container) container.style.display = "none";
+    return;
+  }
+  if (container) container.style.display = "";
+
+  var systemIdHex = Number(systemId).toString(16).padStart(3, "0"); // lower hex, we'll compare consistently
+
+  var table = document.getElementById("subscribers");
+  if (!table) return;
+
+  // Clear table (keep header row)
+  while (table.rows.length > 1) table.deleteRow(1);
+
+  // If r includes non-objects, ignore them safely
+  var rows = [];
+  var totalReg = 0;
+
+  var rfss = "";
+  var site = "";
+
+  Object.values(r || {}).forEach(function (obj) {
+
+    if (!obj || typeof obj !== "object") return;
+
+    var suid = String(obj.suid || "");
+    if (!suid || suid.length < 8) return;
+
+    var wacn = suid.substring(0, 5).toUpperCase();
+    var sysid = suid.substring(5, 8).toUpperCase();
+
+    // filter to selected system only
+    if (sysid !== systemIdHex.toUpperCase()) return;
+
+    // capture rfss/site for header
+    rfss = (obj.rfss != null ? obj.rfss : rfss);
+    site = (obj.site != null ? obj.site : site);
+
+    var srcaddr = obj.srcaddr;
+    if (srcaddr === 0 || srcaddr === "0") return;
+
+    var aff_ga = obj.aff_ga;
+    if (aff_ga === 0 || aff_ga === "0") return;
+
+    var t = Number(obj.time || 0);
+
+    // time string
+    var dt = new Date(t * 1000);
+    var timeStr = dt.toLocaleTimeString([], {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+
+    // display fields
+    var srctag = (obj.tag != null && obj.tag !== "") ? obj.tag : ('ID: ' + srcaddr);
+    var srctg = (obj.aff_ga_tag != null && obj.aff_ga_tag !== "") ? obj.aff_ga_tag : ('Talkgroup ' + aff_ga);
+
+    var affAgaRaw = obj.aff_aga;
+    var affAgaTag = (obj.aff_aga_tag != null && obj.aff_aga_tag !== "") ? obj.aff_aga_tag : "";
+    var affAgaDisp = (Number(affAgaRaw) === 0) ? "-" : (String(affAgaRaw) + (affAgaTag ? (" " + affAgaTag) : ""));
+
+    totalReg++;
+
+    rows.push({
+      // sort keys
+      time: t,
+      system: wacn + "-" + sysid + "-" + String(rfss) + "-" + String(site),
+      tgid: aff_ga,
+      tgtag: srctg,
+      id: srcaddr,
+      ag: (affAgaRaw == null ? 0 : affAgaRaw),
+
+      // display strings
+      timeStr: timeStr,
+      systemStr: wacn + ' . ' + sysid + ' . ' + rfss + ' . ' + site,
+      tgidStr: String(aff_ga),
+      tgtagStr: srctg,
+      idStr: srctag,
+      agStr: affAgaDisp
+    });
+  });
+
+  // counts
+  var subCountEl = document.getElementById('subCount');
+  if (subCountEl) subCountEl.innerText = totalReg;
+
+  var sysCountEl = document.getElementById('sysCount');
+  if (sysCountEl) {
+    var sysLine = ' on System ' + systemIdHex.toUpperCase();
+    if (rfss !== "" && site !== "") sysLine += ' . ' + rfss + ' . ' + site;
+    sysCountEl.innerText = sysLine;
+  }
+
+  // optional sort (only if user clicked a header)
+  if (subSortKey) {
+    rows.sort(function (a, b) {
+      return subSortDir * cmp(a[subSortKey], b[subSortKey]);
+    });
+  }
+
+  // render
+  rows.forEach(function (r) {
+    var row = table.insertRow(-1);
+
+    row.insertCell(0).textContent = r.timeStr;
+    row.insertCell(1).textContent = r.systemStr;
+    row.insertCell(2).textContent = r.tgidStr;
+
+    var c3 = row.insertCell(3);
+    c3.textContent = r.tgtagStr;
+    c3.style.textAlign = "left";
+
+    row.insertCell(4).textContent = r.idStr;
+
+    var c5 = row.insertCell(5);
+    c5.textContent = r.agStr;
+    c5.style.textAlign = "left";
+  });
+
+  // update ▲▼ indicators after rebuild
+  updateSubSortHeaderIndicators();
+
+  applySmartColorsSubReg();
+  filterSubscribers();
+}
+
+function update_sub_reg_all(d) {
+
+  // update subscriber registrations table for all channels
+
+  var cb = document.getElementById('trackSubsToggle');
+  var enabled = cb && cb.checked;
+  var el = document.getElementById('subContainer');
+
+  if (!enabled) {
+    if (el) el.style.display = "none";
+    return;
+  }
+
+  if (el) el.style.display = "";
+
+  var totalReg = 0;
+  var totalSys = 0;
+
+  var table = document.getElementById("subscribers");
+  if (!table) return;
+
+  // clear old rows (keep header row)
+  while (table.rows.length > 1) table.deleteRow(1);
+
+  // ---- collect rows first (so we can sort) ----
+  var rows = [];
+
+  Object.values(d || {}).forEach(function (s) {
+
+    // s can be a string/number (json_type, nac, etc). Skip those.
+    if (!s || typeof s !== 'object' || !s.wuid_data || typeof s.wuid_data !== 'object') return;
+
+    totalSys++;
+
+    Object.values(s.wuid_data).forEach(function (obj) {
+
+      if (!obj || typeof obj !== 'object') return;
+
+      var suid = String(obj.suid || "");
+      if (!suid || suid.length < 8) return;
+
+      var srcaddr = obj.srcaddr;
+      if (srcaddr === 0 || srcaddr === "0") return; // server sometimes sends 0
+
+      var aff_ga = obj.aff_ga;
+      if (aff_ga === 0 || aff_ga === "0") return;   // server sometimes sends tg 0
+
+      var t = Number(obj.time || 0);
+
+      var wacn  = suid.substring(0, 5).toUpperCase();
+      var sysid = suid.substring(5, 8).toUpperCase();
+
+      // epoch → 24h time
+      var dt = new Date(t * 1000);
+      var timeStr = dt.toLocaleTimeString([], {
+        hour12: false,
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit'
+      });
+
+      // tags
+      var srctg = (obj.aff_ga_tag != null && obj.aff_ga_tag !== "")
+        ? obj.aff_ga_tag
+        : ('Talkgroup ' + aff_ga);
+
+      var affAgaRaw = obj.aff_aga;
+      var affAgaTag = (obj.aff_aga_tag != null && obj.aff_aga_tag !== "") ? obj.aff_aga_tag : "";
+      var affAgaDisp = (Number(affAgaRaw) === 0) ? "-" : (String(affAgaRaw) + (affAgaTag ? (" " + affAgaTag) : ""));
+
+      totalReg++;
+
+      rows.push({
+        // sort keys
+        time: t,
+        system: wacn + "-" + sysid,
+        tgid: aff_ga,
+        tgtag: srctg,
+        id: srcaddr,
+        ag: (affAgaRaw == null ? 0 : affAgaRaw),
+
+        // display values
+        timeStr: timeStr,
+        systemStr: wacn + "-" + sysid,
+        tgidStr: String(aff_ga),
+        tgtagStr: srctg,
+        idStr: 'ID: ' + srcaddr,
+        agStr: affAgaDisp
+      });
+    });
+  });
+
+  // ---- optional sort (only if user clicked a header) ----
+  if (subSortKey) {
+    rows.sort(function(a, b) {
+      var av = a[subSortKey];
+      var bv = b[subSortKey];
+      return subSortDir * cmp(av, bv);
+    });
+  }
+
+  // ---- render ----
+  rows.forEach(function(r) {
+    var row = table.insertRow(-1);
+
+    row.insertCell(0).textContent = r.timeStr;
+    row.insertCell(1).textContent = r.systemStr;
+    row.insertCell(2).textContent = r.tgidStr;
+    row.insertCell(3).textContent = r.tgtagStr;
+    row.insertCell(4).textContent = r.idStr;
+    row.insertCell(5).textContent = r.agStr;
+
+    // align left for cols 3 and 5 (like you wanted previously)
+    row.cells[3].style.textAlign = "left";
+    row.cells[5].style.textAlign = "left";
+  });
+
+  // counts
+  var subCount = document.getElementById('subCount');
+  if (subCount) subCount.innerText = totalReg;
+
+  var sysCount = document.getElementById('sysCount');
+  if (sysCount) {
+    var label = totalSys === 1 ? 'System' : 'Systems';
+    sysCount.innerText = ' on ' + totalSys + ' ' + label;
+  }
+
+  // keep header arrows correct after rebuild
+  updateSubSortHeaderIndicators();
+
+  applySmartColorsSubReg();
+  filterSubscribers();
+}
+
+function cleanStr(v) {
+  return (v == null) ? "" : String(v).trim();
+}
+
+function hasValue(v) {
+  return cleanStr(v).length > 0;
+}
+
+function sysHex3(sysid) {
+  // sysid may arrive as number or string
+  var n = Number(sysid);
+  if (!Number.isFinite(n)) return cleanStr(sysid).toUpperCase(); // fallback
+  return n.toString(16).toUpperCase().padStart(3, "0");
+}
+
+function rememberTag(sysidHex, tgid, tagFromServer) {
+
+  if (!hasValue(sysidHex) || !hasValue(tgid)) return;
+
+  var sys = String(sysidHex).toUpperCase();
+  var tg  = String(tgid);
+
+  if (!TG_TAG_CACHE[sys]) TG_TAG_CACHE[sys] = {};
+  if (!TG_TAG_CACHE[sys][tg] || typeof TG_TAG_CACHE[sys][tg] !== "object") {
+    TG_TAG_CACHE[sys][tg] = { tag: "", hits: 0 };
+  }
+
+  // always count the hit
+  TG_TAG_CACHE[sys][tg].hits++;
+
+  // only store tag if it came from server and is non-empty AND not a placeholder
+  if (hasValue(tagFromServer) && typeof tagFromServer === "string") {
+    var t = cleanStr(tagFromServer);
+    if (t && !/^Talkgroup\s+\d+$/i.test(t)) {
+      TG_TAG_CACHE[sys][tg].tag = t; // override placeholder/blank with real tag
+    }
+  }
+}
+
+function bestTag(sysidHex, tgid, tagFromServer, fallback) {
+  // Prefer server tag if it’s a real string
+  var serverTag = tagToString(tagFromServer);
+  if (serverTag) return serverTag;
+
+  // Next: cache (if you have it)
+  var cached = (TG_TAG_CACHE && TG_TAG_CACHE[sysidHex]) ? TG_TAG_CACHE[sysidHex][String(tgid)] : "";
+  cached = tagToString(cached);
+  if (cached) return cached;
+
+  // Finally: fallback (string)
+  return tagToString(fallback);
+}
+
+// additional system info: wacn, sysID, rfss, site id, secondary control channels, freq error
+
+function trunk_update(d) {
+
+    var do_hex = {"syid":0, "sysid":0, "wacn": 0};
+    var do_float = {"rxchan":0, "txchan":0};
+    var srcaddr = 0;
+    var encrypted = 0;
+    var html = "";
+
+    if (d['nac'] != undefined)
+        c_nac = d['nac']
+
+	var subMode = document.getElementById("subMode").value;
+	// "all" or "selected"
+
+	if (subMode === "all")
+		update_sub_reg_all(d);
+
+    for (var nac in d) {
+        if (!is_digit(nac.charAt(0)))
+            continue;
+
+        // If 'system' name is defined, use it to correlate system info with channel currently selected
+        // used by multi_rx.py trunking
+        if (d[nac]['system'] != undefined) {
+            if (d[nac]['system'] != c_system) {
+                continue;
+            }
+            else {
+                c_nac = d['nac'];
+            }
+        }
+        // Otherwise use c_nac which is derived from "current_nac" parameter in 'change_freq' message
+        // used by legacy rx.py trunking
+        else if (nac != c_nac) {
+            continue;
+        }
+        
+		if (subMode === "selected")
+			update_sub_reg(d[nac]['wuid_data'],d[nac]['sysid']);      
+
+
+        var is_p25 = (d[nac]['type'] == 'p25');
+        var is_smartnet = (d[nac]['type'] == 'smartnet');
+        
+// system information and frequencies table
+
+		const band_plan = d[nac]?.band_plan || {};
+
+		var displaySystemName = d[nac]['system'] !== undefined ? d[nac]['system'] : "-";
+		var topLine = d[nac]['top_line'] !== undefined ? d[nac]['top_line'] : "-";
+		var displayCallSign = d[nac]['callsign'] !== undefined ? d[nac]['callsign'] : "-";
+		var totalTsbk = topLine !== "-" ? comma(extractLastNumber(topLine)) : "-";
+		var tsbkTime = d[nac]['last_tsbk'] !== undefined ? d[nac]['last_tsbk'] : "-";
+		var displayWacn = d[nac]['wacn'] !== undefined ? d[nac]['wacn'] : "-";
+		var displayNac = d[nac]['nac'] !== undefined ? d[nac]['nac'] : "-";
+		var displaySystemId = d[nac]['sysid'] !== undefined ? d[nac]['sysid'] : "-";
+		var displayType = d[nac]['type'] !== undefined ? d[nac]['type'] : "-";
+		var displayRfss = d[nac]['rfid'] !== undefined ? d[nac]['rfid'] : "-";
+		var displaySiteId = d[nac]['stid'] !== undefined ? d[nac]['stid'] : "-";		
+		var displaySiteName = getSiteAlias(displaySystemName, displayRfss, displaySiteId);		
+// 		var displaySiteName = getSiteAlias(hex(displaySystemId), displayRfss, displaySiteId);
+
+		
+		if (!displaySiteName.startsWith("Site ")) {
+			displaySiteName = `Site ${displaySiteId}: ${displaySiteName}`;
+		}
+		
+		if (displayCallSign.length < 2)
+			displayCallSign = "-";
+		
+		
+		// this HTML is used in new UI
+		
+        html = "<table class='compact-table'>";
+        
+        html += "<tr><th colspan=99 class='th-section'>" + displaySiteName + "</th></tr>";
+    
+
+		// System Information table (above frequency display)
+		// removed error, placed in channel update block 		  { label: "Error", value: `${error_val} Hz` },
+		const trunkFields = [
+		  { label: "Callsign", value: hex(displayCallSign) },
+		  { label: "Type", value: hex(displayType) },
+		  { label: "System ID", value: "0x" + hex(displaySystemId) },
+		  { label: "WACN", value: "0x" + hex(displayWacn) },
+		  { label: "NAC", value: "0x" + hex(displayNac) },
+		  { label: "RFSS", value: displayRfss },
+		  { label: "Site", value: displaySiteId },
+		  { label: "TSBK", value: totalTsbk },
+		  { label: "Last TSBK", value: getTime(tsbkTime), colspan: 2 }
+		];
+		
+		let htmlParts = ["<tr>"];
+		
+		trunkFields.forEach(field => {
+		  const colspan = field.colspan ? ` colspan="${field.colspan}"` : "";
+		  htmlParts.push(
+			`<td style="text-align:center;"${colspan}><span class="trunk-label">${field.label}</span><br><span class="trunk-value">${field.value}</span></td>`
+		  );
+		});
+
+		html += htmlParts.join("");
+        html += "</tr></table>"
+   
+    	// HTML for frequency table
+
+		// Band Plan - only supported on P25 currently
+
+		const showBp = document.getElementById('showBandPlan').checked;
+		
+			if (is_p25 && showBp) { 
+			    	
+				html += "<table id='bandPlan' class='compact-table'>";
+			
+				html += '<thead><tr><th>ID</th><th>Type</th><th>Frequency</th><th>Tx Offset (MHz)</th><th>Spacing (kHz)</th><th>Slots</th></tr></thead>';
+				html += '<tbody>';
+				
+				for (const [chanId, bp] of Object.entries(band_plan)) {
+					const frequency = bp.frequency !== undefined ? (parseInt(bp.frequency) / 1000000.0).toFixed(6) : '-';
+					const offset = bp.offset !== undefined ? (parseInt(bp.offset) / 1000000.0).toFixed(3)  : '-';
+					const step = bp.step !== undefined ? bp.step / 1000 : '-';
+					const mode = bp.tdma !== undefined ? bp.tdma : '1';
+					const type = mode > 1 ? "TDMA" : "FDMA";
+					
+				
+					html += '<tr>';
+					html += `<td>${chanId}</td>`;
+					html += `<td>${type}</td>`;				
+					html += `<td>${frequency}</td>`;
+					html += `<td>${offset}</td>`;
+					html += `<td>${step}</td>`;
+					html += `<td>${mode}</td>`;
+					html += '</tr>';
+				}
+				
+				html += '</tbody></table>';    	
+    		
+    		} // end is_p25
+    		
+    	// End Band Plan
+    
+        html += "<div class=\"info\"><div class=\"system\">";
+        html += "<table id='frequencyTable' class='compact-table'>";
+        html += "<colgroup>";
+        html += "<col span=\"1\" style=\"width:20%;\">";
+        html += "<col span=\"1\" style=\"width:12.5%;\">";
+        html += "<col span=\"1\" style=\"width:20%;\">";
+        html += "<col span=\"1\" style=\"width:20%;\">";
+        html += "<col span=\"1\" style=\"width:15%;\">";
+        html += "<col span=\"1\" style=\"width:12.5%;\">";
+        html += "</colgroup>";
+        html += "<tr><th>Frequency</th><th>Last</th><th colspan=2>Active Talkgroup ID</th><th>Mode</th><th>Voice Count</th></tr>";
+        
+        var radioIdFreqTable = document.getElementById('radioIdFreqTable').checked;
+                
+        for (var freq in d[nac]['frequency_data']) {
+        
+            chan_type = d[nac]['frequency_data'][freq]['type'];
+            last_activity = d[nac]['frequency_data'][freq]['last_activity'];
+            tg1 = d[nac]['frequency_data'][freq]['tgids'][0];
+            tg2 = d[nac]['frequency_data'][freq]['tgids'][1];
+            
+            
+        
+// 			
+// 			let tag1 = (tg1 != null && tg1 !== "")
+// 			  ? (d[nac]?.frequency_data?.[freq]?.tags?.[0] || `Talkgroup[0] ${tg1}`)
+// 			  : " ";
+// 			
+// 			let tag2 = (tg2 != null && tg2 !== "")
+// 			  ? (d[nac]?.frequency_data?.[freq]?.tags?.[1] || `Talkgroup[1] ${tg2}`)
+// 			  : " ";
+
+
+			// new method remembers previously seen TG tags and uses those if a tgid shows up without its tag
+			var sysidHex = sysHex3(d[nac]?.sysid);
+			
+			var tg1TagFromServer = d[nac]?.frequency_data?.[freq]?.tags?.[0];
+			var tg2TagFromServer = d[nac]?.frequency_data?.[freq]?.tags?.[1];
+			
+			var tag1 = hasValue(tg1)
+			  ? bestTag(sysidHex, tg1, tg1TagFromServer, `Talkgroup ${tg1}`)
+			  : "";
+			
+			var tag2 = hasValue(tg2)
+			  ? bestTag(sysidHex, tg2, tg2TagFromServer, "Talkgroup " + tg2)
+			  : "";
+			
+			if (tag1 === "" && tg1TagFromServer && typeof tg1TagFromServer === "object") {
+			  console.warn("tg1TagFromServer was object; ignored:", tg1TagFromServer);
+			}
+
+
+			if (tag2 === "" && tg2TagFromServer && typeof tg2TagFromServer === "object") {
+			  console.warn("tg2TagFromServer was object; ignored:", tg2TagFromServer);
+			}
+
+			if (hasValue(tg1)) {
+			  rememberTag(sysidHex, tg1, tg1TagFromServer);
+			}
+
+			if (hasValue(tg2)) {
+			  rememberTag(sysidHex, tg2, tg2TagFromServer);
+			}
+
+			let src1 = null;
+			let src2 = null;
+            if (d[nac]['frequency_data'][freq]['srcaddrs'] != undefined) {	// srcaddrs not sent by smartnet systems
+				src1 = d[nac]['frequency_data'][freq]['srcaddrs'][0];
+				src2 = d[nac]['frequency_data'][freq]['srcaddrs'][1];
+			}
+            
+			let srctag1 = null;
+			let srctag2 = null;
+            if (d[nac]['frequency_data'][freq]['srctags'] != undefined) {   // srctags not sent by smartnet systems
+				srctag1 = d[nac]['frequency_data'][freq]['srctags'][0];
+				srctag2 = d[nac]['frequency_data'][freq]['srctags'][1];
+			}
+
+			let source1 =
+			  (srctag1 != null && String(srctag1).trim() !== "")
+				? srctag1
+				: (src1 != null && String(src1).trim() !== "" && Number(src1) !== 0)
+					? `ID: ${src1}`
+					: null;
+
+			let source2 =
+			  (srctag2 != null && String(srctag2).trim() !== "")
+				? srctag2
+				: (src2 != null && String(src2).trim() !== "" && Number(src2) !== 0)
+					? `ID: ${src2}`
+					: null;
+			
+			dispSrc1 = (source1 == null) ? "-" : source1;
+			dispSrc2 = (source2 == null) ? "-" : source2;
+			
+			if (radioIdFreqTable) {
+				var contentId1 = "<br>" + dispSrc1 + "</td>";
+				var contentId2 = "<br>" + dispSrc2 + "</td>";
+			} else {
+				var contentId1 = "</td>";
+				var contentId2 = "</td>";						
+			}
+
+            mode = d[nac]['frequency_data'][freq]['mode'];
+            count = d[nac]['frequency_data'][freq]['counter'];
+            			
+            var mode_str = "<td></td>"
+            
+            // Do alternate first because active TGs will deliberately overwrite the mode
+            if (chan_type == 'alternate') {
+                if (is_p25)
+                    mode_str = "<td style=\"text-align:center;\">Sec CC</td>"
+                else if (is_smartnet)
+                    mode_str = "<td style=\"text-align:center;\">Alt CC</td>"
+                else
+                    mode_str = "<td style=\"text-align:center;\">Alt CC</td>"
+            }
+
+            var achMode = "-";  // not used right now
+            
+            // Now actually handle the appropriate channel type if not alternate
+            if (chan_type == 'control') {
+                tg_str = "<td style=\"text-align:center; color:gray;\" colspan=2>Control</td>";
+                // Deliberately 6 or 8 characters wide, to ensure the column stays the right width without flickering
+                // when call status flags come and go with calls
+                if (is_p25)
+                    mode_str = "<td style=\"text-align:center;\">&nbsp;&nbsp;CC&nbsp;&nbsp;</td>"
+                else if (is_smartnet)
+                    mode_str = "<td style=\"text-align:center;\">&nbsp;&nbsp;&nbsp;CC&nbsp;&nbsp;&nbsp;</td>"
+                else
+                    mode_str = "<td style=\"text-align:center;\">CC</td>"
+                count = "";
+            }
+            else {
+                if (is_smartnet && (tg1 != null || tg2 != null))
+                    mode_str = "<td style=\"text-align:center;\">" + mode + "</td>"
+
+                if (tg1 == null && tg2 == null) {
+                    tg_str = "<td style=\"text-align:center;\" colspan=2>&nbsp&nbsp-&nbsp&nbsp</td>";
+                }
+                else if (tg1 == tg2) {
+                    if (is_p25) {
+                        mode_str = "<td style=\"text-align:center;\">FDMA</td>";
+                        mode_str = "<td style=\"text-align:center;\">FDMA</td>";
+                        achMode = "FDMA";
+                    }
+                    if (tag1 != null && tag1 != "")
+						tg_str = "<td style=\"text-align:center;white-space: nowrap;\" colspan=2>" + tag1.substring(0, MAX_TG_CHARS) + contentId1;
+					else
+						tg_str = "<td style=\"text-align:center;white-space: nowrap;\" colspan=2>" + tg1;
+                    
+                }
+                else {
+                    if (is_p25) {
+                        mode_str = "<td style=\"text-align:center;\">TDMA</td>";
+                        achMode = "TDMA";
+					}                    
+                    if (tg1 == null)
+                        tg1 = " - ";
+                    if (tg2 == null)
+                        tg2 = " - ";
+                    //tg_str = "<td style=\"text-align:center;white-space: nowrap;\">" + tg1 + " &nbsp; " + tag1.substring(0, MAX_TG_CHARS) + contentId1 + "<td style=\"text-align:center;white-space: nowrap;\">" + tg2 + " &nbsp; " + tag2.substring(0, MAX_TG_CHARS) + contentId2;
+                    tg_str = "<td style=\"text-align:center;white-space: nowrap;\">" + tag1.substring(0, MAX_TG_CHARS) + contentId1 + "<td style=\"text-align:center;white-space: nowrap;\">" + tag2.substring(0, MAX_TG_CHARS) + contentId2;
+                }
+            }
+
+			// Append Call History
+        	if (d[nac]['sysid'] !== undefined && (tg1 !== undefined || tg2 !== undefined)) {
+
+				appendCallHistory(d[nac]['sysid'], tg1, tg2, tag1, tag2, (parseInt(freq) / 1000000.0).toFixed(6), source1, source2, "frequency");
+			}          
+
+            html += "<tr>";
+            html += "<td class='freqData'>" + (parseInt(freq) / 1000000.0).toFixed(6) + "</td>";
+
+            html += "<td style=\"text-align:center;\">" + last_activity + "</td>";
+            html += tg_str;
+            html += mode_str;
+            html += "<td style=\"text-align:right;\">" + comma(count) + "</td>";
+            html += "</tr>";
+        }
+        
+        html += "</table></div>";
+
+		document.getElementById("frequenciesTable").innerHTML = html; 
+		
+		
+		if (radioIdFreqTable) {
+			document.querySelectorAll('td.freqData').forEach(td => {
+			  td.style.height = '46px';  // make the row height tall enough for 2 rows of text, avoids the ui bounding up and down
+			});
+		} else {
+			document.querySelectorAll('td.freqData').forEach(td => {
+			  td.style.height = '';
+			});
+		}
+
+		// finish up
+		
+		applySmartColorsToFrequencyTable();		
+        patches(d[nac]);
+        adjacent_sites(d[nac]);
+        
+    }
+
+
+    if (d['srcaddr'] != undefined)
+        c_srcaddr = d['srcaddr']
+    if (d['grpaddr'] != undefined)
+        c_grpaddr = d['grpaddr']
+    if (d['encrypted'] != undefined)
+        c_encrypted = d['encrypted']
+    if (d['emergency'] != undefined)
+        c_emergency = d['emergency']
+
+    channel_status();
+    
+}  // end trunk_update() - system freqencies table
+
+function plot(d) {
+    //TODO: implement local plot rendering using json data
+}
+
+function call_log(d) {
+
+	// appends call history table when call history source is Voice Grant (Python)
+
+	const configuredSource = document.getElementById("callHistorySource").value;
+	if (configuredSource !== "voice") {
+	  return;
+	}
+	
+	if (d['log'].length == 0)
+		return;   		// nothing to do
+	
+	const logs = d['log'];
+
+	const titleTh = document.getElementById("callHistoryTableTitle");
+	titleTh.innerText = "Call History - Voice Grants";
+	
+	const tableBody = document.getElementById("callHistoryBody");
+	
+		logs.forEach(log => {
+			// Convert epoch time to Date
+			const dateObj = new Date(log.time * 1000);
+		
+			// Format to HH:MM:SS
+			const hh = String(dateObj.getHours()).padStart(2, '0');
+			const mm = String(dateObj.getMinutes()).padStart(2, '0');
+			const ss = String(dateObj.getSeconds()).padStart(2, '0');
+			const time = `${hh}:${mm}:${ss}`;
+		
+			// Assign remaining fields to variables
+			const sysid = (log.sysid != null ? log.sysid : 0).toString(16).toUpperCase().padStart(3, '0');
+			const tgid = log.tgid;
+			const tgtag = log.tgtag;
+			  var rid = log.rid;
+			const rtag = log.rtag;
+			const rcvr = log.rcvr;
+			const prio = log.prio;
+			const rcvrtag = log.rcvrtag.substring(0, 10) || "";
+			const freq = (log.freq / 1000000.0).toFixed(6);
+			  var slot = log.slot;
+				
+			if (rid == 0)
+				return;  // srcaddr not yet known; a follow-up log entry with the real ID will arrive
+
+			const logKey = sysid + "|" + tgid + "|" + rid;
+			const nowMs = Date.now();
+			const ttlMs = (Number(MAX_HISTORY_SECONDS) || 5) * 1000;
+			if (callLogSeen.has(logKey) && (nowMs - callLogSeen.get(logKey)) <= ttlMs)
+				return;
+			callLogSeen.set(logKey, nowMs);
+
+			displayRtag = (rtag !== "") ? rtag : "ID: " + rid;
+			displayTtag = (tgtag !== "") ? tgtag : "Talkgroup " + tgid;
+			
+			if (slot == null)
+				slot = "-";
+			
+			displayReceiver = freq + " &nbsp;&nbsp;<font color=#aaa>" + rcvr + ": " + rcvrtag + "</font> &nbsp;&nbsp;S" + slot + "<font color=#aaa> &nbsp;&nbsp;P" + prio;			
+			
+			const newRow = document.createElement("tr");
+			newRow.innerHTML = `
+				<td>${time}</td>
+				<td>${sysid}</td>
+				<td>${displayReceiver} &nbsp;&nbsp;</td>
+				<td>${tgid}</td>
+				<td style="text-align: left;">${displayTtag}</td>
+				<td style="text-align: left;">${displayRtag}</td>
+			`;
+			
+			tableBody.insertBefore(newRow, tableBody.firstChild);
+			
+		});
+	
+	applySmartColorsToCallHistory();
+	
+	const table = document.getElementById("callHistoryContainer");
+	
+	if (table) {
+	  const headerRow = table.querySelector("thead tr");
+	  if (headerRow && headerRow.cells.length > 2) {
+		headerRow.cells[2].innerText = "Frequency / Receiver / Slot / Prio";
+	  }
+	}
+	
+	return;
+	
+}  // end call_log
+
+function handle_response(dl) {
+	
+    const dispatch = {
+        call_log: call_log,
+        trunk_update: trunk_update,
+        change_freq: change_freq,
+        channel_update: channel_update,
+        rx_update: rx_update,
+        terminal_config: term_config,
+        plot: plot,
+        full_config: full_config,
+        ws_instances: ws_instances
+    };
+
+    for (let i = 0; i < dl.length; i++) {
+        const d = dl[i];
+        if (!("json_type" in d)) continue;
+        if (!(d.json_type in dispatch)) continue;
+        dispatch[d.json_type](d);
+    }
+}
+
+function do_update() {
+
+	if (smartColors == undefined) {
+		smartColors = [];
+		console.log('smartColors was found undefined in do_update()');		
+	}
+
+	
+    if (channel_list.length == 0) {
+        send_command("update", 0, 0);
+
+        if (smartColors.length == 0)
+        	send_command("get_terminal_config", 0, 0);
+        
+    }
+    else {
+        send_command("update", 0, Number(channel_list[channel_index]));
+        if (smartColors.length == 0)
+        	send_command("get_terminal_config", 0, 0);
+    }
+    f_debug();
+}
+
+function send_command(command, arg1 = 0, arg2 = 0) {
+
+    request_count += 1;
+    if (send_queue.length >= SEND_QLIMIT) {
+        send_qfull += 1;
+        send_queue.unshift();
+    }
+    send_queue.push( {"command": command, "arg1": arg1, "arg2": arg2} );
+    send_process();
+}
+
+async function send_process() {
+    const cmd = JSON.stringify(send_queue);
+    send_queue = [];  // Clear the queue immediately
+
+    const wbox = document.getElementById('warning-box');
+    const wtxt = document.getElementById('warning-text');
+
+    try {
+        const response = await fetch("/", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: cmd
+        });
+
+        if (!response.ok) {
+            http_errors += 1;
+            wbox.style.display = "flex";
+            wtxt.innerText = "HTTP Error: " + response.status;
+            console.error("HTTP Error:", response.status, response.statusText);
+            return;
+        }
+
+        http_ok += 1;
+
+        const dl = await response.json();
+        if (!dl) return;
+
+        wbox.style.display = "none";
+
+        try {
+            handle_response(dl);
+        } catch (err) {
+        	console.error("err: " + err);
+            console.error("Error inside handle_response():", err.stack || err);
+        }
+
+    } catch (error) {
+        fetch_errors += 1;
+        wbox.style.display = "flex";
+        wtxt.innerText = "Fetch Error: " + (error.message || error);
+        console.error("Fetch Exception Details:", error.stack || error);
+    }
+}
+
+function f_chan_button(command) {
+    channel_index += command;
+    if (channel_index < 0) {
+        channel_index = channel_list.length - 1;
+    }
+    else if (channel_index >= channel_list.length) {
+        channel_index = 0;
+    }
+}
+
+function select_channel_by_id(ch_id) {
+    var idx = channel_list.indexOf(String(ch_id));
+    if (idx >= 0) {
+        channel_index = idx;
+    }
+}
+
+function toggle_auto_focus() {
+    auto_focus = !auto_focus;
+    update_auto_btn();
+}
+
+function update_auto_btn() {
+    var btn = document.getElementById('btn-auto-focus');
+    if (!btn) return;
+    if (auto_focus) {
+        btn.textContent = 'AUTO FOCUS: on';
+        btn.style.color = '';
+    } else {
+        btn.textContent = 'AUTO FOCUS: off';
+        btn.style.color = '#f80';
+    }
+}
+
+function f_dump_button(command) {
+    send_command('dump_tgids', 0, Number(channel_list[channel_index]));
+    send_command('dump_tracking', 0, Number(channel_list[channel_index]));
+}
+
+function f_dump_buffer(command) {
+    send_command('dump_buffer', command, Number(channel_list[channel_index]));
+    alert("OP25 buffers written to server")
+}
+
+function f_cap_button(command) {
+    send_command('capture', 0, Number(channel_list[channel_index]));
+}
+
+function f_tune_button(command) {
+
+	let step = 0;
+	
+	switch (command) {
+	  case "ld": // large down
+		_tune = -lg_step;
+		break;
+	  case "sd": // small down
+		_tune = -sm_step;
+		break;
+	  case "su": // small up
+		_tune = sm_step;
+		break;
+	  case "lu": // large up
+		_tune = lg_step;
+		break;
+	  default:
+		console.warn("Unknown tune command:", command);
+		_tune = 0;
+	}
+
+    if (channel_list.length == 0) {
+        send_command('adj_tune', _tune, 0);
+    }
+    else {
+        send_command('adj_tune', _tune, Number(channel_list[channel_index]));
+    }
+}
+
+function f_plot_button(command) {
+    if (channel_list.length == 0) {
+        send_command('toggle_plot', command, 0);
+    }
+    else {
+        send_command('toggle_plot', command, Number(channel_list[channel_index]));
+    }
+    
+    updatePlotButtonStyles();
+}
+
+function f_preset(i) {
+
+	const preset = newPresets.find(p => p.id === i);
+	
+	if (!preset) {
+		console.warn(`No preset found for ID ${i}`);
+		return;
+	}
+
+	const command = "hold";
+
+	_tgid = preset.tgid;
+
+	if (isNaN(_tgid) || (_tgid < 0) || (_tgid > 65535))
+		_tgid = 0;
+
+    if (channel_list.length == 0) {
+        send_command(command, _tgid);
+    } else {
+        send_command(command, _tgid, Number(channel_list[channel_index]));
+    }
+}
+
+function f_scan_button(command) {
+
+    var _tgid = 0;
+
+    if (command == "goto") {
+
+        command = "hold"
+        if (current_tgid != null)
+           _tgid = current_tgid;
+        _tgid = parseInt(prompt("Enter tgid to hold", _tgid));
+            
+        if (isNaN(_tgid) || (_tgid < 0) || (_tgid > 65535))
+            _tgid = 0;
+    }
+    
+    else if ((command == "lockout") && (current_tgid == null)) {
+        _tgid = parseInt(prompt("Enter tgid to blacklist", _tgid));
+        if (isNaN(_tgid) || (_tgid <= 0) || (_tgid > 65534))
+            return;
+    }
+    else if (command == "whitelist") {
+        _tgid = parseInt(prompt("Enter tgid to whitelist", _tgid));
+        if (isNaN(_tgid) || (_tgid <= 0) || (_tgid > 65534))
+            return;
+    }
+    else if (command == "set_debug") {
+        _tgid = parseInt(prompt("Enter logging level", _tgid));
+        if (isNaN(_tgid) || (_tgid < 0) )
+            return;
+    }
+
+    if (channel_list.length == 0) {
+    
+       	if (command == "hold" && _tgid != 0)             
+    		send_command("whitelist", _tgid);
+    
+        send_command(command, _tgid);
+    }
+    else {
+    
+    	if (command == "hold" && _tgid != 0)
+    		send_command("whitelist", _tgid, Number(channel_list[channel_index]));
+
+        send_command(command, _tgid, Number(channel_list[channel_index]));
+    }
+}
+
+function f_debug() {
+	if (!d_debug) return;
+	
+	var html = "Requests from send_command: " + request_count;
+	html += "<br>HTTP 200 OK: " + http_ok;
+	html += "&nbsp;&nbsp;&nbsp;&nbsp;HTTP Errors: " + http_errors;
+	html += "<br>Fetch Errors: " + fetch_errors;
+	html += "<br>Send Queue Size " + send_queue.length;
+	html += "&nbsp;&nbsp;&nbsp;&nbsp;Queue Full " + send_qfull;	
+	html += "<br>";
+	var div_debug = document.getElementById("div_debug");
+	div_debug.innerHTML = html;
+}
+
+function comma(x) {
+    // add comma formatting to whatever you give it (xx,xxxx,xxxx)
+    return x.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function getTime(ts) {
+    const date = new Date(ts * 1000); // convert to milliseconds
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    const seconds = String(date.getSeconds()).padStart(2, '0');
+    return `${hours}:${minutes}:${seconds}`;
+}
+
+function extractLastNumber(str) {
+    const match = str.match(/(\d+)(?!.*\d)/);
+    return match ? parseInt(match[0], 10) : null;
+}
+
+function appendCallHistory(sysid, tg1, tg2, tag1, tag2, freq, sourceId1, sourceId2, dataSource) {
+  // dataSource is one of 'frequency' or 'voice'
+
+  var configuredSourceEl = document.getElementById("callHistorySource");
+  var configuredSource = configuredSourceEl ? configuredSourceEl.value : "";
+  if (dataSource !== configuredSource) return;
+
+  // title the call history table
+  var titleTh = document.getElementById("callHistoryTableTitle");
+  if (titleTh) {
+    if (configuredSource === "display") titleTh.innerText = "Call History - Display";
+    else if (configuredSource === "frequency") titleTh.innerText = "Call History - Frequency Data";
+    else titleTh.innerText = "Call History";
+  }
+
+  var tableBody = document.getElementById("callHistoryBody");
+  if (!tableBody) return;
+
+  var now = new Date();
+  var timestamp = now.toTimeString().split(" ")[0]; // "HH:MM:SS"
+  var epochMs = now.getTime();
+
+  // Normalize sysid -> 3-digit hex
+  var sysNum = Number(sysid);
+
+  var sysHex = (!isNaN(sysNum) && sysid !== null && sysid !== "")
+    ? sysNum.toString(16).toUpperCase().padStart(3, "0")
+    : "-";
+    
+  // helpers
+  function cleanStr(v) {
+    if (v === undefined || v === null) return "";
+    return String(v).trim();
+  }
+
+  function hasValue(v) {
+    return cleanStr(v).length > 0;
+  }
+
+  function makeKey(tgid, sourceId) {
+    // include freq to avoid TDMA/dual-path collisions across freqs
+    // add slot later if you have it: `${sysHex}|${freq}|${slot}|${tg}|${src}`
+    return sysHex + "|" + cleanStr(freq) + "|" + cleanStr(tgid) + "|" + cleanStr(sourceId);
+  }
+
+  function isDuplicate(tgid, sourceId) {
+    var key = makeKey(tgid, sourceId);
+    var last = callHistorySeen.get(key);
+    if (!last) return false;
+
+    // MAX_HISTORY_SECONDS assumed global; store in ms
+    var ttlMs = (Number(MAX_HISTORY_SECONDS) || 5) * 1000;
+    return (epochMs - last) <= ttlMs;
+  }
+
+  function markSeen(tgid, sourceId) {
+    callHistorySeen.set(makeKey(tgid, sourceId), epochMs);
+
+    // Optional: prevent unbounded growth
+    // If you want, prune occasionally:
+    if (callHistorySeen.size > 5000) {
+      // cheap prune: clear all (or implement better pruning)
+      // callHistorySeen.clear();
+    }
+  }
+
+  function addRow(tgid, tag, sourceId, source) {
+    var tgStr = cleanStr(tgid);
+    var srcStr = cleanStr(sourceId);
+    if (!tgStr || !srcStr) {
+      // don’t append blanks
+      return;
+    }
+
+    var tgName = hasValue(tag) ? cleanStr(tag) : ("Talkgroup " + tgStr);
+
+    var newRow = document.createElement("tr");
+    newRow.innerHTML =
+      "<td>" + timestamp + "</td>" +
+      "<td>" + sysHex + "</td>" +
+      "<td>" + cleanStr(freq) + "</td>" +
+      "<td>" + tgStr + "</td>" +
+      "<td style=\"text-align:left;\">" + tgName + "</td>" +
+      "<td style=\"text-align:left;\">" + srcStr + "</td>";
+
+    tableBody.insertBefore(newRow, tableBody.firstChild);
+
+    // cap rows (assumes MAX_HISTORY_ROWS global)
+    var maxRows = Number(MAX_HISTORY_ROWS) || 200;
+    while (tableBody.rows.length > maxRows) {
+      tableBody.deleteRow(tableBody.rows.length - 1);
+    }
+  }
+
+function processLeg(tg, tag, src, method) {
+
+  if (!hasValue(tg)) {
+//     console.log("processLeg skip: missing tg", {
+//       tg: tg,
+//       tag: tag,
+//       src: src,
+//       method: method
+//     });
+    return;
+  }
+
+  if (!hasValue(src)) {
+//     console.log("processLeg skip: missing src", {
+//       tg: tg,
+//       tag: tag,
+//       src: src,
+//       method: method
+//     });
+    return;
+  }
+
+  // normalize once
+  var tgStr  = cleanStr(tg);
+  var srcStr = cleanStr(src);
+
+  if (isDuplicate(tgStr, srcStr)) {
+//     console.log("processLeg skip: duplicate", {
+//       tg: tgStr,
+//       src: srcStr,
+//       method: method
+//     });
+    return;
+  }
+
+// 
+//   console.log("processLeg addRow", {
+//     tg: tgStr,
+//     tag: tag,
+//     src: srcStr,
+//     method: method
+//   });
+
+  addRow(tgStr, tag, srcStr, method);
+  markSeen(tgStr, srcStr);
+}
+
+  processLeg(tg1, tag1, sourceId1, "tg1");
+  if (String(tg2) !== String(tg1)) processLeg(tg2, tag2, sourceId2, "tg2");
+
+
+  applySmartColorsToCallHistory();
+
+  filterCallHistgory();
+
+  // Header label tweak
+  var table = document.getElementById("callHistoryContainer");
+  if (table) {
+    var headerRow = table.querySelector("thead tr");
+    if (headerRow && headerRow.cells.length > 2) {
+      headerRow.cells[2].innerText = "Frequency";
+    }
+  }
+}
+
+function applySmartColorsToChannels() {
+  if (!document.getElementById("smartColorToggle").checked) return;
+  if (smartColors.length == 0) return;
+
+  const rows = document.querySelectorAll("#channels-container tbody tr");
+
+  rows.forEach(row => {
+    const cells = row.querySelectorAll("td");
+    if (cells.length < 6) return; // make sure column 5 exists
+
+    const talkgroupCell = cells[5];
+    const cellText = talkgroupCell.textContent.toLowerCase();
+
+    let matched = false;
+
+    for (const colorGroup of smartColors) {
+      if (colorGroup.keywords.some(keyword => cellText.includes(keyword.toLowerCase()))) {
+        talkgroupCell.style.color = colorGroup.color;
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      talkgroupCell.style.color = "";
+    }
+  });
+} // end applySmartColorsToChannels
+
+function applySmartColorsSubReg() {
+  if (!document.getElementById("smartColorToggle").checked) return;
+  if (smartColors.length == 0) return;
+  
+  const rows = document.querySelectorAll("#subscribers tr");
+
+  rows.forEach(row => {
+    const cells = row.querySelectorAll("td");
+    if (cells.length < 5) return;
+
+    const tgidCell = cells[2];
+    const tgTagCell = cells[3];
+    const sourceCell = cells[4];
+    
+
+    const cellText = tgTagCell.textContent.toLowerCase();
+
+    let matched = false;
+
+    for (const colorGroup of smartColors) {
+      if (colorGroup.keywords.some(keyword => cellText.includes(keyword.toLowerCase()))) {
+        tgidCell.style.color = colorGroup.color;
+        sourceCell.style.color = colorGroup.color;
+        tgTagCell.style.color = colorGroup.color;
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      tgidCell.style.color = "";
+      sourceCell.style.color = "";
+      tgTagCell.style.color = "";
+    }
+  });
+} // end applySmartColorsToSubReg
+
+function applySmartColorsSeenTg() {
+  if (!document.getElementById("smartColorToggle").checked) return;
+  if (smartColors.length == 0) return;
+  
+  const rows = document.querySelectorAll("#seenTgTable tr");
+
+  rows.forEach(row => {
+    const cells = row.querySelectorAll("td");
+    if (cells.length < 3) return;
+
+    const tgidCell = cells[1];
+    const tgTagCell = cells[2];
+//     const sourceCell = cells[4];
+    
+
+    const cellText = tgTagCell.textContent.toLowerCase();
+
+    let matched = false;
+
+    for (const colorGroup of smartColors) {
+      if (colorGroup.keywords.some(keyword => cellText.includes(keyword.toLowerCase()))) {
+        tgidCell.style.color = colorGroup.color;
+        tgTagCell.style.color = colorGroup.color;
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      tgidCell.style.color = "";
+      tgTagCell.style.color = "";
+    }
+  });
+} // end applySmartColorsToSubReg
+
+function applySmartColorsToCallHistory() {
+  if (!document.getElementById("smartColorToggle").checked) return;
+  if (smartColors.length == 0) return;
+  
+  const rows = document.querySelectorAll("#callHistoryBody tr");
+
+  rows.forEach(row => {
+    const cells = row.querySelectorAll("td");
+    if (cells.length < 5) return;
+
+    const tgidCell = cells[3];
+    const sourceCell = cells[4];
+    const sourceIdCell = cells[5];
+    
+    const cellText = sourceCell.textContent.toLowerCase();
+
+    let matched = false;
+
+    for (const colorGroup of smartColors) {
+      if (colorGroup.keywords.some(keyword => cellText.includes(keyword.toLowerCase()))) {
+        tgidCell.style.color = colorGroup.color;
+        sourceCell.style.color = colorGroup.color;
+        sourceIdCell.style.color = colorGroup.color;
+        matched = true;
+        break;
+      }
+    }
+
+    if (!matched) {
+      tgidCell.style.color = "";
+      sourceCell.style.color = "";
+      sourceIdCell.style.color = "";
+    }
+  });
+} // end applySmartColorsToCallHistory
+
+function applySmartColorsToFrequencyTable() {
+  if (!document.getElementById("smartColorToggle").checked) return;
+  if (smartColors.length == 0) return;
+
+  const rows = document.querySelectorAll("#frequencyTable tr");
+
+  rows.forEach(row => {
+    const cells = row.querySelectorAll("td");
+    if (cells.length < 3) return;
+
+    const talkgroupCells = [cells[2]];
+    if (cells.length > 3 && cells[3].cellIndex === 3) {
+      talkgroupCells.push(cells[3]);
+    }
+
+    talkgroupCells.forEach(cell => {
+      const fullText = cell.textContent;
+      const firstLine = fullText.split('\n')[0].toLowerCase(); // Only first line for matching
+
+      let matched = false;
+
+      // Skip TDMA/FDMA mode cells
+      if (firstLine === "fdma" || firstLine === "tdma") return;
+
+      for (const colorGroup of smartColors) {
+        if (colorGroup.keywords.some(keyword => firstLine.includes(keyword.toLowerCase()))) {
+          cell.style.color = colorGroup.color;
+          matched = true;
+          break;
+        }
+      }
+
+      if (!matched) {
+        cell.style.color = "";
+      }
+    });
+  });
+} // end applySmartColorsToFrequencyTable
+
+function applySmartColorToTgidSpan() {
+  if (!document.getElementById("smartColorToggle").checked) return;
+  if (smartColors.length == 0) return;
+
+	const el = document.getElementById("displayTalkgroup");
+	if (!el) return;
+	
+	const source = document.getElementById("displaySource");
+
+  const cellText = el.textContent.toLowerCase();
+
+  for (const colorGroup of smartColors) {
+    if (colorGroup.keywords.some(keyword => cellText.includes(keyword.toLowerCase()))) {
+      el.style.color = colorGroup.color;
+      source.style.color = colorGroup.color;
+      return;
+    }
+  }
+
+  el.style.color = "";
+  
+} // end applySmartColorToTgidSpan
+
+function getSiteAlias(sysname, rfss, site) {
+    const sysNameUpper = String(sysname).toUpperCase();  // Normalize sysname to uppercase
+
+    if (!site_alias || Object.keys(site_alias).length === 0) {
+        if (config_cache == null) {
+            send_command('get_full_config');
+        }
+    }
+
+    try {
+        const alias = site_alias?.[sysNameUpper]?.[rfss]?.[site]?.alias;
+        return alias ?? `Site ${site}`;
+    } catch (err) {
+        console.warn("Error looking up site alias:", err);
+        return `Site ${site}`;
+    }
+}
+
+function toggleDivById(divId, buttonId) {
+  const el = document.getElementById(divId);
+  const btn = document.getElementById(buttonId);
+  if (!el || !btn) return;
+
+  const isVisible = el.style.display !== "none";
+
+  if (isVisible) {
+    el.style.display = "none";
+    btn.style.color = ""; // reset to default
+  } else {
+    el.style.display = "";
+    btn.style.color = "red";
+  }
+}
+
+function updatePlotButtonStyles() {
+  // First clear all button borders
+  const buttonIds = ['fft', 'constellation', 'symbol', 'eye', 'mixer', 'fll'];
+  buttonIds.forEach(type => {
+    const btn = document.getElementById(`pb-${type}`);
+    if (btn) btn.classList.remove("plot-active");
+  });
+
+  // Now check each image to see which plots are currently active
+  for (let i = 0; i < 6; i++) {
+    const img = document.getElementById(`img${i}`);
+    if (!img || img.style.display === "none") continue;
+
+    const src = img.getAttribute("src") || "";
+    buttonIds.forEach(type => {
+      if (src.includes(type)) {
+        const btn = document.getElementById(`pb-${type}`);
+        if (btn) btn.classList.add("plot-active");
+      }
+    });
+  }
+}
+
+function isNumber(value) {
+  return typeof value === "number" && !isNaN(value);
+}
+
+function handleColumnLayoutChange(e) {
+  const secondCol = document.getElementById("second-column");
+  if (!secondCol) return;
+
+  if (e.matches) {
+    // 2-column layout active
+    secondCol.style.marginLeft = "10px";
+  } else {
+    // stacked layout (1 column)
+    secondCol.style.marginLeft = "";
+  }
+}
+
+function saveSettingsToLocalStorage() {
+  localStorage.setItem("callHeight", document.getElementById("callHeightControl").value);
+  localStorage.setItem("plotWidth", document.getElementById("plotSizeControl").value);
+  localStorage.setItem("smartColorsToggle", document.getElementById("smartColorToggle").checked);
+  localStorage.setItem("adjacentSitesToggle", document.getElementById("adjacentSitesToggle").checked);
+  localStorage.setItem("callHistorySource", document.getElementById("callHistorySource").value);
+  localStorage.setItem("radioIdFreqTable", document.getElementById("radioIdFreqTable").checked);
+  localStorage.setItem("channelsTableToggle", document.getElementById("channelsTableToggle").checked);
+  localStorage.setItem("valueColor", document.getElementById("valueColorPicker").value);
+  localStorage.setItem("showBandPlan", document.getElementById("showBandPlan").checked);
+  localStorage.setItem("trackSubsToggle", document.getElementById("trackSubsToggle").checked);
+  localStorage.setItem("subMode", document.getElementById("subMode").value);
+  localStorage.setItem("muteAudioAtStartup", document.getElementById("muteAudioAtStartup").checked);
+}  // end saveSettingsToLocalStorage
+
+function loadSettingsFromLocalStorage() {
+	const callHeight = localStorage.getItem("callHeight") || "600";
+	const plotWidth = localStorage.getItem("plotWidth") || "300";
+	const smartColorsToggle = localStorage.getItem("smartColorsToggle");
+	const adjacentSites = localStorage.getItem("adjacentSitesToggle");
+	const callHistorySource = localStorage.getItem("callHistorySource") || "frequency";
+	const radioIdFreqTable = localStorage.getItem("radioIdFreqTable");
+	const channelsTableToggle = localStorage.getItem("channelsTableToggle");
+	const showBandPlan = localStorage.getItem("showBandPlan");
+	const trackSubsToggle = localStorage.getItem("trackSubsToggle");
+	const savedSubMode = localStorage.getItem("subMode");
+	
+	if (savedSubMode !== null) {
+		document.getElementById("subMode").value = savedSubMode;
+	}	
+
+	document.getElementById("trackSubsToggle").checked = trackSubsToggle === "true";	
+	
+	document.getElementById("showBandPlan").checked = showBandPlan === "true";	
+	
+	document.getElementById("radioIdFreqTable").checked = radioIdFreqTable === "true";
+	
+	document.getElementById("callHeightControl").value = callHeight;
+	
+	document.querySelector(".call-history-scroll").style.height = `${callHeight}px`;
+	
+	document.getElementById("plotSizeControl").value = plotWidth;
+	
+	document.querySelectorAll(".plot-image").forEach(img => {
+		img.style.width = `${plotWidth}px`;
+	});
+	
+	const smartColorEnabled = smartColorsToggle === null ? true : smartColorsToggle === "true";
+	document.getElementById("smartColorToggle").checked = smartColorEnabled;
+	
+	const adjacentSitesEnabled = adjacentSites === null ? true : adjacentSites === "true";
+	document.getElementById("adjacentSitesToggle").checked = adjacentSitesEnabled;
+	var container = document.getElementById("adjacentSitesContainer");
+	if (container) {
+		container.style.display = adjacentSitesEnabled ? "" : "none";
+	}
+	
+	document.getElementById("callHistorySource").value = callHistorySource;
+	
+	const channelsEnabled = channelsTableToggle === null ? true : channelsTableToggle === "true";
+	document.getElementById("channelsTableToggle").checked = channelsEnabled;
+	const channelsContainer = document.getElementById("channels-container");
+	if (channelsContainer) {
+	channelsContainer.style.display = channelsEnabled ? "" : "none";
+	}
+	
+	const valueColor = localStorage.getItem("valueColor") || "#00ffff"; // fallback if missing
+	document.getElementById("valueColorPicker").value = valueColor;
+	document.documentElement.style.setProperty('--values', valueColor);
+
+	const muteAudio = localStorage.getItem("muteAudioAtStartup");
+	muteAudioAtStartup = muteAudio === "true";
+	document.getElementById("muteAudioAtStartup").checked = muteAudioAtStartup;
+
+} // end loadSettingsFromLocalStorage
+
+function showHome() {
+  const settings = document.getElementById("settings-container");
+  const about = document.getElementById("about-container");
+
+  if (settings) settings.style.display = "none";
+  if (about) about.style.display = "none";
+
+  const btnSettings = document.getElementById("btn-settings");
+  const btnAbout = document.getElementById("btn-about");
+
+  if (btnSettings) btnSettings.style.color = "";
+  if (btnAbout) btnAbout.style.color = "";
+}
+
+function hex(val) {
+  return val.toString(16).toUpperCase();
+}
+
+async function get_presets_from_config(sysname, retries = 3, delay = 500) {
+    if (sysname === "-") {
+        console.warn("Invalid sysname:", sysname);
+        return null;
+    }
+
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        try {
+            const response = await fetch('/', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify([{ command: "get_full_config", arg1: 0, arg2: 0 }])
+            });
+
+            if (!response.ok) {
+                console.error(`Fetch failed (HTTP ${response.status}) on attempt ${attempt}`);
+                if (attempt < retries) await new Promise(resolve => setTimeout(resolve, delay));
+                continue;
+            }
+
+            const data = await response.json();
+            return data;
+        } catch (error) {
+            console.warn(`Error during fetch (attempt ${attempt}):`, error);
+            if (attempt < retries) await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+
+    console.error("Failed to fetch presets after retries.");
+    return null;
+}
+
+async function findPresetsForSysname(targetSysname) {
+    var configData;
+    if (config_cache == null) {
+        configData = await get_presets_from_config(targetSysname);
+    } else {
+        configData = [ config_cache ];
+    }
+
+    if (!configData || !Array.isArray(configData) || configData.length === 0) {
+        console.warn("Invalid config data or config data not ready yet in findPresetsForSysname()");
+        return null;
+    }
+
+    const trunkingChans = configData[0]?.trunking?.chans || [];
+
+    for (const chan of trunkingChans) {
+        if (chan.sysname === targetSysname) {
+            return chan.presets || [];
+        }
+    }
+
+//     console.warn("Sysname not found:", targetSysname);
+    return [];
+}
+
+async function loadPresets(sysname) {
+    newPresets = await findPresetsForSysname(sysname);
+
+    const presetContainer = document.getElementById('presetButtons');
+    if (!presetContainer) return;
+
+    if (newPresets && newPresets.length > 0) {
+        presetContainer.style.display = "";
+
+        noPresetsCounter = 0; // reset counter when presets found
+
+        // First, hide ALL preset buttons
+        const allPresetBtns = presetContainer.querySelectorAll('button[id^="preset-btn-"]');
+        allPresetBtns.forEach(btn => {
+            btn.style.display = "none"; // hide by default
+        });
+
+        // Then show only matching buttons
+        newPresets.forEach(p => {
+            const btn = document.getElementById(`preset-btn-${p.id}`);
+            if (btn) {
+                btn.textContent = `${p.label}`;
+                btn.title = `TGID: ${p.tgid}`;  // Tooltip
+                btn.style.display = "";         // Show  button
+            }
+        });
+
+    } else {
+        noPresetsCounter++;
+
+        if (noPresetsCounter >= 5) {
+            presetContainer.style.display = "none";
+        } else {
+			// do nothing right now
+        }
+    }
+} // end loadPresets
+
+function ws_instances(instances) {
+    Object.entries(instances).forEach(([key, value]) => {
+        if (key == 'json_type')
+            return;
+        if (!(key in ws_endpoints) || ws_endpoints[key] != value)
+            ws_endpoints[key] = value;
+        ws_connect(key);
+    });
+}
+
+function audio_play(channel) {
+    var state = audioChannels[channel];
+    if (!audioCtx || state.muted || state.queue.length === 0) return;
+    if (state.nextPlayTime < audioCtx.currentTime)
+        state.nextPlayTime = audioCtx.currentTime;
+    while (state.queue.length > 0) {
+        var samples = state.queue.shift();
+        var buffer = audioCtx.createBuffer(1, samples.length, WS_AUDIO_SAMPLE_RATE);
+        var ch = buffer.getChannelData(0);
+        for (var i = 0; i < samples.length; i++)
+            ch[i] = samples[i] / 32768.0;
+        var source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+        source.start(state.nextPlayTime);
+        state.nextPlayTime += buffer.duration;
+    }
+}
+
+function audio_toggle(channel) {
+    if (!audioCtx)
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: WS_AUDIO_SAMPLE_RATE });
+    if (!(channel in audioChannels))
+        audioChannels[channel] = { queue: [], nextPlayTime: 0, muted: true };
+    var state = audioChannels[channel];
+    state.muted = !state.muted;
+    if (state.muted) {
+        state.queue = [];
+        state.nextPlayTime = 0;
+    }
+    channel_status();
+    if (lastChannelData) channel_table(lastChannelData);
+}
+
+function ws_connect(channel) {
+    if ((channel in ws_connections) && ws_connections[channel] != null && ws_connections[channel].readyState <= 1)
+        return;
+
+    if (!(channel in ws_endpoints) || ws_endpoints[channel] == null)
+        return;
+
+    if (!(channel in audioChannels))
+        audioChannels[channel] = { queue: [], nextPlayTime: 0, muted: muteAudioAtStartup };
+
+    var ws_url = (function(endpoint) {
+        try {
+            var u = new URL(endpoint);
+            if (u.hostname === '0.0.0.0' || u.hostname === '127.0.0.1')
+                u.hostname = window.location.hostname;
+            return u.toString();
+        } catch(e) { return endpoint; }
+    })(ws_endpoints[channel]);
+
+    var ws = new WebSocket(ws_url);
+    ws_connections[channel] = ws;
+    ws.binaryType = 'arraybuffer';
+    console.log("WebSocket audio connected for channel", channel, ":", ws.url);
+
+    ws.onmessage = function(event) {
+        var state = audioChannels[channel];
+        if (typeof event.data === 'string') {
+            var msg = JSON.parse(event.data);
+            if (msg.cmd === 'audio_drain' || msg.cmd === 'audio_drop') {
+                state.queue = [];
+                state.nextPlayTime = 0;
+            }
+        } else if (!state.muted && audioCtx) {
+            state.queue.push(new Int16Array(event.data));
+            audio_play(channel);
+        }
+    };
+
+    ws.onclose = function(event) {
+        ws_connections[channel] = null;
+        setTimeout(function() { ws_connect(channel); }, 3000);
+    };
+
+    ws.onerror = function(event) {
+        console.log("WebSocket audio error for channel", channel, ":", event);
+    };
+}
+
+function full_config(config) {
+    // only load the config once, then cache it
+    if (config_cache == null) {
+        config_cache = config;
+    }
+
+	var sa = config['trunking'] ? config['trunking']['chans'] : [];
+	site_alias = buildSiteAliases(sa);
+
+    // some payloads are sending over full_config when it's not requested (plots) and not needed.
+    var getConfigBtn = localStorage.getItem('getConfigBtn');
+    if (getConfigBtn == 1)
+        togglePopup('popupContainer', true);
+        
+        
+    localStorage.setItem('getConfigBtn', 0);
+    
+
+    const container = document.getElementById('configDisplay');
+    container.innerHTML = "";
+
+    function createSection(title, contentHtml) {
+        const section = document.createElement('div');
+        section.className = 'config-section';
+
+        const header = document.createElement('h3');
+        header.className = 'config-header';
+
+        // Create text node (title)
+        header.appendChild(document.createTextNode(title.charAt(0).toUpperCase() + title.slice(1)));
+
+        // ➕ Add toggle icon
+        const toggleIcon = document.createElement('span');
+        toggleIcon.textContent = "➕";
+        toggleIcon.style.marginLeft = "10px";
+        toggleIcon.style.fontSize = "16px";
+        header.appendChild(toggleIcon);
+
+        const content = document.createElement('div');
+        content.className = 'config-content';
+        content.innerHTML = contentHtml;
+        content.style.display = 'none'; // start collapsed
+
+        header.onclick = () => {
+            if (content.style.display === 'none') {
+                content.style.display = 'block';
+                toggleIcon.textContent = "➖";
+            } else {
+                content.style.display = 'none';
+                toggleIcon.textContent = "➕";
+            }
+        };
+
+        section.appendChild(header);
+        section.appendChild(content);
+
+        return section;
+    }
+
+    function formatEntry(entry) {
+        let html = '<table class="config-table">';
+        for (const [key, value] of Object.entries(entry)) {
+            // Skip keys starting with #
+            if (key.startsWith('#')) continue;
+
+            const displayKey = key; // no auto-capitalization for inner keys
+
+            html += '<tr>';
+            html += `<td class="config-key">${displayKey}</td>`;
+            if (typeof value === 'object' && value !== null) {
+                html += `<td class="config-value" style="color:#ddd;">${formatEntry(value)}</td>`;
+            } else {
+                html += `<td class="config-value">${value}</td>`;
+            }
+            html += '</tr>';
+        }
+        html += '</table>';
+        return html;
+    }
+
+    // Top level keys
+    for (const [sectionName, sectionContent] of Object.entries(config)) {
+        let html = "";
+
+        if (Array.isArray(sectionContent)) {
+            sectionContent.forEach((item, index) => {
+                html += `<h4>Record ${index + 1}</h4>` + formatEntry(item);
+            });
+        } else if (typeof sectionContent === "object") {
+            html += formatEntry(sectionContent);
+        } else {
+            html += `<p><b>${sectionName}:</b> ${sectionContent}</p>`;
+        }
+
+        container.appendChild(createSection(sectionName, html));
+    }
+} // end full_config()
+
+
+function togglePopup(id, open) {
+  const popup = document.getElementById(id);
+  if (!popup) {
+    console.error(`Popup element with id "${id}" not found.`);
+    return;
+  }
+
+  if (open) {
+    popup.style.display = 'flex';
+    setTimeout(() => popup.classList.add('show'), 10); // Smooth fade-in
+  } else {
+    popup.classList.remove('show');
+    popup.style.display = 'none';
+  }
+}
+
+
+function buildSiteAliases(sa) {
+    const siteAliases = {};
+
+    // Verify input is a non-empty array
+    if (!Array.isArray(sa) || sa.length === 0) {
+        console.warn("buildSiteAliases: Invalid or empty input.");
+        return siteAliases;
+    }
+
+    sa.forEach(system => {
+        // Verify each system object
+        if (!system || typeof system !== 'object' || !system.sysname || !system.site_alias) {
+            console.warn("buildSiteAliases: Skipping invalid system entry:", system);
+            return;
+        }
+
+        const sysname = String(system.sysname).trim().toUpperCase();  // Normalize sysname (added .trim() just in case)
+        const aliases = system.site_alias;
+
+        if (!sysname || typeof aliases !== 'object') {
+            console.warn("buildSiteAliases: Invalid sysname or aliases structure for:", system);
+            return;
+        }
+
+        siteAliases[sysname] = {};
+
+        for (const rfssId in aliases) {
+            if (Object.prototype.hasOwnProperty.call(aliases, rfssId)) {
+                siteAliases[sysname][rfssId] = {};
+
+                for (const siteId in aliases[rfssId]) {
+                    if (Object.prototype.hasOwnProperty.call(aliases[rfssId], siteId)) {
+                        const aliasObj = aliases[rfssId][siteId];
+
+                        if (aliasObj && typeof aliasObj.alias === 'string') {
+                            siteAliases[sysname][rfssId][siteId] = { alias: aliasObj.alias };
+                        } else {
+                            console.warn(`buildSiteAliases: Missing alias for sysname=${sysname}, rfss=${rfssId}, site=${siteId}`);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    return siteAliases;
+} // end buildSiteAliases
+
+
+// Subscriber search 
+
+function openSubSearchModal() {
+
+  var container = document.getElementById("searchSubsPopup");
+  if (!container)  {
+  	return;
+  }
+
+  refreshSubSearchSnapshot();
+
+  container.classList.add("show");
+  container.setAttribute("aria-hidden", "false");
+
+  // focus the search box
+  setTimeout(function () {
+    var input = document.getElementById("subSearchInput");
+    if (input) input.focus();
+  }, 0);
+}
+
+function closeSubSearchModal() {
+
+  var container = document.getElementById("searchSubsPopup");
+  if (!container) { console.warn('error no container at 2368'); return; }
+
+  container.classList.remove("show");
+  container.setAttribute("aria-hidden", "true");
+}
+
+function clearSubSearch() {
+  var input = document.getElementById("subSearchInput");
+  if (input) input.value = "";
+  filterSubSearchTable();
+}
+
+
+function refreshSubSearchSnapshot() {
+
+  var live = document.getElementById("subscribers");
+  var snap = document.getElementById("subSearchTable");
+  var meta = document.getElementById("subSearchMeta");
+
+  if (!live || !snap) {
+  	console.warn('error no live, no snap in refreshSubSearchSnapshot()');
+  	return;
+  }
+
+  // Clone the current table contents (header + rows)
+  snap.innerHTML = live.innerHTML;
+
+  // Update meta
+  var rowCount = Math.max(0, snap.querySelectorAll("tr").length - 1); // minus header row
+  var now = new Date();
+  var hh = String(now.getHours()).padStart(2, "0");
+  var mm = String(now.getMinutes()).padStart(2, "0");
+  var ss = String(now.getSeconds()).padStart(2, "0");
+
+  if (meta) meta.textContent = "Snapshot: " + hh + ":" + mm + ":" + ss + "  |  Rows: " + rowCount;
+
+  // Apply current filter (if any)
+  filterSubSearchTable();
+}
+
+// --- Sub Search (popup) snapshot + sort ---
+
+function refreshSubSearchSnapshot() {
+  var live = document.getElementById("subscribers");
+  var snap = document.getElementById("subSearchTable");
+  var meta = document.getElementById("subSearchMeta");
+
+  if (!live || !snap) {
+    console.warn("error no live, no snap in refreshSubSearchSnapshot()");
+    return;
+  }
+
+  // Grab header labels from the live table (first <tr>)
+  var liveHeader = live.querySelector("tr");
+  var headerCells = liveHeader ? liveHeader.querySelectorAll("th") : null;
+
+  // Grab only DATA rows from live table (skip header row)
+  var liveRows = live.querySelectorAll("tr");
+  var html = "";
+
+	html += "<thead><tr>";
+	if (headerCells && headerCells.length) {
+	  for (var h = 0; h < headerCells.length; h++) {
+		var label = (headerCells[h].textContent || "").trim();
+		html += '<th class="th-section" data-ss-col="' + h + '">' + escHtml(label) + "</th>";
+	  }
+	} else {
+	  html += '<th class="th-section" data-ss-col="0">Time</th>' +
+			  '<th class="th-section" data-ss-col="1">System</th>' +
+			  '<th class="th-section" data-ss-col="2">TGID</th>' +
+			  '<th class="th-section" data-ss-col="3">Talkgroup</th>' +
+			  '<th class="th-section" data-ss-col="4">Source</th>' +
+			  '<th class="th-section" data-ss-col="5">AG</th>';
+	}
+	html += "</tr></thead>";
+	
+	// Start TBODY for data rows
+	html += "<tbody>";
+	for (var i = 1; i < liveRows.length; i++) {
+	  html += liveRows[i].outerHTML;
+	}
+	html += "</tbody>";
+
+  // Append the live data rows (skip index 0 header)
+  for (var i = 1; i < liveRows.length; i++) {
+    html += liveRows[i].outerHTML;
+  }
+
+  snap.innerHTML = html;
+
+  // Wire up popup-only sorting on the new header
+  bindSubSearchSortHandlers();
+
+  // Meta
+  var rowCount = Math.max(0, snap.querySelectorAll("tr").length - 1);
+  var now = new Date();
+  var hh = String(now.getHours()).padStart(2, "0");
+  var mm = String(now.getMinutes()).padStart(2, "0");
+  var ss = String(now.getSeconds()).padStart(2, "0");
+  if (meta) meta.textContent = "Snapshot: " + hh + ":" + mm + ":" + ss + "  |  Rows: " + rowCount;
+
+  // Apply current filter (if any)
+  filterSubSearchTable();
+
+  // Re-apply popup sort if user already selected one
+  if (SUB_SEARCH_SORT.col != null) {
+    sortSubSearchTable(SUB_SEARCH_SORT.col, SUB_SEARCH_SORT.dir, true);
+  }
+}
+
+function bindSubSearchSortHandlers() {
+  var snap = document.getElementById("subSearchTable");
+  if (!snap) return;
+
+  var ths = snap.querySelectorAll("tr:first-child th[data-ss-col]");
+  for (var i = 0; i < ths.length; i++) {
+    // remove previous handler if we ever rebind
+    ths[i].onclick = null;
+
+    ths[i].style.cursor = "pointer";
+    ths[i].style.userSelect = "none";
+
+    ths[i].addEventListener("click", function (e) {
+      var col = parseInt(this.getAttribute("data-ss-col"), 10);
+      if (isNaN(col)) return;
+
+      // toggle direction if clicking same col
+      if (SUB_SEARCH_SORT.col === col) {
+        SUB_SEARCH_SORT.dir = (SUB_SEARCH_SORT.dir === "asc") ? "desc" : "asc";
+      } else {
+        SUB_SEARCH_SORT.col = col;
+        SUB_SEARCH_SORT.dir = "asc";
+      }
+
+      sortSubSearchTable(SUB_SEARCH_SORT.col, SUB_SEARCH_SORT.dir);
+      updateSubSearchSortIndicators();
+    });
+  }
+
+  updateSubSearchSortIndicators();
+}
+
+function sortSubSearchTable(colIndex, dir, preserveIndicatorsOnly) {
+  var table = document.getElementById("subSearchTable");
+  if (!table) return;
+
+  var rows = Array.from(table.querySelectorAll("tr")).slice(1); // skip header
+  // keep current filter state: we sort all rows (visible + hidden)
+  rows.sort(function (a, b) {
+    var aText = getCellText(a, colIndex);
+    var bText = getCellText(b, colIndex);
+
+    // Time column: "HH:MM:SS" -> sortable
+    if (colIndex === 0) {
+      var at = timeToSortable(aText);
+      var bt = timeToSortable(bText);
+      return (dir === "asc") ? (at - bt) : (bt - at);
+    }
+
+    // Numeric-ish compare if possible (TGID etc)
+    var aNum = isNumLike(aText);
+    var bNum = isNumLike(bText);
+    var cmp = 0;
+
+    if (aNum && bNum) {
+      cmp = Number(aText) - Number(bText);
+    } else {
+      cmp = String(aText).localeCompare(String(bText), undefined, { numeric: true, sensitivity: "base" });
+    }
+
+    return (dir === "asc") ? cmp : -cmp;
+  });
+
+  // Re-append rows in sorted order
+  for (var i = 0; i < rows.length; i++) table.appendChild(rows[i]);
+
+  if (!preserveIndicatorsOnly) {
+    // keep filter applied after sort
+    filterSubSearchTable();
+  }
+}
+
+function updateSubSearchSortIndicators() {
+  var table = document.getElementById("subSearchTable");
+  if (!table) return;
+
+  var ths = table.querySelectorAll("tr:first-child th[data-ss-col]");
+  for (var i = 0; i < ths.length; i++) {
+    var th = ths[i];
+    var base = (th.textContent || "").replace(/\s*[▲▼]\s*$/, ""); // strip old arrow
+    var col = parseInt(th.getAttribute("data-ss-col"), 10);
+
+    if (SUB_SEARCH_SORT.col === col) {
+      th.textContent = base + (SUB_SEARCH_SORT.dir === "asc" ? " ▲" : " ▼");
+    } else {
+      th.textContent = base;
+    }
+  }
+}
+
+function getCellText(tr, idx) {
+  var tds = tr.querySelectorAll("td");
+  var cell = tds[idx];
+  return cell ? (cell.textContent || "").trim() : "";
+}
+
+function isNumLike(v) {
+  if (v == null) return false;
+  var s = String(v).trim();
+  if (s === "") return false;
+  return !isNaN(Number(s));
+}
+
+function timeToSortable(hms) {
+  // "HH:MM:SS" -> seconds since midnight
+  var m = String(hms || "").trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return 0;
+  var hh = parseInt(m[1], 10) || 0;
+  var mm = parseInt(m[2], 10) || 0;
+  var ss = parseInt(m[3] || "0", 10) || 0;
+  return hh * 3600 + mm * 60 + ss;
+}
+
+function escHtml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function filterSubSearchTable() {
+  var input = document.getElementById("subSearchInput");
+  var table = document.getElementById("subSearchTable");
+  var meta  = document.getElementById("subSearchMeta");
+  if (!table) return;
+
+  var q = (input ? input.value : "").toLowerCase().trim();
+  var rows = table.querySelectorAll("tr");
+
+  var visibleCount = 0;
+
+  for (var i = 1; i < rows.length; i++) {
+    var row = rows[i];
+    var text = (row.textContent || "").toLowerCase();
+    var show = (!q || text.indexOf(q) !== -1);
+
+    row.style.display = show ? "" : "none";
+    if (show) visibleCount++;
+  }
+
+  if (meta) {
+    var t = meta.dataset.snapshotTime || "--:--:--";
+    var total = meta.dataset.totalRows || visibleCount;
+
+    meta.textContent =
+      "Snapshot: " + t +
+      " | Matches: " + visibleCount +
+      " / " + total;
+  }
+}
+
+// Subscriber search  end
+
+function getCaller() {
+	
+	// supplies the calling function
+
+	const err = new Error();
+	const stackLines = err.stack.split("\n");
+
+	// stackLines[0] is 'Error'
+	// stackLines[1] is this function (getCaller)
+	// stackLines[2] is the caller we're interested in
+	if (stackLines.length >= 3) {
+		return stackLines[2].trim();
+	} else {
+		return "Unknown caller";
+	}
+}
+
+function csvTable() {
+	// save the call history table to csv
+	
+    const table_id = "callHistoryContainer";
+    const separator = ',';
+
+    const rows = document.querySelectorAll(`table#${table_id} tr`);
+    const csv = [];
+
+    // First valid header row is at index 1
+    const headerRow = rows[1]?.querySelectorAll('th');
+    if (headerRow && headerRow.length > 0) {
+        const headers = Array.from(headerRow).map(cell => {
+            let data = cell.innerText.trim().replace(/(\r\n|\n|\r)/gm, '').replace(/\s+/g, ' ');
+            data = data.replace(/"/g, '""');
+            
+            return `"${data}"`;
+        });
+        csv.push(headers.join(separator));
+    }
+
+    // Data rows from index 2 onward
+    for (let i = 2; i < rows.length; i++) {
+        const cols = rows[i].querySelectorAll('td');
+        if (cols.length === 0) continue;  // Skip empty or non-data rows
+
+        const row = Array.from(cols).map(cell => {
+            let data = cell.innerText.trim().replace(/(\r\n|\n|\r)/gm, '').replace(/\s+/g, ' ');
+            data = data.replace(/"/g, '""');
+            return `"${data}"`;
+        });
+        csv.push(row.join(separator));
+    }
+
+    const csv_string = csv.join('\n');
+
+    const filename = "export_" + table_id + "_" + new Date().toLocaleDateString().split("/").join("-") + ".csv";
+
+    const link = document.createElement('a');
+    link.style.display = 'none';
+    link.setAttribute('href', 'data:text/csv;charset=utf-8,' + encodeURIComponent(csv_string));
+    link.setAttribute('download', filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+function filterSubscribers() {
+    var input = document.getElementById("subFilter1");
+    var table = document.getElementById("subscribers");
+    if (!input || !table) return;
+
+    var filter = input.value.toLowerCase();
+    var rows = table.getElementsByTagName("tr");
+
+    // skip header row (index 0)
+    for (var i = 1; i < rows.length; i++) {
+        var row = rows[i];
+        var text = row.textContent.toLowerCase();
+
+        row.style.display = text.includes(filter) ? "" : "none";
+    }
+}
+
+function filterCallHistgory() {
+    var input = document.getElementById("historyFilter");
+    var table = document.getElementById("callHistory");
+    if (!input || !table) return;
+
+    var filter = input.value.toLowerCase();
+    var rows = table.getElementsByTagName("tr");
+
+    // skip header row (index 0)
+    for (var i = 1; i < rows.length; i++) {
+        var row = rows[i];
+        var text = row.textContent.toLowerCase();
+
+        row.style.display = text.includes(filter) ? "" : "none";
+    }
+}
+
+function setSubSort(th) {
+  try {
+    var key = th && th.getAttribute ? th.getAttribute("data-sort") : null;
+    if (!key) return;
+
+    if (subSortKey === key) subSortDir *= -1;
+    else { subSortKey = key; subSortDir = 1; }
+
+    updateSubSortHeaderIndicators();
+
+    // Rebuild with whatever data source you already call update_sub_reg_all() from.
+    // If you have the last payload cached, call update_sub_reg_all(lastSubRegData).
+  } catch (e) {
+    console.log("setSubSort error:", e);
+  }
+}
+
+function updateSubSortHeaderIndicators() {
+  var table = document.getElementById("subscribers");
+  if (!table) return;
+
+  var ths = table.querySelectorAll("tr:first-child th[data-sort]");
+  ths.forEach(function(th) {
+    var base = (th.textContent || "").replace(/[▲▼]\s*$/, "").trim();
+    th.textContent = base;
+    var key = th.getAttribute("data-sort");
+    if (key === subSortKey) th.textContent = base + (subSortDir === 1 ? " ▲" : " ▼");
+  });
+}
+
+
+// Seen Talkgroups
+
+function openSeenTgModal() {
+  var container = document.getElementById("seenTgPopup");
+  if (!container) return;
+
+  refreshSeenTgSnapshot();
+
+  container.classList.add("show");
+  container.setAttribute("aria-hidden", "false");
+
+  setTimeout(function () {
+    var input = document.getElementById("seenTgFilter");
+    if (input) input.focus();
+  }, 0);
+}
+
+function closeSeenTgModal() {
+  var container = document.getElementById("seenTgPopup");
+  if (!container) return;
+
+  container.classList.remove("show");
+  container.setAttribute("aria-hidden", "true");
+}
+
+function clearSeenTgFilter() {
+  var input = document.getElementById("seenTgFilter");
+  if (input) input.value = "";
+  filterSeenTgTable();
+}
+
+function refreshSeenTgSnapshot() {
+
+  var table = document.getElementById("seenTgTable");
+  var meta  = document.getElementById("seenTgMeta");
+  if (!table) { console.error("Seen Talkgroup Table not found."); return; }
+
+  // Build rows from TG_TAG_CACHE
+  var rows = [];
+  var sysCount = 0;
+
+  Object.keys(TG_TAG_CACHE || {}).forEach(function (sysid) {
+    var tgMap = TG_TAG_CACHE[sysid];
+    if (!tgMap || typeof tgMap !== "object") return;
+
+    sysCount++;
+
+    Object.keys(tgMap).forEach(function (tgid) {
+      var entry = tgMap[tgid];
+
+      // entry might be string (old) or object (new: {tag, hits})
+      var tag = "";
+      var hits = 0;
+
+      if (entry != null && typeof entry === "object") {
+        tag = entry.tag == null ? "" : String(entry.tag);
+        hits = Number(entry.hits || 0);
+      } else {
+        tag = entry == null ? "" : String(entry);
+        hits = 0;
+      }
+
+      rows.push({
+        sysid: String(sysid),
+        tgid: String(tgid),
+        tag: tag,
+        hits: hits
+      });
+    });
+  });
+
+  // Sort based on current selected header
+  rows.sort(function(a, b) {
+    var col = SEEN_TG_SORT_COL;
+    var dir = SEEN_TG_SORT_DIR;
+
+    // 0=System, 1=TGID, 2=Tag, 3=Hits
+    if (col === 0) return dir * a.sysid.localeCompare(b.sysid);
+
+    if (col === 1) {
+      var an = parseInt(a.tgid, 10), bn = parseInt(b.tgid, 10);
+      if (!isNaN(an) && !isNaN(bn)) return dir * (an - bn);
+      return dir * a.tgid.localeCompare(b.tgid);
+    }
+
+    if (col === 2) return dir * a.tag.localeCompare(b.tag);
+
+    if (col === 3) return dir * ((a.hits || 0) - (b.hits || 0));
+
+    return 0;
+  });
+
+  // Render table with THEAD/TBODY so sticky headers work
+  table.innerHTML = "";
+
+  var thead = document.createElement("thead");
+  var htr = document.createElement("tr");
+  var headers = ["System", "TGID", "Talkgroup", "Hits"];
+
+  headers.forEach(function (h, idx) {
+    var th = document.createElement("th");
+    th.className = "th-section";
+    th.textContent = seenTgHeaderLabel(h, idx);
+
+    // store col index for click sort
+    th.setAttribute("data-seen-col", String(idx));
+
+    htr.appendChild(th);
+  });
+
+  thead.appendChild(htr);
+  table.appendChild(thead);
+
+  var tbody = document.createElement("tbody");
+
+  rows.forEach(function (r) {
+    var tr = document.createElement("tr");
+
+    tr.insertCell(0).textContent = r.sysid;
+    tr.insertCell(1).textContent = r.tgid;
+
+    var td2 = tr.insertCell(2);
+    td2.textContent = r.tag;
+    td2.style.textAlign = "left";
+
+    tr.insertCell(3).textContent = String(r.hits || 0);
+
+    tbody.appendChild(tr);
+  });
+
+  table.appendChild(tbody);
+
+  // Hook sorting clicks after header exists
+  wireSeenTgSortHandlers();
+
+  // Meta
+  var now = new Date();
+  var hh = String(now.getHours()).padStart(2, "0");
+  var mm = String(now.getMinutes()).padStart(2, "0");
+  var ss = String(now.getSeconds()).padStart(2, "0");
+
+  if (meta) {
+    meta.textContent =
+      "Snapshot: " + hh + ":" + mm + ":" + ss +
+      "  |  Systems: " + sysCount +
+      "  |  Rows: " + rows.length;
+  }
+
+  filterSeenTgTable();
+  applySmartColorsSeenTg();
+}
+
+function filterSeenTgTable() {
+  var input = document.getElementById("seenTgFilter");
+  var table = document.getElementById("seenTgTable");
+  var meta  = document.getElementById("seenTgMeta");
+  if (!table) return;
+
+  var q = (input ? input.value : "").toLowerCase().trim();
+  var trs = table.querySelectorAll("tr");
+
+  var visible = 0;
+  for (var i = 1; i < trs.length; i++) { // skip header
+    var tr = trs[i];
+    var text = (tr.textContent || "").toLowerCase();
+    var show = (!q || text.indexOf(q) !== -1);
+    tr.style.display = show ? "" : "none";
+    if (show) visible++;
+  }
+
+  // If you want the meta to include match count without “appending”
+  if (meta) {
+    // Rewrite meta but keep the prefix before " | Matches:"
+    var base = meta.textContent || "";
+    base = base.replace(/\s*\|\s*Matches:\s*\d+\s*$/i, "");
+    meta.textContent = base + "  |  Matches: " + visible;
+  }
+}
+
+function sortSeenTgRows(rows) {
+  if (SEEN_TG_SORT.col === null) return rows;
+
+  var col = SEEN_TG_SORT.col;
+  var asc = SEEN_TG_SORT.asc ? 1 : -1;
+
+  rows.sort(function (a, b) {
+    var va, vb;
+
+    switch (col) {
+      case 0: va = a.sysid; vb = b.sysid; break;
+      case 1: va = a.tgid;  vb = b.tgid;  break;
+      case 2: va = a.tag;   vb = b.tag;   break;
+      case 3: va = a.hits;  vb = b.hits;  break;
+      default: return 0;
+    }
+
+    // numeric compare where possible
+    var na = Number(va);
+    var nb = Number(vb);
+    if (!isNaN(na) && !isNaN(nb)) {
+      return (na - nb) * asc;
+    }
+
+    return String(va).localeCompare(String(vb)) * asc;
+  });
+
+  return rows;
+}
+
+function wireSeenTgSortHandlers() {
+  var table = document.getElementById("seenTgTable");
+  if (!table) return;
+
+  var ths = table.querySelectorAll("thead th[data-seen-col]");
+  ths.forEach(function (th) {
+    th.style.cursor = "pointer";
+    th.onclick = function () {
+      var col = Number(th.getAttribute("data-seen-col"));
+
+      if (SEEN_TG_SORT_COL === col) {
+        SEEN_TG_SORT_DIR = -SEEN_TG_SORT_DIR; // toggle
+      } else {
+        SEEN_TG_SORT_COL = col;
+        SEEN_TG_SORT_DIR = 1; // default asc
+      }
+
+      refreshSeenTgSnapshot();
+    };
+  });
+}
+
+function tagToString(v) {
+  if (v == null) return "";                 // null/undefined
+  if (typeof v === "string") return v.trim();
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+
+  // objects: try common shapes, otherwise blank
+  if (typeof v === "object") {
+    if (typeof v.tag === "string") return v.tag.trim();
+    if (typeof v.name === "string") return v.name.trim();
+    if (typeof v.label === "string") return v.label.trim();
+    if (typeof v.text === "string") return v.text.trim();
+    // Last resort: don't stringify "[object Object]" into UI
+    return "";
+  }
+
+  return "";
+}
+
+function seenTgCompare(a, b, col, dir) {
+  var mult = (dir === "desc") ? -1 : 1;
+
+  // 0=sysid, 1=tgid, 2=tag, 3=hits
+  if (col === 0) {
+    return mult * a.sysid.localeCompare(b.sysid);
+  }
+  if (col === 1) {
+    var an = parseInt(a.tgid, 10), bn = parseInt(b.tgid, 10);
+    if (!isNaN(an) && !isNaN(bn)) return mult * (an - bn);
+    return mult * a.tgid.localeCompare(b.tgid);
+  }
+  if (col === 2) {
+    return mult * String(a.tag || "").localeCompare(String(b.tag || ""));
+  }
+  if (col === 3) {
+    return mult * ((Number(a.hits) || 0) - (Number(b.hits) || 0));
+  }
+
+  // fallback stable-ish
+  return mult * a.sysid.localeCompare(b.sysid);
+}
+
+function seenTgHeaderLabel(label, colIndex) {
+  // active column shows ▲ or ▼, others show ⇅
+  if (colIndex === SEEN_TG_SORT_COL) {
+    return label + (SEEN_TG_SORT_DIR === 1 ? " ▲" : " ▼");
+  }
+  return label + " ⇅";
+}
+
+function clearFilter(id) {
+  var el = document.getElementById(id);
+  if (!el) return;
+
+  el.value = "";
+  el.dispatchEvent(new Event("input")); // triggers existing filters
+}
+
+// Compare two values for sorting.
+// If both values look numeric, compare them numerically.
+// Otherwise, fall back to locale-aware string comparison,
+// using numeric-aware ordering and case-insensitive matching.
+function cmp(a, b) {
+  // numeric compare if possible, else string compare
+  var aNum = isNumLike(a), bNum = isNumLike(b);
+  if (aNum && bNum) return Number(a) - Number(b);
+  return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" });
+}
+
+function isNumLike(v) {
+  if (v === null || v === undefined) return false;
+  var s = String(v).trim();
+  if (s === "") return false;
+  return !Number.isNaN(Number(s));
+}
+
+// Backdrop + Esc close (mirrors your other modal style)
+document.addEventListener("click", function (e) {
+  var container = document.getElementById("seenTgPopup");
+  if (!container || !container.classList.contains("show")) return;
+  if (e.target === container) closeSeenTgModal();
+});
+
+document.addEventListener("keydown", function (e) {
+  if (e.key !== "Escape") return;
+  var container = document.getElementById("seenTgPopup");
+  if (container && container.classList.contains("show")) closeSeenTgModal();
+});
+
+// Close modal on backdrop click
+document.addEventListener("click", function (e) {
+  var container = document.getElementById("searchSubsPopup");
+  if (!container || !container.classList.contains("show")) return;
+  if (e.target === container) closeSubSearchModal();
+});
+
+// Close modal on Esc
+document.addEventListener("keydown", function (e) {
+  if (e.key !== "Escape") return;
+  var container = document.getElementById("searchSubsPopup");
+  if (container && container.classList.contains("show")) closeSubSearchModal();
+});
+

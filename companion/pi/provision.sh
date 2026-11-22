@@ -180,8 +180,8 @@ if [ "$VOICE" = "1" ]; then
         WAVELENS_YES=1 bash "$SRC/companion/pi/install-dsd.sh" \
             || warn "dsd-fme did not build. Rerun: sudo $SRC/companion/pi/install-dsd.sh"
     fi
-    WAVELENS_YES=1 bash "$SRC/companion/pi/install-op25.sh" \
-        || warn "The APCO25 decoder did not build; P25 uses dsd-fme meanwhile. Rerun: sudo $SRC/companion/pi/install-op25.sh"
+    WAVELENS_YES=1 bash "$SRC/companion/pi/install-apco25.sh" \
+        || warn "The APCO25 decoder did not build; P25 uses dsd-fme meanwhile. Rerun: sudo $SRC/companion/pi/install-apco25.sh"
     systemctl restart wavelens-bridge 2>/dev/null || true
 fi
 
