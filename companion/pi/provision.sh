@@ -94,7 +94,6 @@ apt-get install -y -q git python3 python3-pip python3-dbus python3-gi rtl-sdr rt
     avahi-daemon curl
 # esptool from apt is missing on some images; pip is fine for a tool
 command -v esptool.py >/dev/null 2>&1 || command -v esptool >/dev/null 2>&1 || pip3 install -q --break-system-packages esptool || true
-python3 -c "import bluezero" 2>/dev/null || pip3 install -q --break-system-packages bluezero
 
 # The RTL-SDR Blog V4 has an R828D tuner. rtl-sdr 2.0 and later drive it; the 0.6 that Bookworm ships shows
 # "[R82XX] PLL not locked!", tunes wrong and rtl_power hangs. There, build the RTL-SDR Blog fork as Debian packages
@@ -109,7 +108,7 @@ blog_driver() {
     echo "  building the RTL-SDR Blog driver (replaces rtl-sdr $cur; about five minutes)"
     apt-get install -y -q build-essential cmake pkg-config debhelper libusb-1.0-0-dev || return 1
     work=$(mktemp -d)
-    git clone -q --depth 1 https://github.com/rtlsdrblog/rtl-sdr-blog "$work/rtl-sdr-blog" || { rm -rf "$work"; return 1; }
+    cp -a "$SRC/companion/vendor/rtl-sdr-blog" "$work/rtl-sdr-blog" || { rm -rf "$work"; return 1; }   # pinned copy
     if ! (cd "$work/rtl-sdr-blog" && dpkg-buildpackage -b --no-sign > "$work/build.log" 2>&1); then
         tail -n 20 "$work/build.log"; rm -rf "$work"; return 1
     fi
@@ -120,6 +119,19 @@ blog_driver() {
     rm -rf "$work"
     echo "  RTL-SDR Blog driver installed ($(dpkg-query -W -f='${Version}' rtl-sdr))"
 }
+echo "== checkout at $SRC"
+if [ -d "$SRC/.git" ]; then
+    git -C "$SRC" fetch -q origin main && git -C "$SRC" reset -q --hard origin/main
+else
+    git clone -q "$REPO" "$SRC"
+fi
+git -C "$SRC" config core.fileMode false
+git config --global --add safe.directory "$SRC" 2>/dev/null || true
+
+echo "== bluezero"
+# the bridge's Bluetooth library, from the pinned source release in companion/vendor
+python3 -c "import bluezero" 2>/dev/null || pip3 install -q --break-system-packages "$SRC"/companion/vendor/bluezero/bluezero-*.tar.gz
+
 echo "== RTL-SDR driver"
 V4=0; rtl_dongles | grep -q "Blog V4" && V4=1
 if [ "$BLOG" = "1" ] || { [ "$BLOG" = "auto" ] && [ "$V4" = "1" ]; }; then
@@ -130,14 +142,6 @@ else
     echo "  stock rtl-sdr $(dpkg-query -W -f='${Version}' rtl-sdr 2>/dev/null || echo '?') (no RTL-SDR Blog V4 plugged in)"
 fi
 
-echo "== checkout at $SRC"
-if [ -d "$SRC/.git" ]; then
-    git -C "$SRC" fetch -q origin main && git -C "$SRC" reset -q --hard origin/main
-else
-    git clone -q "$REPO" "$SRC"
-fi
-git -C "$SRC" config core.fileMode false
-git config --global --add safe.directory "$SRC" 2>/dev/null || true
 
 echo "== hostname $HOST (admin page at http://$HOST.local:8080)"
 if [ "$(hostname)" != "$HOST" ]; then

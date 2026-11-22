@@ -3,7 +3,7 @@
 # so the Wavelens bridge can play DMR, P25 phase 1, NXDN and D-STAR voice through the phone.
 # Takes about ten minutes on a Pi 4. Needs internet on the Pi (apt + GitHub). Re-run it to update.
 #
-# mbelib implements voice codecs that are covered by patents in some countries. Its authors ask you to
+# mbelib (companion/vendor/mbelib) implements voice codecs that are covered by patents in some countries. Its authors ask you to
 # read https://github.com/lwvmobile/mbelib#readme before building it. This script will not proceed
 # until you confirm you have.
 set -e
@@ -23,12 +23,15 @@ sudo apt-get install -y libpulse-dev libsndfile1-dev libfftw3-dev liblapack-dev 
 # Pager data (POCSAG / FLEX) on analog channels: the bridge uses multimon-ng when it is present.
 sudo apt-get install -y multimon-ng || true
 
+# Built from the copies in companion/vendor (pinned, tested versions), not from their projects' repositories.
+VENDOR=$(cd "$(dirname "$0")/../vendor" && pwd)
+[ -f "$VENDOR/mbelib/CMakeLists.txt" ] && [ -f "$VENDOR/dsd-fme/CMakeLists.txt" ] \
+    || { echo "companion/vendor/mbelib or dsd-fme missing (update the Wavelens checkout)"; exit 1; }
 work=$(mktemp -d)
+cp -a "$VENDOR/mbelib" "$VENDOR/dsd-fme" "$work/"
 cd "$work"
-git clone --depth 1 -b ambe_tones https://github.com/lwvmobile/mbelib
 mkdir mbelib/build && cd mbelib/build && cmake .. && make -j"$(nproc)" && sudo make install && sudo ldconfig
 cd "$work"
-git clone --depth 1 https://github.com/lwvmobile/dsd-fme
 mkdir dsd-fme/build && cd dsd-fme/build && cmake .. && make -j"$(nproc)" && sudo make install && sudo ldconfig
 cd / && rm -rf "$work"
 echo
