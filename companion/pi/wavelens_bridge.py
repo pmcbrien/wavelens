@@ -4589,6 +4589,113 @@ def trunk_resume() -> bool:
     return False
 
 
+# Band scan: the app's Weather, Marine, Aircraft and Ham buttons. The dongle steps through the band's channels the
+# way a hardware scanner does: each one gets SCAN_DWELL_S for the squelch to open; a channel nobody is talking
+# on is left at once, and one with a voice stays until it has been quiet SCAN_HANG_S, then the scan goes on from
+# the next channel. Parking on one channel of the band played static (or nothing) while the rest of the band
+# was busy. A continuous broadcast (weather radio) just keeps the dongle. Needs a squelch: at 0 every channel
+# "has audio" (its noise), so the scan uses at least SCAN_MIN_SQ.
+SCAN = {"on": False, "chans": [], "mode": "fm", "i": 0, "name": "", "until": 0.0, "key": None, "asked_at": 0.0}
+SCAN_DWELL_S = 1.8          # rtl_fm is up in about half a second; give the squelch the rest to open
+SCAN_HANG_S = 3.0           # a channel that had a voice keeps the dongle this long after its squelch closes
+SCAN_MIN_SQ = 30            # rtl_fm squelch floor while scanning (the --listen-squelch default)
+SCAN_TTL_S = 15 * 60.0      # ends by itself this long after the app's last renewal, like Follow
+SCAN_MAX_CHANS = 64
+
+
+def scan_parse(cmd: dict):
+    """(channels, mode, name) from a bandscan command; channels in 24–1766 MHz, de-duplicated, in the order
+    given (the app lists the busiest-first ones first: Ch 16, Guard). None when nothing usable is in it."""
+    out = []
+    for f in (cmd.get("mhz") or [])[:SCAN_MAX_CHANS]:
+        try:
+            m = round(float(f), 4)
+        except (TypeError, ValueError):
+            continue
+        if 24.0 <= m <= 1766.0 and all(abs(m - o) > 0.002 for o in out) and not locked_out(m):
+            out.append(m)
+    if not out:
+        return None
+    mode = str(cmd.get("mode") or "fm")
+    mode = mode if mode in LISTEN_MODES or mode in DIGITAL_MODES else "fm"
+    return out, mode, str(cmd.get("name") or "")[:40]
+
+
+def scan_start(chans: list, mode: str, name: str, sq) -> None:
+    """Start (or renew) a band scan. The app re-sends its command about once a minute: the same band again
+    only renews it, so the scan is not dragged back to its first channel every minute."""
+    now = time.time()
+    key = (tuple(chans), mode)
+    if sq is not None:
+        LISTEN["sq"] = max(0, min(1000, int(sq)))
+    if SCAN["on"] and SCAN["key"] == key:
+        SCAN["until"] = now + SCAN_TTL_S
+        if LISTEN["req"] is not None:
+            LISTEN["until"] = now + LISTEN_MAX_S
+        return
+    LISTEN["follow"] = False                 # one source at a time: a band replaces public-safety scanning
+    TRUNK["tries"], TRUNK["cc_at"] = [], 0.0
+    if HUNT["on"]:
+        HUNT["cancel"] = True
+    SCAN.update(on=True, chans=list(chans), mode=mode, i=0, name=name, until=now + SCAN_TTL_S, key=key, asked_at=0.0)
+    listen_status(f"scanning {name or 'the band'}: {len(chans)} channel(s), stopping on any voice")
+    scan_tune(0, now)
+
+
+def scan_stop() -> None:
+    SCAN.update(on=False, key=None)
+
+
+def scan_tune(i: int, now: float) -> None:
+    SCAN["i"] = i % len(SCAN["chans"])
+    SCAN["asked_at"] = now
+    sq = max(LISTEN["sq"], SCAN_MIN_SQ)
+    listen_start(SCAN["chans"][SCAN["i"]], SCAN["mode"], sq, 0.0)
+
+
+def scan_heard() -> bool:
+    """The channel now tuned has opened its squelch since it was tuned."""
+    return LISTEN["proc"] is not None and LISTEN["last_audio"] > LISTEN["tuned_at"] + 0.01
+
+
+def _scan_tick(now: float) -> None:
+    if not SCAN["on"]:
+        return
+    if now > SCAN["until"]:
+        scan_stop()
+        listen_stop("band scan timed out (the app stopped renewing it)")
+        listen_status("band scan ended")
+        return
+    if len(SCAN["chans"]) == 1:
+        if LISTEN["req"] is None:            # one channel: just keep it tuned (a 5 min listen ended, say)
+            scan_tune(0, now)
+        return
+    if LISTEN["req"] is None:
+        scan_tune(SCAN["i"] + 1, now)
+        return
+    if LISTEN["proc"] is None or LISTEN["starting"]:
+        if now - SCAN["asked_at"] > SCAN_DWELL_S + 8.0:      # a tool that never came up: don't stall the scan
+            scan_tune(SCAN["i"] + 1, now)
+        return
+    if LISTEN["mode"] == "auto" and now - LISTEN["chan_at"] < FOLLOW_PROBE_S:
+        return                               # AUTO still probing for a digital sync (no audio flows meanwhile)
+    if scan_heard():
+        if now - LISTEN["last_audio"] >= SCAN_HANG_S:
+            scan_tune(SCAN["i"] + 1, now)    # the voice ended: on through the band
+    elif now - LISTEN["tuned_at"] >= SCAN_DWELL_S:
+        scan_tune(SCAN["i"] + 1, now)        # nobody on it: next channel
+
+
+def scan_watch() -> None:
+    """The band scan's supervisor: four times a second, so a quiet channel costs about two seconds."""
+    while True:
+        time.sleep(0.25)
+        try:
+            _scan_tick(time.time())
+        except Exception as e:  # noqa: BLE001
+            print(f"bridge: band scan: {type(e).__name__}: {e}", file=sys.stderr)
+
+
 def follow_watch() -> None:
     """Follow's 1 s supervisor thread. One bad pass (a field a racing command just cleared, a tool that
     died mid-call) must not end Follow for the rest of the run: log it and carry on with the next second."""
@@ -4667,8 +4774,9 @@ def listen_status(msg: str) -> None:
                      "cats": sorted(TRUNK.get("cats") or []),
                      "unlisted": TRUNK.get("unlisted", "mute"), "interop": TRUNK.get("interop", "other"),
                      "gain": LISTEN.get("gain", 40), "ppm": LISTEN.get("ppm", 0),
-                     "tgs": [{"ts": int(ts), "tg": tg, "name": nm, "enc": e, "cat": c} for ts, tg, nm, e, c in TRUNK.get("tg_seen") or []][-12:]
-                     } if (on or LISTEN["follow"]) else "off"})
+                     "tgs": [{"ts": int(ts), "tg": tg, "name": nm, "enc": e, "cat": c} for ts, tg, nm, e, c in TRUNK.get("tg_seen") or []][-12:],
+                     "scan": {"name": SCAN["name"], "n": len(SCAN["chans"]), "i": SCAN["i"], "mode": SCAN["mode"]} if SCAN["on"] else None,
+                     } if (on or LISTEN["follow"] or SCAN["on"]) else "off"})
 
 
 def listen_stop(why: str = "stopped", cancel_hunt: bool = False) -> None:
@@ -6311,8 +6419,16 @@ def run_peripheral(name: str) -> None:
                       "band": state["band"], "mode": state["mode"], "listen": "off"})
             elif str(cmd.get("v") or "") == "off":
                 LISTEN["follow"] = False
+                scan_stop()
                 listen_stop("stopped", cancel_hunt=True)
                 listen_status("listening stopped")
+            elif str(cmd.get("v") or "") == "bandscan":
+                # {"c":"listen","v":"bandscan","mhz":[156.8, 156.3, ...],"mode":"fm","name":"Marine","sq":30}
+                got = scan_parse(cmd)
+                if got is None:
+                    listen_status("band scan: no channel to scan (all locked out, or outside 24-1766 MHz)")
+                else:
+                    scan_start(got[0], got[1], got[2], cmd.get("sq"))
             elif str(cmd.get("v") or "") == "lockout":
                 # The phone's list of frequencies Follow must never tune (it resends it on every connect).
                 try:
@@ -6409,6 +6525,7 @@ def run_peripheral(name: str) -> None:
                     TRUNK["tg_allow"] = set()
                 listen_status(f"{len(TRUNK['tg_allow'])} talkgroup(s) always heard" if TRUNK["tg_allow"] else "no talkgroups always heard")
             elif str(cmd.get("v") or "") == "system":
+                scan_stop()
                 # the phone tapped a system in the ranking: lock onto it now
                 try:
                     want = float(cmd.get("mhz") or 0)
@@ -6442,6 +6559,7 @@ def run_peripheral(name: str) -> None:
                     TRUNK["tries"], TRUNK["cc_at"] = [], time.time()
                     listen_start(LISTEN["mhz"], "trunkq" if TRUNK["qpsk"] else "trunk", LISTEN["sq"], 0.0)
             elif str(cmd.get("v") or "") == "trunk":
+                scan_stop()
                 TRUNK["qpsk"] = bool(cmd.get("qpsk", TRUNK["qpsk"]))
                 try:
                     mhz = float(cmd.get("mhz") or 0)
@@ -6458,6 +6576,7 @@ def run_peripheral(name: str) -> None:
                 else:
                     trunk_start(None)
             elif str(cmd.get("v") or "") == "follow":
+                scan_stop()
                 sq = cmd.get("sq")
                 if sq is not None:
                     LISTEN["sq"] = max(0, min(1000, int(sq)))
@@ -6496,6 +6615,8 @@ def run_peripheral(name: str) -> None:
                     mode = str(cmd.get("mode") or "fm")
                     if manual_listen_is_renewal(mhz, mode, time.time()):
                         return
+                    if SCAN["on"] and not (LISTEN["req"] is not None and abs(LISTEN["mhz"] - mhz) < 0.002):
+                        scan_stop()          # a channel tapped by hand: listen to it, the band scan ends
                     # A tap on a channel the RadioReference list knows as part of a trunked system: follow the
                     # system (P25 / EDACS / DMR with its control channel and channel map) instead of probing
                     # the channel as if it were conventional — AUTO on an EDACS or P25 data stream yields a
@@ -7058,9 +7179,11 @@ def main() -> None:
         LISTEN["dev"] = a.listen_device
         CAPS.append("listen")
         CAPS.append("trunk")                   # digital voice + trunk-tracking (dsd-fme); an ESP32 companion has "listen" only
+        CAPS.append("bandscan")                # {"c":"listen","v":"bandscan",...}: step through a band's channels (SCAN)
         kill_strays()
         threading.Thread(target=listen_worker, daemon=True).start()
         threading.Thread(target=follow_watch, daemon=True).start()
+        threading.Thread(target=scan_watch, daemon=True).start()
     if a.dump1090:
         CAPS.append("adsb")
         threading.Thread(target=feed_dump1090, args=(a.dump1090,), daemon=True).start()

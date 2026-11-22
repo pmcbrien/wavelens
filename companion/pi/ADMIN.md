@@ -165,3 +165,9 @@ request without a prompt, because the Pi has no screen to confirm on. On Raspber
 also keeps itself the default agent, so the panel's "confirm the pairing code" popup does not appear. Anyone in Bluetooth range can pair; the
 bridge already accepts connections from any phone running the app. Off: `sudo systemctl disable --now
 wavelens-bt-agent`, or install with `WAVELENS_BT_AUTOPAIR=0`.
+
+An iPhone or iPad gets no pairing prompt either. The link needs no pairing, but bluetoothd used to read the iPad's
+own (encrypted) services as soon as it connected, and iOS answered with "Bluetooth Pairing Request". The installer
+and `wavelens-update` set `[GATT] Client = false` and `[General] JustWorksRepairing = always` in
+`/etc/bluetooth/main.conf` (`wavelens_bt_config.py`; the original is kept as `main.conf.wavelens-bak`) and restart
+Bluetooth once. Nothing on the Pi uses it as a Bluetooth central. `WAVELENS_BT_AUTOPAIR=0` leaves main.conf alone.

@@ -169,6 +169,15 @@ install_files() {   # from $SRC into $LIB (same list as install-service.sh)
             install -m 0644 "$p/wavelens-bt-agent.service" /etc/systemd/system/ && bt=1
         fi
     fi
+    # No pairing prompt on an iPhone or iPad (wavelens_bt_config.py: bluetoothd's GATT client off, Just Works
+    # re-pairing). Same choice as the agent; bluetoothd reads main.conf only at start, so restart it on a change.
+    if [ "$(cat /etc/wavelens/bt-autopair 2>/dev/null)" != "0" ] && [ -f "$p/wavelens_bt_config.py" ] && [ -d /etc/bluetooth ]; then
+        if [ "$(python3 "$p/wavelens_bt_config.py" /etc/bluetooth/main.conf 2>/dev/null)" = "changed" ]; then
+            log "Bluetooth: main.conf set for iPhone/iPad without a pairing prompt"
+            systemctl restart bluetooth 2>/dev/null || true
+            sleep 2
+        fi
+    fi
     systemctl daemon-reload
     if [ "$bt" = 1 ]; then systemctl enable -q wavelens-bt-agent 2>/dev/null; systemctl restart wavelens-bt-agent 2>/dev/null || true; fi
 }

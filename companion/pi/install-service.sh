@@ -89,6 +89,17 @@ if [ "${WAVELENS_BT_AUTOPAIR:-1}" != "0" ] && [ -f wavelens-bt-agent.service ] &
     fi
 fi
 
+# No pairing prompt on an iPhone or iPad either (see wavelens_bt_config.py): bluetoothd's GATT client off, so
+# it never reads the iPad's encrypted services, which is what made iOS ask to pair; and Just Works re-pairing.
+# Part of the same WAVELENS_BT_AUTOPAIR choice. bluetoothd reads main.conf only at start.
+if [ "${WAVELENS_BT_AUTOPAIR:-1}" != "0" ] && [ -f wavelens_bt_config.py ] && [ -d /etc/bluetooth ]; then
+    if [ "$(python3 wavelens_bt_config.py /etc/bluetooth/main.conf 2>/dev/null)" = "changed" ]; then
+        echo "Bluetooth: iPhone/iPad link without a pairing prompt (main.conf; the original is main.conf.wavelens-bak)"
+        systemctl restart bluetooth 2>/dev/null || true
+        sleep 2
+    fi
+fi
+
 systemctl daemon-reload
 if [ "${BT_AGENT:-0}" = "1" ]; then systemctl enable -q wavelens-bt-agent && systemctl restart wavelens-bt-agent || echo "wavelens-bt-agent did not start: journalctl -u wavelens-bt-agent"; fi
 systemctl enable wavelens-bridge
