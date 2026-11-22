@@ -47,6 +47,9 @@ static void subghzInit();
 #define WL_VERSION  "dev"        // platformio.ini injects companion/VERSION; Arduino IDE builds say "dev"
 #endif
 #define FW_NAME     "wavelens-esp32 " WL_VERSION
+#ifndef WL_BUILD
+#define WL_BUILD    "local"      // version.py injects the commit; only the boot line prints it
+#endif
 // Status LED. digitalWrite() on RGB_BUILTIN drives an addressable (WS2812) LED as a NeoPixel; that is only
 // right where the boards this image goes on really have one. The one esp32c3 image is built for the
 // C3-DevKitM-1 (whose variant defines RGB_BUILTIN, a WS2812 on GPIO 8) but mostly lands on C3 SuperMini-class
@@ -1652,7 +1655,7 @@ void setup() {
   rfInit();
   subghzInit();
   listenInit();
-  Serial.printf("%s up; advertising as %s  (pair code %s)\n", FW_NAME, devName, pairCode);
+  Serial.printf("%s (build " WL_BUILD ", " WL_CHIP ") up; advertising as %s  (pair code %s)\n", FW_NAME, devName, pairCode);
   Serial.printf("passkey %06lu — %s\n", (unsigned long)passkey,
                 locked ? "locked: phones must pair with it" : "not locked (lock it from the app)");
 }
