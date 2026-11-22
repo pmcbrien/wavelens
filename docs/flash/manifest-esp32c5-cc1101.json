@@ -1,1 +1,1 @@
-{"name": "Wavelens Spotter (esp32c5-cc1101)", "version": "2026.11.18.4", "new_install_prompt_erase": true, "builds": [{"chipFamily": "ESP32-C5", "parts": [{"path": "wavelens-esp32c5-cc1101-merged.bin", "offset": 0}]}]}
+{"name": "Wavelens Spotter (esp32c5-cc1101)", "version": "2026.11.22", "new_install_prompt_erase": true, "builds": [{"chipFamily": "ESP32-C5", "parts": [{"path": "wavelens-esp32c5-cc1101-merged.bin", "offset": 0}]}]}
