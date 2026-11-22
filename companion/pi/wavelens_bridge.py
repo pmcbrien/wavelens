@@ -32,7 +32,7 @@ rtl_433 / hackrf_sweep / rtl_power / rtl_fm / rtl_tcp / dump1090 you use on PATH
 for digital voice and P25 / DMR / EDACS trunking; smartnet.py beside this file for Motorola Type II.
 Receive only: nothing here ever transmits. Runs on a Pi 4 in a car daily (Oct 2026); the HackRF sweep
 is a forked worker process, a hung RTL-SDR is USB-reset, and a missing sensor dongle is tolerated.
-Tunables that matter for the scanner: --trunk-idle (5 s), --trunk-min-db (18), --listen-squelch,
+Tunables that matter for the scanner: --trunk-idle (30 s), --trunk-min-db (18), --listen-squelch,
 --moto-band, --hackrf-keep-sweeping.
 """
 from __future__ import annotations   # Pi OS Bullseye ships Python 3.9: keeps `dict | None` hints lazy
@@ -3834,7 +3834,7 @@ def cc_forget(mhz: float) -> None:
 
 TRUNK_SEEN_S = 180.0        # a site frequency counts as a candidate for this long after its last hit
 TRUNK_CC_WAIT_S = 10.0      # dsd-fme must show a sync on a candidate within this, else the next is tried (rtl_tcp start + sync)
-TRUNK_IDLE_S = 5.0          # a locked system with no call for this long: on to the next strongest system (scanner-style)
+TRUNK_IDLE_S = 30.0         # a locked system with no call for this long: on to the next strongest system (scanner-style)
 TRUNK_MIN_DB = 18.0         # a system is only rotated to when its control channel was this far over the band's floor
 TRUNK_RANK_TTL_S = 15 * 60.0  # the hunt's ranking of nearby systems is re-done after this
 TRUNK_FAIL_SKIP_S = 10 * 60.0 # a carrier that gave no sync is not retried for this long
@@ -4082,7 +4082,10 @@ def cc_hunt(first: list) -> None:
             # measured — else one UHF carrier kept the scan off the 800 MHz public-safety systems entirely.
             probe = [b for b in probe if any(b[1] <= f < b[2] and not rr_doubtful_site(row) for f, _, row in RR.controls)]
         elif found:
-            probe = []
+            # No list of local control channels to go by: still measure the 700 and 800 MHz bands, where the
+            # public-safety systems are. A steady VHF or UHF carrier is as often paging or data as a control
+            # channel, and stopping at it kept the hunt off the 800 MHz system entirely.
+            probe = [b for b in probe if b[1] >= 769.0 and b[2] <= 869.0]
         now = time.time()
         if probe and not cancelled() and LISTEN["proc"] is not None and LISTEN["mode"] in TRUNK_MODES and LISTEN["detected"] \
                 and now - LISTEN.get("call_at", 0.0) < TRUNK_PROBE_QUIET_S:
@@ -4551,6 +4554,14 @@ def follow_leave(now: float, why: str) -> None:
         with FOLLOW_LOCK:
             LISTEN["played"][follow_key(LISTEN["mhz"])] = now
     if not follow_next(now):
+        if "trunked system" in why and LISTEN["proc"] is not None and LISTEN["mode"] in TRUNK_MODES \
+                and LISTEN["detected"] and LISTEN["follow"]:
+            # Quiet, but it is the only system to go to and nothing conventional is waiting: stay on it, the
+            # way a hardware scanner sits on its one site. Dropping it left the scan off the air for about a
+            # minute at a time until trunk_resume brought it back, missing most of the calls.
+            LISTEN["chan_at"] = now
+            listen_status(f"trunked: {LISTEN['mhz']:.4f} MHz quiet; staying on it (the only system nearby)")
+            return
         if TRUNK["auto"] and LISTEN["follow"] and not HUNT["on"] and "trunked system" not in why and trunk_resume():
             listen_status(f"follow: {why}; back to the trunked system")
             return
@@ -6834,7 +6845,7 @@ def main() -> None:
     ap.add_argument("--hackrf-ppm", type=float, default=0.0,
                     help="HackRF crystal correction: reported MHz are scaled by (1 + ppm/1e6). Key a radio on a known "
                          "frequency, read exact_mhz, then ppm = (known - read) / read * 1e6 (typically -20..20)")
-    ap.add_argument("--trunk-idle", type=float, default=5.0, metavar="SECONDS",
+    ap.add_argument("--trunk-idle", type=float, default=30.0, metavar="SECONDS",
                     help="Follow leaves a locked trunked system after this long without a call, for the next strongest (default 5)")
     ap.add_argument("--tg-unlisted", choices=("mute", "play"), default="mute",
                     help="with POLICE / FIRE / EMS chosen: a talkgroup your export does not list, on a system it covers, "

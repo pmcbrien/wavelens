@@ -669,7 +669,7 @@ utilities and businesses, P25 before DMR before EDACS; two candidates per site s
    unit ID is never read, kept or shown. Encrypted calls (ALG ID other than 0x80/0x00) are shown as
    "· encrypted" and decode to silence; a system whose control channel issues only encryption commands
    with no clear call for 15 s is marked encrypted and skipped.
-5. **Rotate.** No call for `--trunk-idle` seconds (default 5) → the next strongest system in the ranking,
+5. **Rotate.** No call for `--trunk-idle` seconds (default 30) → the next strongest system in the ranking,
    round-robin; a system is re-tried after the others. The ranking is redone with a fresh hunt after
    15 minutes. Conventional hits (a VHF/UHF carrier in a voice band) get their turn when the system is
    quiet and Follow returns to the system afterwards; low-band (30–54 MHz) hits are tuned only when the
