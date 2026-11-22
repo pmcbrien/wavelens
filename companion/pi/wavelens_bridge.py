@@ -4080,7 +4080,10 @@ def cc_hunt(first: list) -> None:
             # Something steady in the swept bands (a business repeater, say) says nothing about the bands
             # the sweep never visits. Where the list has a local control channel, that band is still
             # measured — else one UHF carrier kept the scan off the 800 MHz public-safety systems entirely.
-            probe = [b for b in probe if any(b[1] <= f < b[2] and not rr_doubtful_site(row) for f, _, row in RR.controls)]
+            # The 700 and 800 MHz public-safety bands are always measured too: an export with only a few
+            # conventional or VHF control channels in it must not keep the hunt off them.
+            probe = [b for b in probe if b[1] >= 769.0 and b[2] <= 869.0
+                     or any(b[1] <= f < b[2] and not rr_doubtful_site(row) for f, _, row in RR.controls)]
         elif found:
             # No list of local control channels to go by: still measure the 700 and 800 MHz bands, where the
             # public-safety systems are. A steady VHF or UHF carrier is as often paging or data as a control
