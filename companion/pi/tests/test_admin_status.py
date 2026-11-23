@@ -41,6 +41,13 @@ class Status(unittest.TestCase):
         order = {"bad": 0, "warn": 1, "info": 2, "ok": 3}
         self.assertEqual(levels, sorted(levels, key=order.get))     # worst first
         self.assertTrue(A.support_report().startswith("Wavelens support report"))
+        self.assertIn("Scanner software v", A.support_report().splitlines()[1])   # every report says its version
+
+    def test_log_header_names_the_versions(self):
+        h = A.log_header("Wavelens bridge log")
+        self.assertTrue(h.startswith("Wavelens bridge log · "))
+        self.assertIn("Scanner software v" + A.installed_version(), h)
+        self.assertIn("Spotter firmware", h)
 
     def test_sessions_survive_a_restart(self):
         with tempfile.TemporaryDirectory() as d:

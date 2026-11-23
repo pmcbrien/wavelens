@@ -1409,10 +1409,17 @@ def run_diagnostics(deep=False):
             "summary": {k: sum(1 for c in checks if c["level"] == k) for k in order}}
 
 
+def log_header(what):
+    """The lines every log or report the admin page hands out starts with: which software wrote it."""
+    fw = read_text(FW_VERSION).strip() or "none downloaded"
+    return (f"{what} · {time.strftime('%Y-%m-%d %H:%M:%S %Z')} · {hostname()}\n"
+            f"Scanner software v{installed_version()} · Spotter firmware on this Pi {fw}\n\n")
+
+
 def support_report():
     """Plain text for support: the checks, the hardware and the last bridge lines. No passwords, no Wi-Fi keys."""
     d = run_diagnostics(deep=True)
-    out = [f"Wavelens support report · {time.strftime('%Y-%m-%d %H:%M:%S')} · {d['snap']['host']} · v{d['snap']['version']}", ""]
+    out = [log_header("Wavelens support report").rstrip("\n")]
     for c in d["checks"]:
         out.append(f"[{c['level'].upper():4}] {c['title']}: {c['found']}" + (f"  → {c['fix']}" if c["fix"] else ""))
     s = d["snap"]["sys"]
@@ -2068,7 +2075,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/logs":
             return self.send_json({"lines": journal_lines(300, noise="noise" in q)})
         if path == "/api/logs.txt":
-            return self.send_text("\n".join(journal_lines(5000, noise=True)) + "\n", "wavelens-bridge.log")
+            return self.send_text(log_header("Wavelens bridge log") + "\n".join(journal_lines(5000, noise=True)) + "\n",
+                                  f"wavelens-bridge-{installed_version()}-{time.strftime('%Y%m%d-%H%M')}.log")
         if path == "/api/update/log":
             return self.send_json(update_status_json())
         if path == "/api/devices":

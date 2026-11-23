@@ -28,6 +28,11 @@ ROWS = (
     '"Air Base",33,"A",1700,6a4,"Flight Ops","D","Ops","Military","x"\n'
     '"Metro",55,"A",9,9,"Metro plain","D","d","Law Dispatch","x"\n'
     '"Metro (P25)",56,"A",9,9,"Metro P25","D","d","Law Dispatch","x"\n'
+    '"Lake County",23,"A",1801,709,"CLFD3","D","Clawson Fireground","Fire-Tac","x"\n'
+    '"Lake County",23,"A",1802,70a,"STLAW","D","St. Lawrence Hospital","Hospital","x"\n'
+    '"Lake County",23,"A",1803,70b,"OPS9","D","Police/Fire Tactical 9","Multi-Tac","x"\n'
+    '"Lake County",23,"A",1804,70c,"TRAIN","D","Radio Training","Multi-Talk","x"\n'
+    '"Lake County",23,"A",1805,70d,"WEST PD","D","Westville Police","","x"\n'
 )
 
 
@@ -109,6 +114,25 @@ class TalkgroupSystem(unittest.TestCase):
         self.assertFalse(verdict(536))                   # Unmute beats the category
         b.TRUNK["cats"] = set()
         self.assertFalse(verdict(1040))                  # no filter: everything plays
+
+    def test_police_means_law_tags_only(self):
+        """Seen on the Windows app and the Pi: POLICE played fire, hospital and shared tactical talkgroups.
+        "law" matched inside "Clawson" and "Lawrence", and Multi-* tags counted as police."""
+        b = self.b
+        self.follow("Lake County", "23")
+        self.assertEqual(b.tg_category(1801), "fire")
+        self.assertEqual(b.tg_category(1802), "ems")
+        self.assertEqual(b.tg_category(1803), "other")    # shared police/fire: follows the Interop option
+        self.assertEqual(b.tg_category(1804), "other")
+        self.assertEqual(b.tg_category(1805), "police")   # no tag: whole words of the description
+        b.TRUNK["interop"] = "police"
+        self.assertEqual(b.tg_category(1803), "police")
+
+    def test_conventional_agency_whole_words(self):
+        b = self.b
+        self.assertEqual(b.follow_hit_category({"agency": "Lawrence Township Fire"}), "fire")
+        self.assertEqual(b.follow_hit_category({"agency": "County Sheriff's Office"}), "police")
+        self.assertEqual(b.follow_hit_category({"agency": "Oaklawn Hospital"}), "ems")
 
     def test_filter_on_a_system_the_export_does_not_cover(self):
         b = self.b

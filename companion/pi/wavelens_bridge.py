@@ -54,6 +54,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import platform
 import sys
 import threading
 import time
@@ -3580,10 +3581,33 @@ def sys_order(ranked: list) -> list:
 
 # Category of a talkgroup from the RadioReference Tag column ("Law Dispatch", "Fire-Tac", "EMS Dispatch",
 # "Multi-Dispatch", "Public Works", "Schools", "Interop", "Hospital"…). The phone's POLICE / FIRE / EMS / OTHER
-# buttons map onto these.
-TG_CATS = [(("law", "corrections", "police", "sheriff"), "police"), (("fire",), "fire"), (("ems", "medical", "hospital"), "ems"),
-           (("multi", "public safety"), "police"), ]
-TG_SHARED = ("interop", "emergency ops")     # every service talks on these: "other" unless TRUNK["interop"] says police
+# buttons map onto these. The Tag is RadioReference's fixed list, so it decides on its own: the description
+# and alpha tag are only read when a row has no tag, and then as whole words — as substrings, "law" matched
+# "Clawson Fireground" and "St. Lawrence Hospital", and both played under POLICE.
+TG_TAG_CATS = ((("law", "corrections"), "police"), (("fire",), "fire"), (("ems", "hospital"), "ems"))
+# Shared by police, fire and EMS: Interop, Emergency Ops and the Multi-Dispatch / Multi-Tac / Multi-Talk
+# tags ("Police/Fire Tactical 9", event and training channels). "other" unless TRUNK["interop"] says police.
+TG_SHARED = ("interop", "emergency ops", "multi")
+TG_WORDS = ((re.compile(r"\b(law|police|sheriffs?|corrections|jail|pd|so)\b"), "police"),
+            (re.compile(r"\b(fire|fireground|fd)\b"), "fire"),
+            (re.compile(r"\b(ems|medical|ambulance|hospital)\b"), "ems"))
+
+
+def tg_tag_category(tag: str, text: str = "") -> str:
+    """police | fire | ems | shared | other from a RadioReference Tag; with no tag, from whole words of the
+    description and alpha tag."""
+    t = re.sub(r"[-_/]+", " ", (tag or "").strip().lower())
+    if t:
+        if any(t.startswith(w) for w in TG_SHARED):
+            return "shared"
+        for words, cat in TG_TAG_CATS:
+            if any(t.split()[0] == w for w in words):
+                return cat
+        return "other"
+    for rx, cat in TG_WORDS:
+        if rx.search((text or "").lower()):
+            return cat
+    return "other"
 
 
 def tg_system_covered() -> bool:
@@ -3747,13 +3771,10 @@ def tg_category(tg: int, system: "str | None" = None, sid: "str | None" = None) 
     if not hit:
         return ""
     alpha, desc, mode, tag = hit
-    text = f"{tag} {desc} {alpha}".lower()
-    if any(w in tag.lower() for w in TG_SHARED):
+    cat = tg_tag_category(tag, f"{desc} {alpha}")
+    if cat == "shared":
         return "police" if TRUNK.get("interop") == "police" else "other"
-    for words, cat in TG_CATS:
-        if any(w in text for w in words):
-            return cat
-    return "other"
+    return cat
 HUNT = {"on": False, "cancel": False, "sweeping": False, "gen": 0}
 TRUNK_KINDS = ("p25", "dmr", "nxdn", "edacs", "moto")
 # Where control channels live: the base-station (output) side of the trunking bands, 800 MHz first
@@ -4468,12 +4489,13 @@ def follow_hit_category(x: dict) -> str:
     a = str(x.get("agency") or "").lower()
     if not a:
         return ""
-    if any(k in a for k in ("law", "police", "sheriff", "public safety")):
-        return "police"
-    if "fire" in a:
-        return "fire"
-    if any(k in a for k in ("ems", "ambulance", "hospital", "medical")):
-        return "ems"
+    # Whole words: "Lawrence Township Fire" is fire, not law. A licensee named "public safety" runs police,
+    # fire and EMS together, so it counts as police only when Interop does.
+    for rx, cat in TG_WORDS:
+        if rx.search(a):
+            return cat
+    if re.search(r"\bpublic safety\b", a):
+        return "police" if TRUNK.get("interop") == "police" else "other"
     return "other"
 
 
@@ -7249,6 +7271,8 @@ def main() -> None:
     ap.add_argument("--plan", action="store_true",
                     help="print shell assignments (PLAN_RTL433_DEV, PLAN_ARGS) for the radios found, and exit; run-bridge.sh uses it when WAVELENS_AUTO=1")
     a = ap.parse_args()
+    # First line of every run, so any journal or log someone sends says which version wrote it.
+    print(f"bridge: {FW} starting (Python {sys.version.split()[0]}, {platform.platform(terse=True)})", file=sys.stderr, flush=True)
     sys.stderr = _StderrTee(sys.stderr)
     threading.Thread(target=log_pump, daemon=True).start()
     CAPS.append("log")
