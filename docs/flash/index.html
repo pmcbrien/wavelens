@@ -34,7 +34,7 @@
       <li>Click the button, pick the serial port that appears (usually <code>USB Serial</code>, <code>USB JTAG/serial debug unit</code>, <code>CP210x</code> or <code>CH340</code>), and let it run — about a minute.</li>
       <li>When it says done, unplug and plug it back in. The LED blinks twice (white on boards with a colour LED) and it advertises as <code>Wavelens-XXXX</code>; pair it in the app.</li>
     </ol>
-    <esp-web-install-button manifest="manifest.json?b=f7c2c53">
+    <esp-web-install-button manifest="manifest.json?b=77f4f21">
       <span slot="unsupported" class="nope">This browser can't talk to USB serial. Use Chrome or Edge on a computer.</span>
       <span slot="not-allowed" class="nope">Open this page over HTTPS to flash.</span>
     </esp-web-install-button>
@@ -43,7 +43,7 @@
   <h2 id="c5-cc1101">ESP32-C5 with a CC1101 (new, being proven)</h2>
   <div class="box">
     <p>Wired a CC1101 sub-GHz module to an ESP32-C5 (for example a Waveshare ESP32-C5-Zero)? This build adds rtl_433 decoders on 433.92&nbsp;MHz (tyre sensors, key fobs, remotes, weather sensors) to the C5's 2.4 and 5&nbsp;GHz Wi-Fi and Bluetooth. Wire it as in the <a href="https://wavelensapp.us/hardware.html#c5-cc1101">wiring diagram</a> first, then install with this button. The plain button above would install the C5 build without the CC1101. It is new and has not yet been checked on a real board, so tell us how yours does. Receive only: the CC1101 is never told to transmit. Update this board from here or from the Wavelens app; don't flash it from a Scanner Pi's admin page, which installs the plain C5 build.</p>
-    <esp-web-install-button manifest="manifest-esp32c5-cc1101.json?b=f7c2c53">
+    <esp-web-install-button manifest="manifest-esp32c5-cc1101.json?b=77f4f21">
       <button slot="activate">Install C5 + CC1101 firmware</button>
       <span slot="unsupported" class="nope">This browser can't talk to USB serial. Use Chrome or Edge on a computer.</span>
       <span slot="not-allowed" class="nope">Open this page over HTTPS to flash.</span>
