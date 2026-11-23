@@ -3425,7 +3425,7 @@ DSD_UDP_PORT = 23470
 RTL_TCP_PORT = 23471
 LISTEN = {"proc": None, "req": None, "gen": 0, "dev": "", "ppm": 0, "gain": 40, "mhz": 0.0, "mode": "", "asked": "", "sq": 0,
           "raw_mhz": 0.0, "tol": 0.05, "readings": [], "honed_at": 0.0,   # the sweep's placing, and later readings
-          "until": 0.0, "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0,
+          "until": 0.0, "seq": 0, "follow": False, "follow_until": 0.0, "tuned_at": 0.0, "last_audio": 0.0, "autosq": True,
           "chan_at": 0.0,                   # when this channel was first asked for (tuned_at restarts on AUTO → FM)
           "carrier_at": 0.0, "detected": "",   # auto: when the sweep last saw the tuned carrier; what dsd-fme found
           "call": "", "call_at": 0.0,       # trunk: the talkgroup dsd-fme is following right now, and when it started
@@ -4628,6 +4628,52 @@ SCAN_TTL_S = 15 * 60.0      # ends by itself this long after the app's last rene
 SCAN_MAX_CHANS = 64
 
 
+# Noise squelch (auto squelch), the way a hardware scanner's works: an FM receiver with no carrier puts out loud
+# broadband hiss; with a carrier the hiss "quiets" and what is left is voice, mostly under 1 kHz. So a frame whose
+# high-frequency share is large is noise, whatever its level: rtl_fm's -l squelch is a level threshold that sits
+# below the static on many channels (marine and ham especially, and it moves with the gain), so static played.
+# A frame that is near-silent is a dead carrier, also not a voice. Applies to the analog listens (rtl_fm FM / AM):
+# frames judged noise are not sent and do not count as "heard", so a band scan moves straight on.
+NSQ_RATIO = 1.3             # sum(diff^2) / sum(x^2) at 8 kHz above this = hiss. Measured on the bench Pi (rtl_fm
+                            # -M fm -s 16000 -r 8000, gain 40): marine static 1.6-2.3 (5th-95th percentile, -l 30
+                            # passed all of it); a weak NOAA broadcast 0.6-2.0, speech well under 1
+NSQ_MIN_RMS = 120           # below this, a carrier with nothing on it
+NSQ_OPEN = 2                # consecutive voice frames (80 ms) to open
+NSQ_CLOSE = 6               # consecutive noise frames (240 ms) to close: no chopped syllables
+
+
+def nsq_noise(pcm: bytes) -> bool:
+    """True if this 8 kHz frame is hiss or a silent carrier, not something to hear."""
+    n = len(pcm) // 2
+    if n < 8:
+        return True
+    x = struct.unpack(f"<{n}h", pcm[:2 * n])
+    m = sum(x) / n
+    x = [v - m for v in x]
+    e = sum(v * v for v in x)
+    if e < NSQ_MIN_RMS * NSQ_MIN_RMS * n:
+        return True
+    d = sum((x[i] - x[i - 1]) ** 2 for i in range(1, n))
+    return d > NSQ_RATIO * e
+
+
+class NoiseSquelch:
+    """Opens on NSQ_OPEN voice frames in a row, closes on NSQ_CLOSE noise frames in a row."""
+
+    def __init__(self):
+        self.open, self.run = False, 0
+
+    def frame(self, pcm: bytes) -> bool:
+        noise = nsq_noise(pcm)
+        if self.open == (not noise):
+            self.run = 0
+        else:
+            self.run += 1
+            if self.run >= (NSQ_CLOSE if self.open else NSQ_OPEN):
+                self.open, self.run = not self.open, 0
+        return self.open
+
+
 def scan_parse(cmd: dict):
     """(channels, mode, name) from a bandscan command; channels in 24–1766 MHz, de-duplicated, in the order
     given (the app lists the busiest-first ones first: Ch 16, Guard). None when nothing usable is in it."""
@@ -4840,7 +4886,7 @@ def listen_status(msg: str) -> None:
           "listen": {"mhz": LISTEN["mhz"] if on else 0, "mode": LISTEN["mode"] if on else "",
                      "asked": LISTEN["asked"] if on else "", "detected": LISTEN["detected"] if on else "",
                      "call": LISTEN["call"] if on else "",
-                     "sq": LISTEN["sq"], "follow": bool(LISTEN["follow"]),
+                     "sq": LISTEN["sq"], "autosq": bool(LISTEN.get("autosq", True)), "follow": bool(LISTEN["follow"]),
                      "lockout": LISTEN["lockout"],
                      "system": (TRUNK.get("system") or "") if on and LISTEN["mode"] in TRUNK_MODES else "",
                      "hold": bool(TRUNK.get("hold")), "tglock": int(TRUNK.get("tg_lock") or 0), "idle": TRUNK_IDLE_S,
@@ -5691,6 +5737,7 @@ def _serve_listen(req: tuple, gen: int) -> None:
     print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})" + (" · APCO25" if op25 is not None else ""), file=sys.stderr)
     listen_status(f"listening on {mhz:.4f} MHz ({mode.upper()}); the RTL-SDR sweep is paused")
     enc = Ima()
+    nsq = NoiseSquelch() if sock is None and mode in ("fm", "am") and LISTEN.get("autosq", True) else None
     in_rate = out_rate if sock is None else LISTEN_RATE
     need = int(in_rate * LISTEN_FRAME / LISTEN_RATE) * 2      # one 40 ms frame at the input rate
     buf = b""
@@ -5939,6 +5986,8 @@ def _serve_listen(req: tuple, gen: int) -> None:
                         break
                 if LISTEN["detected"] == "DATA":
                     continue                 # digital carrier nobody can decode here: no audio, and Follow sees it as quiet
+                if nsq is not None and not nsq.frame(pcm if len(pcm) == LISTEN_FRAME * 2 else pcm[:LISTEN_FRAME * 2]):
+                    continue                 # static or a dead carrier: not heard, not sent
                 LISTEN["last_audio"] = time.time()
                 if LISTEN["detected"] in ("POCSAG", "FLEX"):
                     continue                 # pager data: nothing to hear; the pages go as lines
@@ -6574,6 +6623,12 @@ def run_peripheral(name: str) -> None:
                     scan_apply_lockout(time.time())
                 emit({"t": "status", "msg": f"lockout: {len(lst)} frequencies Follow will skip", "band": state["band"],
                       "mode": state["mode"], "lockout": lst})
+            elif str(cmd.get("v") or "") == "autosq":
+                # {"c":"listen","v":"autosq","on":true}: the noise squelch on analog channels (on by default)
+                LISTEN["autosq"] = bool(cmd.get("on", True))
+                if LISTEN["req"] is not None and LISTEN["mode"] in ("fm", "am"):
+                    listen_resolve(LISTEN["mode"], "auto squelch " + ("on" if LISTEN["autosq"] else "off"))
+                listen_status("auto squelch " + ("on: static and dead carriers are skipped" if LISTEN["autosq"] else "off"))
             elif str(cmd.get("v") or "") == "hold":
                 TRUNK["hold"] = bool(cmd.get("on", True))
                 listen_status("system held: staying on this system" if TRUNK["hold"] else "system released: scanning again")
@@ -7311,6 +7366,7 @@ def main() -> None:
         CAPS.append("listen")
         CAPS.append("trunk")                   # digital voice + trunk-tracking (dsd-fme); an ESP32 companion has "listen" only
         CAPS.append("bandscan")                # {"c":"listen","v":"bandscan",...}: step through a band's channels (SCAN)
+        CAPS.append("autosq")                  # {"c":"listen","v":"autosq","on":bool}: noise squelch on analog channels
         kill_strays()
         threading.Thread(target=listen_worker, daemon=True).start()
         threading.Thread(target=follow_watch, daemon=True).start()
