@@ -548,6 +548,13 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
                                      // may be off (MHz); the bridge snaps to the likeliest channel within it;
 {"c":"listen","v":"follow"}          // scanner: tune every fresh voice-band hit (air AM, VHF/UHF FM, CB), play it
 {"c":"listen","v":"lockout","mhz":[460.6,462.5625]}   // the whole list of MHz Follow never tunes (±20 kHz);
+{"c":"listen","v":"bandscan","mhz":[156.8,156.3],"mode":"fm","name":"Marine","sq":30,"ranges":[[156,163]]}
+                                     // step through a band's channels (cap "bandscan"): a quiet one is left after
+                                     // 1.8 s, a voice held until 3 s of silence, squelch at least 30. "ranges" (MHz)
+                                     // keeps the sweep dongle to the band while the scan runs; a lockout drops those
+                                     // channels, and locking out every channel ends the scan
+{"c":"listen","v":"autosq","on":false}   // noise squelch on analog FM/AM (cap "autosq", on by default): static and
+                                     // dead carriers are neither played nor count as heard, so a band scan moves on
 {"c":"listen","v":"off"}             // until the squelch closes + 3 s or 30 s is up, then the newest waiting one
                                      // (an AUTO probe gets its 8 s undisturbed); a channel just played waits 60 s
                                      // before it's returned to. "sq": rtl_fm
@@ -555,9 +562,9 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 {"c":"listen","v":"trunk","mhz":856.9625,"qpsk":true}   // follow a trunked system from this control channel
 {"c":"listen","v":"trunk"}           // …or find the nearest system (hunt); see "Trunked systems" below
 {"c":"listen","v":"trunkauto","on":true,"qpsk":false,"idle":5}   // may Follow take trunked systems by itself; QPSK
-                                     // first?; "idle": seconds of silence before the scanner hands off (2–120, default 5;
+                                     // first?; "idle": seconds of silence before the scanner hands off (2–120, default 30;
                                      // the status echoes it as "idle")
-{"c":"listen","v":"hold","on":true}      // stay on this trunked system (no 5 s rotation); "on":false releases
+{"c":"listen","v":"hold","on":true}      // stay on this trunked system (no idle rotation); "on":false releases
 {"c":"listen","v":"skip"}                // leave this system now, go to the next strongest
 {"c":"listen","v":"tglock","tg":1234}    // hear only this talkgroup (0 unlocks); "tgavoid" with "tgs":[...] mutes a list
 {"c":"listen","v":"tgallow","tgs":[1234]}   // talkgroups always heard even when the category filter would mute them
@@ -692,12 +699,12 @@ frequency — the usual convention, not a guarantee); **Motorola Type II / Smart
 the bridge's own decoder** (`pi/smartnet.py`: `rtl_fm` discriminator audio → 3600-baud FSK bits →
 preamble, 4×19 deinterleave, parity correction, 10-bit CRC → OSWs → grants; the same dongle plays each
 grant's analog voice channel and returns; `--moto-band` 800 | 800r | 800s | 900 | obt:BASE:SPACING:OFFSET).
-**APCO25 decoder for trunked P25**: provision.sh with `WAVELENS_DIGITAL_VOICE=1` (or `pi/install-apco25.sh`)
-builds it from `companion/apco25` into `/opt/apco25`, and the bridge then follows trunked P25 with its CQPSK demodulator instead of dsd-fme
+**APCO25 decoder for trunked P25**: provision.sh builds it by default (`WAVELENS_DIGITAL_VOICE=0` skips; `pi/install-apco25.sh` does it on its own)
+from `companion/apco25` into `/opt/apco25`, and the bridge then follows trunked P25 with its CQPSK demodulator instead of dsd-fme
 (much cleaner on simulcast); same call fields, holds, ignores and filters. If it can't start, that listen falls
 back to dsd-fme; DMR, NXDN, EDACS and conventional digital always use dsd-fme. `WAVELENS_TRUNK_DECODER=auto|op25|dsd-fme`
-in `/etc/default/wavelens-bridge` (default `auto`). Its IMBE vocoder is patented in some countries; the
-installer asks first. LTR has no control channel to follow. Unencrypted public-safety trunked traffic is lawful to receive in
+in `/etc/default/wavelens-bridge` (default `auto`). Its IMBE vocoder is patented in some countries; provision.sh
+prints the notice, and `install-apco25.sh` run on its own asks first. LTR has no control channel to follow. Unencrypted public-safety trunked traffic is lawful to receive in
 the US; check state law for a receiver in a vehicle.
 
 **Auto mode** (a plain Listen on a carrier) starts `dsd-fme -fa`; the sync it reports ("Sync: +DMR",
