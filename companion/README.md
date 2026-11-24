@@ -352,6 +352,12 @@ tagged by `src`; it gets the same `mode` / `band` / `ch` / `park` commands as th
 `log` and audio are never sent to it. Both reconnect on their own. A companion's own advertisement is never
 adopted as the other link.
 
+**Up to five links on Android.** The app holds a main companion plus up to four more at once (Companion
+screen → Add a companion), so a Pi and four Spotters can all be linked over Bluetooth for direction finding
+when the Spotters aren't plugged into the Pi's USB ports. Each card says what the board is once it has said
+hello: "Scanner (Raspberry Pi)", "Spotter (ESP32-S3)" or "Spotter, dual-band (ESP32-C5)". Four Spotters on the
+Pi's USB need only the one link to the Pi (a powered hub is wise: see the power note below).
+
 **The Pi is always the main one.** Each link remembers the caps from its last hello; whenever the second link
 reports a better scanner (`trunk` > `listen` > `sweep`) than the main one — or the main slot is empty — the app
 swaps the two pairings and reconnects. Pair them in any order; an ESP32 paired first ends up as the sniffer,
