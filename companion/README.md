@@ -383,6 +383,29 @@ Wi-Fi + Bluetooth on every channel, so networks on 3, 9 or 13 and Bluetooth are 
 USB flasher asks the bridge to let go of the port (`/run/wavelens/spotter-pause`) while it flashes.
 `--no-spotters` leaves USB boards alone. Tests: `python3 -m unittest companion/pi/tests/test_spotters.py`.
 
+### Direction finding (cap `df`)
+
+Each Spotter can be told which way its antenna faces: front, front-right, right, rear-right, rear, rear-left,
+left or front-left. The setting is kept on the board (`{"c":"face"}`, firmware 2026.11.23.1) and reported in
+its hello, so every app sees the same one. Set it from the phone's Companion screen (**Faces**), iOS Setup or the
+desktop Find tab. Mount the Spotters at the car's edges. The car body shadowing the far side is what makes the
+sides differ: omni antennas a few inches apart can't give a direction. Two Spotters give a side, four give
+roughly a quadrant, and no app claims more than that.
+
+- **Pi:** with two or more of its USB Spotters facing different ways, every hit it relays carries
+  `"brg":{"deg":90,"agree":0.8,"n":2,"word":"right","sides":{"USB 1.1":-80,"USB 1.2":-55}}`. That is the
+  power-weighted direction of the units that heard the device in the last 6 s. Faced units keep Bluetooth on
+  beside their Wi-Fi channels (mode `both`), so a Bluetooth device has a level on every side.
+- **Converge:** a Wi-Fi device is only heard by the units parked on its channel. For one worth pointing at,
+  the app sends `{"c":"df","id":"b4:1e:52:12:34:56","ch":6}` and the Pi tunes every faced unit to that channel
+  for 2 s (`{"c":"tune"}`). At most once per device every 6 s. A Spotter linked straight to a phone or computer
+  is sent the `tune` itself.
+- **Commands:** `{"c":"spotter","u":"USB 1.2","face":"front-left"}` sets a Pi-hosted unit's facing (`""` clears
+  it). Each unit in the hello's `spotters` list carries `"face"`, `"df"` (its firmware can take a facing) and
+  `"ghz5"`.
+- **Phones and the desktop** also sum the readings they get themselves: the Pi's units (by `u`) plus a Spotter
+  on the phone's or computer's own link. A Pi plus a Bluetooth Spotter on the phone count together.
+
 ### Who hears what
 
 Nothing is handed off: every radio in the car listens, and their hits merge in the phone by address (strongest
@@ -538,6 +561,15 @@ The phone keeps RSSI history, so repeats are useful; floods are not.
 {"c":"band","v":"2g"}                // 2g | 5g | all     (say so in a status if the hardware can't)
 {"c":"ch","v":"hop"}                 // hop every channel of the band
 {"c":"ch","v":[1,6,11]}              // or park on these
+{"c":"face","v":"front-left"}        // Spotter (cap "df"): which way its antenna faces — front, front-right, right,
+                                     // rear-right, rear, rear-left, left, front-left; "" or "off" clears it. Saved in
+                                     // flash and sent back in the hello as "face"; off by default
+{"c":"tune","ch":149,"ms":2000,"id":"b4:1e:52:12:34:56"}   // Spotter (cap "df"): a direction reading. Sniff
+                                     // Wi-Fi on that one channel for ms (300–5000, default 2000) whatever the job,
+                                     // then go back to it unaided. id (optional): the BSSID measured, reported every
+                                     // 200 ms while tuned. Answers {"t":"tune","ok":true,"ch":149,"ms":2000} (or
+                                     // "ok":false,"msg"), then {"t":"tune","done":true,"why":"time"|"cancel"|"update",
+                                     // "ch":6}. {"c":"tune","v":false} ends it early. Bluetooth needs no tune
 {"c":"park","v":"le"}                // body cams & radios preset (the app also sends mode/band/ch for it);
                                      // a HackRF bridge parks on 796–816 MHz. "off" = sweep everything again
 {"c":"pos","lat":27.9,"lon":-82.8}   // opt-in only: the phone's fix, every 10 s, so the companion can rank

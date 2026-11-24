@@ -32,7 +32,10 @@ class Licences(unittest.TestCase):
         for key, _name, _what, _lic, folder, lic, _up in A.OSS:
             self.assertTrue((REPO / folder).is_dir(), f"{key}: {folder} missing")
             if lic:
-                self.assertTrue((REPO / folder / lic).is_file(), f"{key}: {folder}/{lic} missing")
+                archive = lic.partition(":")[0]     # "x.tar.gz:x/LICENSE": the licence inside a release tarball
+                self.assertTrue((REPO / folder / archive).is_file(), f"{key}: {folder}/{archive} missing")
+                A.source_dir = lambda: REPO
+                self.assertTrue(A.oss_licence_text(key), f"{key}: licence text not readable")
 
     def test_licence_text_comes_from_the_checkout(self):
         A.source_dir = lambda: REPO
@@ -40,7 +43,7 @@ class Licences(unittest.TestCase):
 
     def test_only_listed_components_are_served(self):
         A.source_dir = lambda: REPO
-        for bad in ("../../etc/passwd", "apco25/../../../etc/passwd", "", "bluezero", "nope"):
+        for bad in ("../../etc/passwd", "apco25/../../../etc/passwd", "", "nope", "bluezero-0.9.1/LICENSE"):
             self.assertIsNone(A.oss_licence_text(bad), bad)
 
     def test_missing_file_is_none(self):

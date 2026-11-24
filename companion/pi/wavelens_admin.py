@@ -49,6 +49,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import tarfile
 import sys
 import tempfile
 import threading
@@ -441,7 +442,7 @@ def args_set_name(args, name):
         out.append(p)
     if name:
         out += ["--name", name]
-    return shlex.join(out)
+    return " ".join(shlex.quote(x) for x in out)
 
 
 # Scanner settings the Settings page edits as form fields; each is one flag inside WAVELENS_ARGS.
@@ -501,7 +502,7 @@ def args_set_flag(args, flag, value):
         out.append(p)
     if value not in (None, ""):
         out += [flag, str(value)]
-    return shlex.join(out)
+    return " ".join(shlex.quote(x) for x in out)
 
 
 def defaults_help():
@@ -618,7 +619,7 @@ class Job:
             self.started = time.time()
             self.seq += 1
             self.lines.clear()
-            self.lines.append(f"$ {shlex.join(argv)}")
+            self.lines.append("$ " + " ".join(shlex.quote(x) for x in argv))
         threading.Thread(target=self._run, args=(argv, timeout, on_kill), daemon=True).start()
         return True
 
@@ -1560,11 +1561,11 @@ OSS = [
     ("dsd-fme", "dsd-fme", "digital voice decoder: DMR, P25 phase 1, NXDN", "ISC, with GPL-licensed files",
      "companion/vendor/dsd-fme", "COPYRIGHT", "https://github.com/lwvmobile/dsd-fme"),
     ("mbelib", "mbelib", "voice codecs used by dsd-fme", "ISC (patent notice in its README)",
-     "companion/vendor/mbelib", "README.md", "https://github.com/lwvmobile/mbelib"),
+     "companion/vendor/mbelib", "COPYRIGHT", "https://github.com/lwvmobile/mbelib"),
     ("rtl-sdr-blog", "RTL-SDR Blog driver", "driver for the RTL-SDR Blog V4 dongle", "GNU GPL version 2",
      "companion/vendor/rtl-sdr-blog", "COPYING", "https://github.com/rtlsdrblog/rtl-sdr-blog"),
     ("bluezero", "bluezero", "Python Bluetooth library the bridge uses", "MIT",
-     "companion/vendor/bluezero", "", "https://pypi.org/project/bluezero/"),
+     "companion/vendor/bluezero", "bluezero-0.9.1.tar.gz:bluezero-0.9.1/LICENSE", "https://pypi.org/project/bluezero/0.9.1/"),
 ]
 
 
@@ -1580,12 +1581,28 @@ def oss_licence_text(key):
     """The licence file of one component, from the checkout on this Pi; None if it is not there."""
     for k, _, _, _, folder, lic, _ in OSS:
         if k == key and lic:
-            f = source_dir() / folder / lic
+            archive, _, member = lic.partition(":")
+            f = source_dir() / folder / archive
             try:
+                if member:                      # a component kept as its release tarball: read the file inside
+                    with tarfile.open(f) as t:
+                        m = t.extractfile(member)
+                        return m.read().decode("utf-8", "replace") if m else None
                 return f.read_text(errors="replace")
-            except OSError:
+            except (OSError, KeyError, tarfile.TarError):
                 return None
     return None
+
+
+def oss_upstream(folder, up):
+    """The original project's link, at the exact commit vendored here when the checkout records one."""
+    try:
+        commit = (source_dir() / folder / ".vendored-commit").read_text().strip()
+    except OSError:
+        commit = ""
+    if commit and re.fullmatch(r"[0-9a-f]{7,40}", commit) and up.startswith("https://github.com/"):
+        return f"{up}/tree/{commit}"
+    return up
 
 
 def csrf_ok(given, expected):
@@ -2206,7 +2223,7 @@ open this page. If you forget it: <code>sudo wavelens-admin --reset-password</co
             f"<tr><td><b>{esc(n)}</b><br><span class=\"mut\">{esc(what)}</span></td><td>{esc(lic)}</td>"
             f"<td><a href=\"{esc(PUBLIC_REPO)}/tree/main/{esc(folder)}\">source</a>"
             + (f" · <a href=\"/licences/{esc(k)}\">licence text</a>" if l else "")
-            + f" · <a href=\"{esc(up)}\">original project</a></td></tr>"
+            + f" · <a href=\"{esc(oss_upstream(folder, up))}\">original project</a></td></tr>"
             for k, n, what, lic, folder, l, up in OSS)
         body = f"""<div class="card"><h2>Open-source software on this Scanner</h2>
 <p>The Scanner runs open-source software alongside the Wavelens bridge. Each is used under its own licence, which

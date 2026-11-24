@@ -430,7 +430,7 @@ def args_with_name(args: str, name: str) -> str:
             out.append(p)
     if name:
         out += ["--name", name]
-    return shlex.join(out)
+    return " ".join(shlex.quote(x) for x in out)
 
 
 def save_name(name: str, path: str = "") -> None:
@@ -476,6 +476,10 @@ def rename(v) -> None:
         return say("name must be 1-20 letters, digits, - or _")
     if not can_rename():
         return say("this bridge was started by hand: set its name with --name")
+    # Same name as now (or "" while already on the default): nothing to save, no restart to drop the link for.
+    cur, code = state.get("name") or "", state.get("code") or ""
+    if (name and name == cur) or (not name and code and cur == f"Wavelens-{code}"):
+        return say(f"already named {cur}")
     try:
         save_name(name)
     except OSError as e:
@@ -4793,6 +4797,11 @@ def scan_apply_lockout(now: float) -> None:
         SCAN["i"] = keep.index(playing) if playing in keep else 0
 
 
+# Held by the scan supervisor for a whole tick and by the commands that stop or start a scan, so a Stop that
+# lands mid-tick can't be followed by the tick tuning the next channel.
+SCAN_LOCK = threading.RLock()
+
+
 def scan_stop() -> None:
     SCAN.update(on=False, key=None, ranges=[])
 
@@ -4842,7 +4851,8 @@ def scan_watch() -> None:
     while True:
         time.sleep(0.25)
         try:
-            _scan_tick(time.time())
+            with SCAN_LOCK:
+                _scan_tick(time.time())
         except Exception as e:  # noqa: BLE001
             print(f"bridge: band scan: {type(e).__name__}: {e}", file=sys.stderr)
 
@@ -5759,7 +5769,11 @@ def _serve_listen(req: tuple, gen: int) -> None:
     print(f"bridge: listen: {mhz:.4f} MHz {mode} (squelch {sq})" + (" · APCO25" if op25 is not None else ""), file=sys.stderr)
     listen_status(f"listening on {mhz:.4f} MHz ({mode.upper()}); the RTL-SDR sweep is paused")
     enc = Ima()
-    nsq = NoiseSquelch() if sock is None and mode in ("fm", "am") and LISTEN.get("autosq", True) else None
+    # Only while something is choosing channels for the listener (a band scan, Follow): there a hiss frame means
+    # "move on". On a channel the user picked, a weak weather or marine station measures 0.6-2.0, across
+    # NSQ_RATIO, and the noise squelch chopped it; rtl_fm's own level squelch is enough there.
+    hunting = SCAN["on"] or LISTEN["follow"]
+    nsq = NoiseSquelch() if sock is None and mode in ("fm", "am") and LISTEN.get("autosq", True) and hunting else None
     in_rate = out_rate if sock is None else LISTEN_RATE
     need = int(in_rate * LISTEN_FRAME / LISTEN_RATE) * 2      # one 40 ms frame at the input rate
     buf = b""
@@ -6516,10 +6530,23 @@ def run_peripheral(name: str) -> None:
             hello()
             emit({"t": "status", "msg": "ok", "band": state["band"], "mode": state["mode"]})
         elif c == "spotter" and HUB:
-            # Companion screen / admin page: give a Pi-hosted Spotter a job ("ble", "wifi:1,6,11", "both", "auto")
-            msg = HUB.set_role(str(cmd.get("u") or ""), str(cmd.get("role") or "auto"))
+            # Companion screen / admin page: give a Pi-hosted Spotter a job ("ble", "wifi:1,6,11", "both", "auto"),
+            # or say which way it faces for direction finding ({"c":"spotter","u":"USB 1.3","face":"front-left"})
+            if "face" in cmd:
+                msg = HUB.set_face(str(cmd.get("u") or ""), str(cmd.get("face") or ""))
+            else:
+                msg = HUB.set_role(str(cmd.get("u") or ""), str(cmd.get("role") or "auto"))
             emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
             hello()
+        elif c == "df" and HUB:
+            # Direction reading on a Wi-Fi device ({"c":"df","id":BSSID,"ch":6}): the faced Spotters converge on
+            # its channel for 2 s, and the lines they send carry "brg". Bluetooth needs no converge.
+            try:
+                ch = int(cmd.get("ch") or 0)
+            except (TypeError, ValueError):
+                ch = 0
+            msg = HUB.converge(str(cmd.get("id") or "").lower(), ch)
+            emit({"t": "status", "msg": msg, "band": state["band"], "mode": state["mode"]})
         elif c == "peer" and HUB:
             # the phone also holds a Spotter over Bluetooth: the Pi's units take Wi-Fi, the phone's takes Bluetooth
             HUB.set_phone_spotter(bool(cmd.get("spotter")))
@@ -6619,8 +6646,9 @@ def run_peripheral(name: str) -> None:
                       "band": state["band"], "mode": state["mode"], "listen": "off"})
             elif str(cmd.get("v") or "") == "off":
                 LISTEN["follow"] = False
-                scan_stop()
-                listen_stop("stopped", cancel_hunt=True)
+                with SCAN_LOCK:
+                    scan_stop()
+                    listen_stop("stopped", cancel_hunt=True)
                 listen_status("listening stopped")
             elif str(cmd.get("v") or "") == "bandscan":
                 # {"c":"listen","v":"bandscan","mhz":[156.8, 156.3, ...],"mode":"fm","name":"Marine","sq":30}
@@ -6628,7 +6656,8 @@ def run_peripheral(name: str) -> None:
                 if got is None:
                     listen_status("band scan: no channel to scan (all locked out, or outside 24-1766 MHz)")
                 else:
-                    scan_start(got[0], got[1], got[2], cmd.get("sq"), scan_ranges(cmd, got[0]))
+                    with SCAN_LOCK:
+                        scan_start(got[0], got[1], got[2], cmd.get("sq"), scan_ranges(cmd, got[0]))
             elif str(cmd.get("v") or "") == "lockout":
                 # The phone's list of frequencies Follow must never tune (it resends it on every connect).
                 try:
@@ -7350,6 +7379,7 @@ def main() -> None:
     threading.Thread(target=hotplug_watch, daemon=True).start()
     if not a.no_spotters:
         globals()["HUB"] = spotters.Hub(emit, lambda s: print("bridge: " + s, file=sys.stderr))
+        CAPS.append("df")                      # direction finding with its USB Spotters: "brg" on hits, {"c":"df"}
         HUB.on_change = hello
         CAPS.append("spotters")
     if a.hackrf_sweep or a.rtl_power or AUTO["on"]:

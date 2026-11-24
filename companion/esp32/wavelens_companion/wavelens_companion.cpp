@@ -145,6 +145,23 @@ static uint8_t  chIdx = 0;
 static uint32_t lastHop = 0;
 static uint8_t  curCh = 1;
 
+// Direction finding (cap "df"). The owner says which side of the car (or room) this Spotter's antenna faces;
+// kept in flash and sent in every hello, so whoever coordinates several Spotters (the Pi, else the phone or
+// the desktop app) can turn their signal strengths into an arrow. "" = not set: the board takes no part in a
+// bearing. Names match the desktop app's mounts. See faceCommand.
+static const char* const FACES[] = {"front", "front-right", "right", "rear-right", "rear", "rear-left", "left", "front-left"};
+static char     face[12] = "";
+// A converge: the coordinator moves every Spotter with a facing to one Wi-Fi channel for a moment, so they all
+// measure the same device at the same time, then each goes back to its own job on its own. tuneUntil 0 = not
+// tuned. While tuned the board sniffs Wi-Fi even in Bluetooth-only mode, and reports the device asked for
+// faster than the normal per-BSSID rate, so the coordinator gets several readings to take a median of.
+static volatile uint32_t tuneUntil = 0;
+static uint8_t           tuneCh = 0;
+static uint8_t           tuneId[6];
+static volatile bool     tuneHasId = false;
+static const uint32_t    TUNE_MIN_MS = 300, TUNE_MAX_MS = 5000, TUNE_DEF_MS = 2000;
+static const uint32_t    TUNE_RATE_MS = 200;   // per-BSSID report rate for the device being measured
+
 static const uint8_t CH_24[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
 #if SOC_WIFI_SUPPORT_5G
 // ESP32-C5: the 20 MHz 5 GHz channels (UNII-1 to UNII-3); the country setting limits what is legal to send,
@@ -294,8 +311,8 @@ static_assert(sizeof(HW_WORST) <= HW_CAP, "hwJson() can overflow its buffer: rai
 // devName is at most 23 characters, pairCode 4, the chip name ("esp32c5", …) 7.
 #define HELLO_WORST "{\"t\":\"hello\",\"fw\":\"" FW_NAME "\",\"ver\":\"" WL_VERSION "\",\"chip\":\"esp32c5\"," \
                     "\"name\":\"XXXXXXXXXXXXXXXXXXXXXXX\",\"code\":\"XXXX\"," \
-                    "\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\",\"rename\",\"5g\",\"rf\",\"subghz\",\"sweep\",\"listen\",\"scan\"]," \
-                    "\"spec\":[" SPEC_RANGE_STR "]" ",\"hw\":" HW_WORST "}\n"
+                    "\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\",\"rename\",\"df\",\"5g\",\"rf\",\"subghz\",\"sweep\",\"listen\",\"scan\"]," \
+                    "\"spec\":[" SPEC_RANGE_STR "]" ",\"face\":\"front-right\"" ",\"hw\":" HW_WORST "}\n"
 static_assert(sizeof(HELLO_WORST) <= QL, "the hello can be longer than a queue line: raise QL");
 // The sec line that follows every hello, and the one-off sec line with the passkey a lock answers with. btId is
 // 12 hex digits; the passkey is kept to 100000..999999, so "%06lu" is always 6.
@@ -308,9 +325,11 @@ static_assert(SEC_CAP <= QL, "a sec line can be longer than a queue line: raise 
 static void hello() {
   char hw[HW_CAP];
   hwJson(hw, sizeof hw);
+  char fc[24] = "";                             // ,"face":"front-right" only once the owner has set one
+  if (face[0]) snprintf(fc, sizeof fc, ",\"face\":\"%s\"", face);
   char line[QL];
   snprintf(line, sizeof line,
-           "{\"t\":\"hello\",\"fw\":\"%s\",\"ver\":\"%s\",\"chip\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\",\"rename\"%s%s%s%s%s]%s,\"hw\":%s}\n",
+           "{\"t\":\"hello\",\"fw\":\"%s\",\"ver\":\"%s\",\"chip\":\"%s\",\"name\":\"%s\",\"code\":\"%s\",\"caps\":[\"wifi\",\"ble\",\"ota\",\"host\",\"rename\",\"df\"%s%s%s%s%s]%s%s,\"hw\":%s}\n",
            FW_NAME, WL_VERSION, WL_CHIP, devName, pairCode,
 #if SOC_WIFI_SUPPORT_5G
            ",\"5g\"",
@@ -342,7 +361,7 @@ static void hello() {
 #else
            ""
 #endif
-           , hw);
+           , fc, hw);
   enqueue(line);
   // Security state on its own line: the hello is already near QL on a fully fitted board, and apps that
   // don't know "sec" ignore it. "id" is the full Bluetooth address, so a phone that lost the board from its
@@ -382,10 +401,11 @@ static void applyChannels() {
     if (chCount == 0) { memcpy(chList, CH_24, sizeof CH_24); chCount = sizeof CH_24; }
   }
   chIdx = 0;
-  setChannel(chList[0]);
+  if (!tuneUntil) setChannel(chList[0]);        // tuned: the new plan starts when the tune ends
 }
 
-static inline bool wifiWanted() { return mode == M_BOTH || mode == M_WIFI; }
+// Tuned for a direction reading: Wi-Fi is heard whatever the mode (RF mode refuses a tune; see tuneCommand).
+static inline bool wifiWanted() { return mode == M_BOTH || mode == M_WIFI || tuneUntil != 0; }
 
 static void IRAM_ATTR sniff(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (!wifiWanted()) return;                  // Bluetooth-only / RF-only: no Wi-Fi lines (applyMode also stops promiscuous)
@@ -399,7 +419,9 @@ static void IRAM_ATTR sniff(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (subtype != 8 && subtype != 5) return;
   const uint8_t* bssid = f + 16;              // addr3
   uint32_t now = millis();
-  if (!rateOk(seenW, bssid, now, WIFI_RATE_MS)) return;
+  // The device being measured for a bearing is reported every TUNE_RATE_MS; everything else at the usual rate.
+  bool measured = tuneUntil && (!tuneHasId || memcmp(bssid, tuneId, 6) == 0);
+  if (!rateOk(seenW, bssid, now, measured ? TUNE_RATE_MS : WIFI_RATE_MS)) return;
 
   // SSID: tagged parameters start after the 24-byte header + 12 bytes of fixed fields.
   char ssid[66] = "";
@@ -439,7 +461,22 @@ static void wifiStart() {
 
 static void wifiStop() { esp_wifi_set_promiscuous(false); }
 
+static void tuneEnd(const char* why) {
+  if (!tuneUntil) return;
+  tuneUntil = 0; tuneHasId = false;
+  esp_wifi_set_promiscuous(wifiWanted());     // a Bluetooth-only board stops sniffing again
+  if (chCount) { if (chIdx >= chCount) chIdx = 0; setChannel(chList[chIdx]); }
+  lastHop = millis();
+  char line[96];
+  snprintf(line, sizeof line, "{\"t\":\"tune\",\"done\":true,\"why\":\"%s\",\"ch\":%d}\n", why, curCh);
+  enqueue(line);
+}
+
 static void wifiTick(uint32_t now) {
+  if (tuneUntil) {                              // a direction reading: stay put, then go back on our own
+    if ((int32_t)(now - tuneUntil) >= 0) tuneEnd("time");
+    return;
+  }
   if (mode == M_BLE || mode == M_RF) return;
   if (chCount <= 1) return;
   if (now - lastHop < HOP_MS) return;
@@ -1226,6 +1263,7 @@ static void otaCommand(const char* line, const char* v) {
     otaSize = sz ? strtoul(sz + 7, nullptr, 10) : 0;
     if (!otaSize) { otaStatus("error", ",\"msg\":\"no size\""); return; }
     if (Update.isRunning()) Update.abort();
+    tuneEnd("update");                                      // no direction reading during an update
     wifiStop(); NimBLEDevice::getScan()->stop();           // the radio is for the update now
     if (!Update.begin(otaSize)) {
       char ex[96]; snprintf(ex, sizeof ex, ",\"msg\":\"cannot start: %s (no OTA partition?)\"", Update.errorString());
@@ -1403,6 +1441,104 @@ static void nameCommand(const char* v) {
   rebootAt = millis() + 1200; if (!rebootAt) rebootAt = 1;
 }
 
+// ------------------------------------------------------------------ direction finding (cap "df")
+//
+// {"c":"face","v":"front-left"} says which way this Spotter's antenna faces: front, front-right, right,
+// rear-right, rear, rear-left, left or front-left ("back…" is taken for "rear…"); "" or "off" clears it. Kept
+// in flash (no restart) and answered with a fresh hello, so the coordinator sees the change at once. One
+// Spotter only ever gives hotter / colder; two or more with a facing give a rough bearing (about a quadrant
+// with four), worked out by the coordinator from their signal strengths, never here.
+//
+// {"c":"tune","ch":149,"ms":2000,"id":"b4:1e:52:12:34:56"} parks the Wi-Fi sniffer on one channel for ms
+// (300-5000, default 2000), whatever the board's job, then puts the job back by itself, so a coordinator that
+// drops off mid-reading never leaves a board stuck. id (optional) is the BSSID being measured: reported every
+// 200 ms instead of every 1.5 s while tuned. Answers {"t":"tune","ok":true,"ch":149,"ms":2000} at the start
+// (or "ok":false with a msg), and {"t":"tune","done":true,"why":"time"|"cancel"|"update","ch":6} when it is
+// back on its own plan. A new tune replaces one running; {"c":"tune","v":false} ends it early. Bluetooth
+// needs no tune: advertisements are on channels 37/38/39 for every board already.
+
+static const char* faceFind(const char* s, size_t n) {
+  char w[12];
+  if (n == 0 || n >= sizeof w) return nullptr;
+  for (size_t i = 0; i < n; i++) w[i] = (char)tolower((unsigned char)s[i]);
+  w[n] = 0;
+  if (!strncmp(w, "back", 4)) { char t[12]; snprintf(t, sizeof t, "rear%s", w + 4); strcpy(w, t); }
+  for (const char* f : FACES) if (!strcmp(w, f)) return f;
+  return nullptr;
+}
+
+static void faceLoad() {
+  Preferences p;
+  p.begin("wavelens", false);
+  char saved[sizeof face] = "";
+  if (p.isKey("face")) p.getString("face", saved, sizeof saved);
+  p.end();
+  const char* f = faceFind(saved, strlen(saved));
+  strcpy(face, f ? f : "");
+}
+
+static void faceCommand(const char* v) {
+  char want[16] = ""; size_t n = 0; bool bad = false;
+  if (v) {
+    while (*v == ' ') v++;
+    if (*v == '"') {
+      for (v++; *v && *v != '"'; v++) { if (n < sizeof want - 1) want[n++] = *v; else bad = true; }
+      want[n] = 0;
+    } else if (strncmp(v, "null", 4) && strncmp(v, "false", 5)) bad = true;
+  }
+  const char* f = nullptr;
+  bool clear = !bad && (n == 0 || !strcmp(want, "off"));
+  if (!clear) f = bad ? nullptr : faceFind(want, n);
+  if (!clear && !f) { status("face must be front, front-right, right, rear-right, rear, rear-left, left, front-left or off"); return; }
+  Preferences p;
+  p.begin("wavelens", false);
+  if (clear) p.remove("face"); else p.putString("face", f);
+  p.end();
+  strcpy(face, clear ? "" : f);
+  Serial.printf("face: %s\n", face[0] ? face : "not set");
+  hello();
+  status(face[0] ? "facing set" : "facing cleared");
+}
+
+static bool parseMac(const char* s, uint8_t out[6]) {
+  unsigned b[6];
+  if (sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6) return false;
+  for (int i = 0; i < 6; i++) out[i] = (uint8_t)b[i];
+  return true;
+}
+
+static void tuneReply(bool ok, int ch, uint32_t ms, const char* msg) {
+  char line[128];
+  if (ok) snprintf(line, sizeof line, "{\"t\":\"tune\",\"ok\":true,\"ch\":%d,\"ms\":%lu}\n", ch, (unsigned long)ms);
+  else    snprintf(line, sizeof line, "{\"t\":\"tune\",\"ok\":false,\"ch\":%d,\"msg\":\"%s\"}\n", ch, msg);
+  enqueue(line);
+}
+
+static void tuneCommand(const char* line) {
+  if (strstr(line, "\"v\":false")) { tuneEnd("cancel"); return; }
+  const char* pc = strstr(line, "\"ch\":");
+  int ch = pc ? atoi(pc + 5) : 0;
+  if (otaOn) { tuneReply(false, ch, 0, "busy updating"); return; }
+  if (mode == M_RF) { tuneReply(false, ch, 0, "in RF mode"); return; }
+  if (!chOk(ch)) { tuneReply(false, ch, 0, "channel not on this chip"); return; }
+  const char* pm = strstr(line, "\"ms\":");
+  long ms = pm ? atol(pm + 5) : (long)TUNE_DEF_MS;
+  if (ms < (long)TUNE_MIN_MS) ms = TUNE_MIN_MS;
+  if (ms > (long)TUNE_MAX_MS) ms = TUNE_MAX_MS;
+  uint8_t id[6]; bool hasId = false;
+  const char* pi = strstr(line, "\"id\":\"");
+  if (pi) hasId = parseMac(pi + 6, id);
+  tuneHasId = false;                            // the sniffer may be reading tuneId right now
+  if (hasId) memcpy(tuneId, id, 6);
+  tuneHasId = hasId;
+  tuneCh = (uint8_t)ch;
+  bool wasSniffing = wifiWanted();
+  uint32_t until = millis() + (uint32_t)ms; tuneUntil = until ? until : 1;
+  if (!wasSniffing) esp_wifi_set_promiscuous(true);
+  setChannel(tuneCh);
+  tuneReply(true, ch, (uint32_t)ms, "");
+}
+
 // usb: the line came in on the serial port (physical access), not over Bluetooth.
 static void applyCommand(const char* line, bool usb = false) {
   // Tiny parser: enough for {"c":"band","v":"2g"} / {"c":"ch","v":[1,6,11]} / {"c":"mode","v":"ble"} / {"c":"ping"}
@@ -1421,6 +1557,8 @@ static void applyCommand(const char* line, bool usb = false) {
   }
   const char* v = strstr(line, "\"v\":");
   if (!strncmp(c, "name\"", 5)) { nameCommand(v ? v + 4 : nullptr); return; }
+  if (!strncmp(c, "face\"", 5)) { faceCommand(v ? v + 4 : nullptr); return; }
+  if (!strncmp(c, "tune\"", 5)) { tuneCommand(line); return; }
   if (!strncmp(c, "ota", 3)) {                 // see otaMx: this can run in loop() (USB) or the NimBLE task
     xSemaphoreTake(otaMx, portMAX_DELAY); otaCommand(line, v ? v + 4 : nullptr); xSemaphoreGive(otaMx);
     return;
@@ -1440,6 +1578,7 @@ static void applyCommand(const char* line, bool usb = false) {
   if (!strncmp(c, "mode", 4)) {
     Mode m = M_BOTH;
     if (strstr(v, "wifi")) m = M_WIFI; else if (strstr(v, "ble")) m = M_BLE; else if (strstr(v, "\"rf\"")) m = M_RF;
+    if (m == M_RF) tuneEnd("cancel");            // RF mode gives the radio to the sweep: no Wi-Fi reading
     mode = m;
     if (!otaOn) applyMode();
     status("mode set");
@@ -1619,6 +1758,7 @@ void setup() {
   snprintf(btId, sizeof btId, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   secLoad();
   nameLoad();                                  // the owner's own name, if they gave it one
+  faceLoad();                                  // which way the antenna faces, for direction finding
   otaMx = xSemaphoreCreateMutex();             // before the BLE server: OtaCB / RxCB take it
   if (RESET_BTN_PIN >= 0) pinMode(RESET_BTN_PIN, INPUT_PULLUP);
   NimBLEDevice::init(devName);

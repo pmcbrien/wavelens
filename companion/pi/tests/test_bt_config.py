@@ -61,7 +61,8 @@ class BtConfigTest(unittest.TestCase):
     def test_bookworm_file(self):
         new = btc.apply(BOOKWORM)
         self.assertEqual(section(new, "GATT"), {"Client": "false"})
-        self.assertEqual(section(new, "General"), {"JustWorksRepairing": "always"})
+        # LE only: with BR/EDR off a silently paired device has no classic profile (HID) to use
+        self.assertEqual(section(new, "General"), {"JustWorksRepairing": "always", "ControllerMode": "le"})
         self.assertIn("#Name = BlueZ", new)          # other settings and comments untouched
         self.assertIn("#Cache = always", new)
         self.assertIn("[Policy]", new)

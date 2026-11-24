@@ -4,7 +4,10 @@
 A Scanner usually has no screen, and when it does (Raspberry Pi OS with the desktop) the panel's own
 Bluetooth agent pops up "confirm the pairing code" on a monitor nobody is looking at, and the phone's
 pairing waits and fails. This agent answers for the Pi instead, as a headless accessory does: capability
-"NoInputNoOutput", every confirmation and service authorisation accepted.
+"NoInputNoOutput". An LE pairing confirmation is accepted (that is what keeps the phone free of a prompt);
+legacy PIN / passkey pairing is refused, and a service is authorised only if it is the Wavelens service, so a
+nearby computer that pairs silently gets no keyboard (HID), audio or serial profile out of it. main.conf also
+puts the controller in LE-only mode (wavelens_bt_config.py), which leaves classic profiles nothing to use.
 
 It also asks BlueZ to make it the default agent again every few seconds. The desktop panel registers its
 agent at login and takes the default; asking again puts this one back in front, so the prompt never shows.
@@ -23,6 +26,9 @@ from gi.repository import GLib
 AGENT_PATH = "/org/wavelens/btagent"
 CAPABILITY = "NoInputNoOutput"
 REASSERT_S = 5          # how often to ask to be the default agent again (cheap: one D-Bus call)
+# The only service a Wavelens link uses ("Wavelens" in hex, see companion/README.md). Every other profile a
+# paired device asks for — HID input above all (CVE-2023-45866 class keystroke injection) — is rejected.
+ALLOWED_UUIDS = {"57617665-6c65-6e73-0100-000000000001"}
 
 
 def log(msg: str) -> None:
@@ -42,17 +48,21 @@ class Agent(dbus.service.Object):
 
     @dbus.service.method("org.bluez.Agent1", in_signature="os", out_signature="")
     def AuthorizeService(self, device, uuid):
-        log(f"service {uuid} authorised for {device}")
+        if str(uuid).lower() in ALLOWED_UUIDS:
+            log(f"service {uuid} authorised for {device}")
+            return
+        log(f"service {uuid} refused for {device} (not the Wavelens service)")
+        raise Rejected("only the Wavelens service is offered")
 
     @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="s")
     def RequestPinCode(self, device):
-        log(f"PIN asked by {device}: 0000")
-        return "0000"
+        log(f"legacy PIN pairing refused for {device}")
+        raise Rejected("legacy PIN pairing is not offered")
 
     @dbus.service.method("org.bluez.Agent1", in_signature="o", out_signature="u")
     def RequestPasskey(self, device):
-        log(f"passkey asked by {device}: 0")
-        return dbus.UInt32(0)
+        log(f"passkey entry refused for {device}")
+        raise Rejected("passkey entry is not offered")
 
     @dbus.service.method("org.bluez.Agent1", in_signature="ouq", out_signature="")
     def DisplayPasskey(self, device, passkey, entered):

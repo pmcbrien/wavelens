@@ -11,6 +11,9 @@ JustWorksRepairing = always keeps a pairing that does happen (a computer pairing
 an iPad that forgot the Pi and pairs again) prompt-free on the Pi too, alongside wavelens-bt-agent. Whether the
 Pi is pairable at all stays with the agent and the admin page's switch: nothing here turns pairing on.
 
+ControllerMode = le: the Wavelens link is Bluetooth LE only, and with BR/EDR off a device that pairs has no
+classic profile to use (HID keyboard injection, audio, serial), whatever the agent says.
+
 Nothing on the Pi uses it as a Bluetooth central (Spotters plug in over USB), so the GATT client is not needed.
 
 Run by install-service.sh:  python3 wavelens_bt_config.py [/etc/bluetooth/main.conf]
@@ -21,7 +24,7 @@ import re
 import sys
 
 SETTINGS = {
-    "General": {"JustWorksRepairing": "always"},
+    "General": {"JustWorksRepairing": "always", "ControllerMode": "le"},
     "GATT": {"Client": "false"},
 }
 
